@@ -5,12 +5,29 @@
 
 set -euo pipefail
 
-SKILLS_DIR="$(cd "$(dirname "$0")/../skills" && pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SKILLS_DIR="$REPO/skills"
 TARGET_DIR="$HOME/.agents/skills"
+
+# Bail if TARGET_DIR is a symlink that resolves back into this repo.
+if [ -L "$TARGET_DIR" ]; then
+  resolved="$(readlink -f "$TARGET_DIR")"
+  case "$resolved" in
+    "$REPO"|"$REPO"/*)
+      echo "error: $TARGET_DIR is a symlink into this repo ($resolved)." >&2
+      echo "Remove it (rm \"$TARGET_DIR\") and re-run; the script will recreate it as a real dir." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 mkdir -p "$TARGET_DIR"
 
-find "$SKILLS_DIR" -mindepth 3 -maxdepth 3 -name "SKILL.md" | while read -r skill_md; do
+find "$SKILLS_DIR" -name "SKILL.md" \
+  -not -path '*/node_modules/*' \
+  -not -path '*/deprecated/*' \
+  -print0 |
+while IFS= read -r -d '' skill_md; do
   skill_dir="$(dirname "$skill_md")"
   skill_name="$(basename "$skill_dir")"
   target="$TARGET_DIR/$skill_name"
