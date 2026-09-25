@@ -1,0 +1,8 @@
+{
+  "baseBranch": "main",
+  "bootstrap": "yarn install --frozen-lockfile",
+  "verify": "yarn typecheck && yarn test",
+  "parallel": false,
+  "maxSlices": 5,
+  "worktreeRoot": ".claude/worktrees"
+}
