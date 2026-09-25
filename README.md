@@ -18,5 +18,5 @@ Clone the repo and run `scripts/link-skills.sh` to symlink skills into your loca
 skills/
 ├── engineering/   # Development workflow skills
 ├── personal/      # Personal / domain-specific skills
-└── wip/           # Drafts — not listed in plugin.json
+└── wip/           # Drafts
 ```
