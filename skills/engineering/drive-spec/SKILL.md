@@ -1,12 +1,12 @@
 ---
-name: implement-spec
+name: drive-spec
 description: "Build a spec's tracer-bullets, each in its own worktree, into one draft PR."
 disable-model-invocation: true
 ---
 
-# implement-spec
+# drive-spec
 
-`/implement-spec <spec-issue> [--base <branch>] [--parallel] [--dry-run]`
+`/drive-spec <spec-issue> [--base <branch>] [--parallel] [--dry-run]`
 
 Drive a spec issue from its tracer-bullet issues to one draft PR `spec branch → base`. Each slice is built in its own worktree and merged into the spec branch, which lives in a worktree of its own. The checkout you are standing in is never touched, so several sessions can drive several specs in one repo at once.
 
@@ -22,7 +22,7 @@ Communicate with subagents through context pointers: issue numbers, worktree pat
 
 ## Steps
 
-1. **Resolve the run.** For each of `baseBranch`, `bootstrap`, `verify`, `parallel`, `maxSlices`: a flag wins, then `.claude/implement-spec.json` in the repo root, then the default. Defaults: repository default branch, no bootstrap, verify gate read from the repo's `CLAUDE.md` or `AGENTS.md`, sequential, no ceiling. Resolve the worktree root per WORKTREES.md. Done when every value is printed with where it came from.
+1. **Resolve the run.** For each of `baseBranch`, `bootstrap`, `verify`, `parallel`, `maxSlices`: a flag wins, then `.claude/drive-spec.json` in the repo root, then the default. Defaults: repository default branch, no bootstrap, verify gate read from the repo's `CLAUDE.md` or `AGENTS.md`, sequential, no ceiling. Resolve the worktree root per WORKTREES.md. Done when every value is printed with where it came from.
 
 2. **Guard the spec.** Discover the spec's tracer-bullets and each one's blockers per TRACKER.md. Refuse when the spec has a `## Parent` of its own, has no tracer-bullets, or the blockers form a cycle: comment on the spec naming the offending issue, and stop. Done when the topological order is computed, lowest issue number first among ties, with each slice's state (closed, open PR, in-flight branch, todo).
 

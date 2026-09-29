@@ -11,7 +11,7 @@ root="$repo/.claude/worktrees"
 grep -qx '.claude/worktrees/' "$common/info/exclude" || echo '.claude/worktrees/' >> "$common/info/exclude"
 ```
 
-`worktreeRoot` in `.claude/implement-spec.json` overrides `root`.
+`worktreeRoot` in `.claude/drive-spec.json` overrides `root`.
 
 ## Names
 

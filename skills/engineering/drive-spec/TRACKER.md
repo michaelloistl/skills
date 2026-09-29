@@ -122,5 +122,5 @@ EOF
 
 ```sh
 gh issue edit <m> --add-label agent:blocked --remove-label agent:in-progress
-gh issue comment <m> --body "implement-spec halted here: <one line why>. Worktree kept at <path>. Resume with \`/implement-spec <spec>\` after fixing."
+gh issue comment <m> --body "drive-spec halted here: <one line why>. Worktree kept at <path>. Resume with \`/drive-spec <spec>\` after fixing."
 ```
