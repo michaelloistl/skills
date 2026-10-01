@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 `/review-fix-pr [<pr>] [--review-only]`
 
-The local run of the `agent:review-pr` → `agent:implement` label pair: one pass reviews the PR and posts the review, a second fixes the findings, pushes, and replies thread by thread. `<pr>` defaults to the PR whose head is the current branch.
+Two passes over one PR: one reviews the PR and posts the review, a second fixes the findings, pushes, and replies thread by thread. `<pr>` defaults to the PR whose head is the current branch.
 
 The PR head is worked in its own worktree; the checkout you are standing in is never touched — unless it already *is* the PR head (step 2). Reviewer and fixer are separate subagents so the fixer never grades its own review. Communicate with them through context pointers — PR number, review id, worktree path, verify gate — and let them read the rest themselves.
 
