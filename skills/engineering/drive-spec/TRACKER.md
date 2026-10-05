@@ -60,7 +60,7 @@ One comment on the spec issue, found by the marker and edited in place with `gh 
 _Updated <ISO timestamp> from <hostname>._
 ```
 
-Every slice in topological order; closed slices ticked; the one in flight marked. When the final PR exists, a last line names it.
+Every slice in topological order; closed slices ticked; the one in flight marked. When the spec PR exists, a last line names it.
 
 ## Slice PRs
 
@@ -102,7 +102,9 @@ gh issue close <m> --comment "Landed in #<pr> on \`agent/local-spec-<n>-<slug>\`
 
 Pull the spec worktree and finish the slice's land and cleanup steps before taking the next queue entry. Branches still owned by active implementers stay untouched until they enter the queue.
 
-## Final PR
+## Spec PR
+
+Draft, `spec branch → base`, opened when the first slice lands; an open one already there is left as is. The body lists every slice in topological order, including those not yet built.
 
 ```sh
 gh pr list --state open --base <base> --head agent/local-spec-<n>-<slug> --json number,url

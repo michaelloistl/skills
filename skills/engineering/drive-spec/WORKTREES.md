@@ -70,7 +70,7 @@ git branch -D agent/issue-<m>-<slug>
 git push origin --delete agent/issue-<m>-<slug>
 ```
 
-After the final PR opens: remove the spec worktree the same way but keep the branch, local and remote, until the PR merges.
+At cleanup: remove the spec worktree the same way but keep the branch, local and remote, until the PR merges.
 
 On halt: keep the slice worktree in place so the developer can look, and print its path.
 
