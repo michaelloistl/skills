@@ -13,6 +13,10 @@ grep -qx '.claude/worktrees/' "$common/info/exclude" || echo '.claude/worktrees/
 
 `worktreeRoot` in `.claude/drive-spec.json` overrides `root`.
 
+## Notes
+
+Research notes for spec `<n>` live in `$common/drive-spec/spec-<n>/`: inside the shared git dir, so every worktree and every session reaches the same files, and outside every working tree, so nothing gets committed. They survive a halt, so a resume reuses them.
+
 ## Names
 
 | Thing | Branch | Worktree |
