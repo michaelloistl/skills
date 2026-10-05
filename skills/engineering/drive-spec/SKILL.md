@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # drive-spec
 
-`/drive-spec <spec-issue> [--base <branch>] [--parallel] [--dry-run]`
+`/drive-spec <spec-issue> [--base <branch>] [--sequential] [--dry-run]`
 
 Drive a spec issue from its tracer-bullet issues to one draft PR `spec branch → base`. Each slice is built in its own worktree and merged into the spec branch, which lives in a worktree of its own. The checkout you are standing in is never touched, so several sessions can drive several specs in one repo at once.
 
@@ -22,7 +22,7 @@ Communicate with subagents through context pointers: issue numbers, worktree pat
 
 ## Steps
 
-1. **Resolve the run.** For each of `baseBranch`, `bootstrap`, `verify`, `parallel`, `maxSlices`: a flag wins, then `.claude/drive-spec.json` in the repo root, then the default. Defaults: repository default branch, no bootstrap, verify gate read from the repo's `CLAUDE.md` or `AGENTS.md`, sequential, no ceiling. Resolve the worktree root per WORKTREES.md. Done when every value is printed with where it came from.
+1. **Resolve the run.** For each of `baseBranch`, `bootstrap`, `verify`, `parallel`, `maxSlices`: a flag wins, then `.claude/drive-spec.json` in the repo root, then the default. Defaults: repository default branch, no bootstrap, verify gate read from the repo's `CLAUDE.md` or `AGENTS.md`, parallel, no ceiling. `--sequential` sets `parallel` to false. Resolve the worktree root per WORKTREES.md. Done when every value is printed with where it came from.
 
 2. **Guard the spec.** Discover the spec's tracer-bullets and each one's blockers per TRACKER.md. Refuse when the spec has a `## Parent` of its own, has no tracer-bullets, or the blockers form a cycle: comment on the spec naming the offending issue, and stop. Done when the topological order is computed, lowest issue number first among ties, with each slice's state (closed, open PR, in-flight branch, todo).
 
@@ -33,7 +33,7 @@ Communicate with subagents through context pointers: issue numbers, worktree pat
 5. **Explore.** One general-purpose subagent in the spec worktree reads the spec and every slice not yet closed, explores the code and external docs they touch, and writes notes into the notes directory per WORKTREES.md: `shared.md` for what several slices need, `issue-<m>.md` for each slice. Notes name files, seams, existing patterns to follow, and doc links; they leave the design to the implementer. A slice whose notes file already exists is skipped, so a resume explores only what is new. Done when every open slice has a notes file.
 
 6. **Build the frontier.** Repeat until every slice is closed or the ceiling is reached:
-   - Pick from the frontier: open slices whose blockers are all closed. Sequential: the lowest-numbered one. Parallel: all of them, each in a background subagent; completed slices enter the integration queue in finish order.
+   - Pick from the frontier: open slices whose blockers are all closed. Parallel: all of them, each in a background subagent; completed slices enter the integration queue in finish order. Sequential: the lowest-numbered one.
    - A slice with an open PR into the spec branch gets its worktree back and goes straight to the integration queue. A slice with an in-flight branch on origin gets its worktree back and its implementer told to continue.
    - Otherwise open its worktree on `agent/issue-<m>-<slug>` from the spec branch HEAD, run bootstrap, label the issue `agent:in-progress`, and dispatch an implementer subagent with IMPLEMENTER.md filled in. The subagent is done when the verify gate is green and every change is committed.
    - Integrate one slice at a time per TRACKER.md: push and open its PR, merge the latest spec branch into the slice, resolve conflicts, run the verify gate on that exact integration, push, then merge the PR. If the spec branch advances before the PR merges, integrate and verify again. GitHub's initial mergeable result never substitutes for this gate.
