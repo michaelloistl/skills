@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Setup script for the "Rails" Claude Code cloud environment.
-# Paste into the environment's "Setup script" field. Runs as root on Ubuntu
-# before Claude Code launches; the result is cached for ~7 days, so edits to
-# this file reach the cloud only when the pasted script changes or the cache
-# expires.
+# Runs as root on Ubuntu before Claude Code launches. The result is cached for
+# ~7 days and rebuilt only when the pasted script changes, so paste this loader
+# pinned to a commit, and bump SKILLS_REF to roll out a change:
+#
+#   #!/bin/bash
+#   set -euo pipefail
+#   export SKILLS_REF=<commit sha>
+#   f=$(mktemp)
+#   curl -fsSL "https://raw.githubusercontent.com/michaelloistl/skills/$SKILLS_REF/scripts/cloud-setup-rails.sh" -o "$f"
+#   bash "$f" </dev/null
 #
 # Also set in the environment's "Environment variables" field:
 #   LANG=C.UTF-8
@@ -13,7 +19,8 @@ set -euo pipefail
 
 # Versions from the projects' .ruby-version files.
 RUBIES=(3.3.10 3.3.11 3.4.2)
-SCRIPTS=https://raw.githubusercontent.com/michaelloistl/skills/main/scripts
+# SKILLS_REF pins the base script to the same commit as this one.
+SCRIPTS=https://raw.githubusercontent.com/michaelloistl/skills/${SKILLS_REF:-main}/scripts
 
 pids=()
 
