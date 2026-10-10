@@ -4,5 +4,9 @@
   "verify": "yarn typecheck && yarn test",
   "parallel": false,
   "maxSlices": 5,
-  "worktreeRoot": ".claude/worktrees"
+  "worktreeRoot": ".claude/worktrees",
+  "localOnly": {
+    "label": "needs:desktop",
+    "proof": "docs/agents/desktop-proof.md"
+  }
 }

@@ -87,11 +87,12 @@ gh api -X PATCH "repos/$repo/issues/comments/$id" -f body="$body" --silent
 - [x] #12 Create the serializer
 - [ ] #13 Wire the export route ← building
 - [ ] #14 Add the download button
+- [ ] #15 Check the export in the desktop app ← held for a local run
 
 _Updated <ISO timestamp> from <hostname>._
 ```
 
-Every slice in topological order; closed slices ticked; the one in flight marked. When the spec PR exists, a last line names it.
+Every slice in topological order; closed slices ticked; the one in flight marked; held slices marked. When the spec PR exists, a last line names it.
 
 ## Slice PRs
 

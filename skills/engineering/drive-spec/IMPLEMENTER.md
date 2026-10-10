@@ -13,7 +13,7 @@ Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at; then the res
 
 Build the smallest coherent change that satisfies the issue, and only the issue. Test-first where a test can exist: write it, watch it fail, make it pass, one behaviour at a time. Refactor only when green.
 
-While working, run the narrowest check that covers each change: the typecheck, the single test file. Run the full verify gate once at the end; it must be green before you finish: `<verify>`
+While working, run the narrowest check that covers each change: the typecheck, the single test file. Run the full verify gate once at the end; it must be green before you finish: `<verify>` <If localOnly: "This slice carries `<label>`: after the gate, prove it as `<proof>` says. That proof is part of green.">
 
 Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer.
 
