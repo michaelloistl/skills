@@ -14,9 +14,9 @@ MATT_SKILLS=(
 )
 
 npx -y skills@latest add mattpocock/skills -g -y --agent claude-code --copy \
-  --skill "${MATT_SKILLS[@]}"
+  --skill "${MATT_SKILLS[@]}" </dev/null
 npx -y skills@latest add michaelloistl/skills -g -y --agent claude-code --copy \
-  --skill '*'
+  --skill '*' </dev/null
 
 mkdir -p ~/.claude
 
