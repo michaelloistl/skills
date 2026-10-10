@@ -17,8 +17,6 @@
 
 set -euo pipefail
 
-# Versions from the projects' .ruby-version files.
-RUBIES=(3.3.10 3.3.11 3.4.2)
 # SKILLS_REF pins the base script to the same commit as this one.
 SCRIPTS=https://raw.githubusercontent.com/michaelloistl/skills/${SKILLS_REF:-main}/scripts
 
@@ -36,20 +34,28 @@ pids+=($!)
 ) &
 pids+=($!)
 
-# Prebuilt Rubies via rv (seconds, not minutes), linked into rbenv so the
-# repos' .ruby-version files resolve through the preinstalled shims.
+# Rubies come from each repo's .ruby-version: ruby-up installs whichever are
+# missing, as rv prebuilts (seconds, not minutes) linked into rbenv.
+cat > /usr/local/bin/ruby-up <<'EOF'
+#!/usr/bin/env bash
+# Idempotent: install the Rubies this repo's .ruby-version files ask for.
+set -euo pipefail
+versions="$(rbenv root)/versions"
+mkdir -p "$versions"
+for v in $(git ls-files 2>/dev/null | grep -E '(^|/)\.ruby-version$' | xargs -r cat | sed 's/^ruby-//' | sort -u); do
+  [ -x "$versions/$v/bin/ruby" ] && continue
+  "$HOME/.cargo/bin/rv" ruby install "$v" >/dev/null
+  ln -sfn "$HOME/.local/share/rv/rubies/ruby-$v" "$versions/$v"
+  "$versions/$v/bin/ruby" -ropenssl -rpsych -e '' # fail now, not mid-test
+done
+rbenv rehash
+EOF
+chmod +x /usr/local/bin/ruby-up
+
 (
   curl --proto '=https' --tlsv1.2 -LsSf \
     https://github.com/spinel-coop/rv/releases/latest/download/rv-installer.sh | sh >/dev/null
-  rv=$HOME/.cargo/bin/rv
-  for v in "${RUBIES[@]}"; do "$rv" ruby install "$v"; done
-  versions="$(rbenv root)/versions"
-  mkdir -p "$versions"
-  for v in "${RUBIES[@]}"; do
-    ln -sfn "$HOME/.local/share/rv/rubies/ruby-$v" "$versions/$v"
-    "$versions/$v/bin/ruby" -ropenssl -rpsych -e '' # fail now, not mid-session
-  done
-  rbenv rehash
+  ruby-up # warms the cache when the setup runs inside the repo; no-op otherwise
   # The image puts another Ruby ahead of rbenv on PATH; put the shims first
   # in every session shell. Top of .bashrc, before its non-interactive return.
   line="export PATH=\"$(rbenv root)/shims:\$PATH\""
@@ -72,7 +78,8 @@ service postgresql stop
 
 cat > /usr/local/bin/rails-services-up <<'EOF'
 #!/usr/bin/env bash
-# Idempotent: start Postgres and Redis for this session.
+# Idempotent: install the repo's Rubies, start Postgres and Redis.
+ruby-up
 service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null
 redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes >/dev/null
 EOF
@@ -82,5 +89,5 @@ cat >> ~/.claude/CLAUDE.md <<'EOF'
 
 ## Rails in cloud sessions
 
-Before `bundle install`, `bin/rails db:prepare`, or any test run, run `rails-services-up` (starts Postgres and Redis; safe to repeat). Postgres accepts the `root` role without a password. Rubies come from rbenv and match each repo's `.ruby-version`; if a version is missing, say so instead of switching versions.
+Before `bundle install`, `bin/rails db:prepare`, or any test run, run `rails-services-up` (installs the repo's Rubies, starts Postgres and Redis; safe to repeat). Postgres accepts the `root` role without a password. If `ruby -v` still disagrees with `.ruby-version`, say so instead of switching versions.
 EOF
