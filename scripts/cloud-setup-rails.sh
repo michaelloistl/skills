@@ -50,6 +50,13 @@ pids+=($!)
     "$versions/$v/bin/ruby" -ropenssl -rpsych -e '' # fail now, not mid-session
   done
   rbenv rehash
+  # The image puts another Ruby ahead of rbenv on PATH; put the shims first
+  # in every session shell. Top of .bashrc, before its non-interactive return.
+  line="export PATH=\"$(rbenv root)/shims:\$PATH\""
+  echo "$line" > /etc/profile.d/rbenv-shims.sh
+  touch ~/.bashrc
+  grep -qxF "$line" ~/.bashrc || { echo "$line"; cat ~/.bashrc; } > ~/.bashrc.new
+  [ ! -f ~/.bashrc.new ] || mv ~/.bashrc.new ~/.bashrc
 ) &
 pids+=($!)
 
