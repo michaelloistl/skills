@@ -48,7 +48,23 @@ for v in $(git ls-files 2>/dev/null | grep -E '(^|/)\.ruby-version$' | xargs -r 
   ln -sfn "$HOME/.local/share/rv/rubies/ruby-$v" "$versions/$v"
   "$versions/$v/bin/ruby" -ropenssl -rpsych -e '' # fail now, not mid-test
 done
+# Session shells skip profile files, and /usr/local/bin links to the image's
+# own Ruby; link rbenv shims over it so .ruby-version decides. Register
+# the image's Ruby as the global first: rbenv's "system" lookup would find
+# the linked shim and loop.
+if [ "$(rbenv global)" = system ]; then
+  sys=$(readlink -f "$(command -v ruby)")
+  sysv=$("$sys" -e 'print RUBY_VERSION')
+  [ -e "$versions/$sysv" ] || ln -s "$(dirname "$(dirname "$sys")")" "$versions/$sysv"
+  rbenv global "$sysv"
+fi
 rbenv rehash
+# Only the tools rv's Rubies ship (ruby, rake, bundle, ...): never system tools.
+for bin in "$HOME"/.local/share/rv/rubies/*/bin/*; do
+  shim="$(rbenv root)/shims/${bin##*/}"
+  [ -e "$shim" ] || continue
+  ln -sfn "$shim" "/usr/local/bin/${bin##*/}"
+done
 EOF
 chmod +x /usr/local/bin/ruby-up
 
@@ -56,13 +72,6 @@ chmod +x /usr/local/bin/ruby-up
   curl --proto '=https' --tlsv1.2 -LsSf \
     https://github.com/spinel-coop/rv/releases/latest/download/rv-installer.sh | sh >/dev/null
   ruby-up # warms the cache when the setup runs inside the repo; no-op otherwise
-  # The image puts another Ruby ahead of rbenv on PATH; put the shims first
-  # in every session shell. Top of .bashrc, before its non-interactive return.
-  line="export PATH=\"$(rbenv root)/shims:\$PATH\""
-  echo "$line" > /etc/profile.d/rbenv-shims.sh
-  touch ~/.bashrc
-  grep -qxF "$line" ~/.bashrc || { echo "$line"; cat ~/.bashrc; } > ~/.bashrc.new
-  [ ! -f ~/.bashrc.new ] || mv ~/.bashrc.new ~/.bashrc
 ) &
 pids+=($!)
 
