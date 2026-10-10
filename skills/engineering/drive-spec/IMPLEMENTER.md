@@ -7,7 +7,7 @@ You are implementing one tracer-bullet of a spec as a single vertical slice.
 
 Worktree: <path>. Every command runs there. Commits go on the current branch; the orchestrator pushes and opens the PR, so leave pushing and PRs alone.
 
-Issue: #<m> (`gh issue view <m>`). Spec: #<spec> (`gh issue view <spec>`). Earlier slices already landed on this branch; read `git log --oneline <base>..HEAD` to see them. <If continuing: "The branch already holds partial work from an earlier run; read its commits and carry on.">
+Issue: #<m> (`gh api repos/<repo>/issues/<m> --jq '.title, .body'`). Spec: #<spec> (`gh api repos/<repo>/issues/<spec> --jq '.title, .body'`). Earlier slices already landed on this branch; read `git log --oneline <base>..HEAD` to see them. <If continuing: "The branch already holds partial work from an earlier run; read its commits and carry on.">
 
 Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at; then the research notes `<notes>/shared.md` and `<notes>/issue-<m>.md`, and explore only past what they cover. Match the repo's conventions and vocabulary.
 

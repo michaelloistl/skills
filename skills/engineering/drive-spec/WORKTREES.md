@@ -67,8 +67,10 @@ After a slice lands:
 ```sh
 git worktree remove --force "$root/issue-<m>"
 git branch -D agent/issue-<m>-<slug>
-git push origin --delete agent/issue-<m>-<slug>
+[ "$CLAUDE_CODE_REMOTE" = true ] || git push origin --delete agent/issue-<m>-<slug>
 ```
+
+A cloud session's GitHub proxy rejects branch deletion, so there the remote branch stays; the repo's "Automatically delete head branches" setting removes it on merge.
 
 At cleanup: remove the spec worktree the same way but keep the branch, local and remote, until the PR merges.
 
