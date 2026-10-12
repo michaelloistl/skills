@@ -68,6 +68,24 @@ done
 EOF
 chmod +x /usr/local/bin/ruby-up
 
+# Node from the repo's .node-version or .nvmrc, via n into /usr/local.
+cat > /usr/local/bin/node-up <<'EOF'
+#!/usr/bin/env bash
+# Idempotent: install the Node this repo's .node-version or .nvmrc asks for.
+set -euo pipefail
+f=$(git ls-files .node-version .nvmrc 2>/dev/null | head -1)
+[ -n "$f" ] || exit 0
+want=$(sed 's/^v//' "$f" | tr -d '[:space:]')
+case "$want" in [0-9]*) ;; *) echo "node-up: skipping '$want' in $f" >&2; exit 0 ;; esac
+matches() { case "$(node -v 2>/dev/null)" in "v$want" | "v$want".*) return 0 ;; esac; return 1; }
+matches && exit 0
+N_PREFIX=/usr/local npx -y n@latest install "$want" >/dev/null
+hash -r
+matches || { echo "node-up: installed $want, but $(command -v node) is $(node -v)" >&2; exit 1; }
+command -v yarn >/dev/null || npm install -g yarn >/dev/null
+EOF
+chmod +x /usr/local/bin/node-up
+
 (
   curl --proto '=https' --tlsv1.2 -LsSf \
     https://github.com/spinel-coop/rv/releases/latest/download/rv-installer.sh | sh >/dev/null
@@ -87,8 +105,9 @@ service postgresql stop
 
 cat > /usr/local/bin/rails-services-up <<'EOF'
 #!/usr/bin/env bash
-# Idempotent: install the repo's Rubies, start Postgres and Redis.
+# Idempotent: install the repo's Ruby and Node, start Postgres and Redis.
 ruby-up
+node-up
 service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null
 redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes >/dev/null
 EOF
@@ -98,5 +117,5 @@ cat >> ~/.claude/CLAUDE.md <<'EOF'
 
 ## Rails in cloud sessions
 
-Before `bundle install`, `bin/rails db:prepare`, or any test run, run `rails-services-up` (installs the repo's Rubies, starts Postgres and Redis; safe to repeat). Postgres accepts the `root` role without a password. If `ruby -v` still disagrees with `.ruby-version`, say so instead of switching versions.
+Before `bundle install`, `bin/rails db:prepare`, or any test run, run `rails-services-up` (installs the repo's Ruby and Node, starts Postgres and Redis; safe to repeat). Postgres accepts the `root` role without a password. If `ruby -v` or `node -v` still disagrees with `.ruby-version` or `.node-version`, say so instead of switching versions or passing `--ignore-engines`.
 EOF
