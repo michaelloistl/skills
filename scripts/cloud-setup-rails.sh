@@ -68,7 +68,7 @@ done
 EOF
 chmod +x /usr/local/bin/ruby-up
 
-# Node from the repo's .node-version or .nvmrc, via n into /usr/local.
+# Node from the repo's .node-version or .nvmrc, via n over the node on PATH.
 cat > /usr/local/bin/node-up <<'EOF'
 #!/usr/bin/env bash
 # Idempotent: install the Node this repo's .node-version or .nvmrc asks for.
@@ -79,7 +79,12 @@ want=$(sed 's/^v//' "$f" | tr -d '[:space:]')
 case "$want" in [0-9]*) ;; *) echo "node-up: skipping '$want' in $f" >&2; exit 0 ;; esac
 matches() { case "$(node -v 2>/dev/null)" in "v$want" | "v$want".*) return 0 ;; esac; return 1; }
 matches && exit 0
-N_PREFIX=/usr/local npx -y n@latest install "$want" >/dev/null
+# Install over whichever node PATH finds first (the image puts /opt/node22/bin
+# ahead of /usr/local/bin), so the new one wins.
+prefix=/usr/local
+cur=$(command -v node || true)
+[ -n "$cur" ] && prefix=$(dirname "$(dirname "$(readlink -f "$cur")")")
+N_PREFIX=$prefix npx -y n@latest install "$want" >/dev/null
 hash -r
 matches || { echo "node-up: installed $want, but $(command -v node) is $(node -v)" >&2; exit 1; }
 command -v yarn >/dev/null || npm install -g yarn >/dev/null
@@ -112,6 +117,13 @@ service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null
 redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes >/dev/null
 EOF
 chmod +x /usr/local/bin/rails-services-up
+
+# Run it at session start too: repo hooks (e.g. a pre-push bin/ci-lint) call
+# ruby before Claude would, and until ruby-up links the shims, ruby is the
+# image's own. Merge into the settings.json the base script wrote.
+settings=~/.claude/settings.json
+jq '.hooks.SessionStart += [{"hooks": [{"type": "command", "command": "rails-services-up >/dev/null", "timeout": 600}]}]' \
+  "$settings" > "$settings.tmp" && mv "$settings.tmp" "$settings"
 
 cat >> ~/.claude/CLAUDE.md <<'EOF'
 
