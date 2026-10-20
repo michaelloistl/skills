@@ -51,3 +51,5 @@ An interim notification from a background subagent needs no reply: end the turn 
 8. **Confirm the spec PR.** The draft (TRACKER.md) opened at the first landing stays draft; open it now if absent. Refresh the progress comment.
 
 9. **Clean up.** Remove the spec worktree, any slice worktree still present, and the notes directory; prune, and print the PR URL. The spec branch stays on origin until the PR merges.
+
+Every run that gets past step 4, whether it finishes at step 9 or stops in step 6, ends by posting the status comment per TRACKER.md.

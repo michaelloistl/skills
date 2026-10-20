@@ -94,6 +94,21 @@ _Updated <ISO timestamp> from <hostname>._
 
 Every slice in topological order; closed slices ticked; the one in flight marked; held slices marked. When the spec PR exists, a last line names it.
 
+## Status comment
+
+A fresh comment on the spec issue as the run's last action, never an edit: edits notify no one, and this comment is how the operator learns the run is over. The first line is the outcome; every outcome but done adds the resume command on a second line.
+
+```sh
+gh api "repos/$repo/issues/<spec>/comments" --silent -f body="$body"
+```
+
+| Outcome | First line |
+|---|---|
+| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` |
+| halted | `drive-spec halted on #<m>: <one line why>.` |
+| ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` |
+| held | `drive-spec paused: only held slices remain (#<m>, …). Resume in a local session.` |
+
 ## Slice PRs
 
 ```sh
