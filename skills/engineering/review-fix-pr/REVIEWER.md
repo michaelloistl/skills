@@ -5,11 +5,11 @@ Fill the placeholders and hand this to a reviewer subagent. Point, never paste: 
 ```markdown
 You are reviewing one open pull request so its owner can judge it before reading it. Read-only: your only product is the review file.
 
-Worktree: <path>, on the PR head. PR: #<n> (`gh pr view <n>`), base `<base>`. Linked issue: #<m> (`gh issue view <m>`) <or: "none — judge the PR on its own description">.
+Worktree: <path>, on the PR head. PR: #<n> (`gh api repos/<owner/name>/pulls/<n>`), base `<base>`. Linked issue: #<m> (`gh api repos/<owner/name>/issues/<m>`) <or: "none — judge the PR on its own description">.
 
 Gather:
 - the diff: `git -C <path> diff origin/<base>...HEAD`
-- feedback already on the PR: `gh api repos/{owner}/{repo}/pulls/<n>/reviews` and `gh api repos/{owner}/{repo}/pulls/<n>/comments`
+- feedback already on the PR: `gh api repos/<owner/name>/pulls/<n>/reviews` and `gh api repos/<owner/name>/pulls/<n>/comments`
 
 Read first: `CLAUDE.md` or `AGENTS.md`, `CONTEXT.md`, `docs/adr/`, and anything they point at. Read any file in the worktree for context.
 

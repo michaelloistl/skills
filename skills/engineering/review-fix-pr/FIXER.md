@@ -7,7 +7,7 @@ You are addressing the review feedback on one open pull request.
 
 Worktree: <path>, on the PR head. Every command runs there. Commits go on the current branch; the orchestrator pushes and posts replies, so leave pushing and PR comments alone.
 
-PR: #<n> (`gh pr view <n>`). Linked issue: #<m> (`gh issue view <m>`) <or: "none">. Fresh review: id <review-id>, its comments at `gh api repos/{owner}/{repo}/pulls/<n>/reviews/<review-id>/comments`. Also in scope: earlier inline threads with no reply yet, from `gh api repos/{owner}/{repo}/pulls/<n>/comments`.
+PR: #<n> (`gh api repos/<owner/name>/pulls/<n>`). Linked issue: #<m> (`gh api repos/<owner/name>/issues/<m>`) <or: "none">. Fresh review: id <review-id>, its comments at `gh api repos/<owner/name>/pulls/<n>/reviews/<review-id>/comments`. Also in scope: earlier inline threads with no reply yet, from `gh api repos/<owner/name>/pulls/<n>/comments`.
 
 Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at. Match the repo's conventions and vocabulary.
 
