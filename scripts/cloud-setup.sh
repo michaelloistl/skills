@@ -9,7 +9,7 @@ set -euo pipefail
 MATT_SKILLS=(
   code-review codebase-design diagnosing-bugs domain-modeling grill-with-docs
   grilling handoff implement implement-spec improve-codebase-architecture pr
-  prototype research resolving-merge-conflicts retro tdd to-spec to-tickets
+  prototype research retro tdd to-spec to-tickets
   triage wayfinder writing-for-agents
 )
 
