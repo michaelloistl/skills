@@ -111,6 +111,9 @@ service postgresql stop
 cat > /usr/local/bin/rails-services-up <<'EOF'
 #!/usr/bin/env bash
 # Idempotent: install the repo's Ruby and Node, start Postgres and Redis.
+# Wait for the session-start run if it's still going.
+exec 9>/tmp/rails-services-up.lock
+flock 9
 ruby-up
 node-up
 service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null
@@ -120,9 +123,11 @@ chmod +x /usr/local/bin/rails-services-up
 
 # Run it at session start too: repo hooks (e.g. a pre-push bin/ci-lint) call
 # ruby before Claude would, and until ruby-up links the shims, ruby is the
-# image's own. Merge into the settings.json the base script wrote.
+# image's own. In the background: a blocking hook delays session init, and
+# slash commands typed before it finishes go to the model as plain text.
+# Merge into the settings.json the base script wrote.
 settings=~/.claude/settings.json
-jq '.hooks.SessionStart += [{"hooks": [{"type": "command", "command": "rails-services-up >/dev/null", "timeout": 600}]}]' \
+jq '.hooks.SessionStart += [{"hooks": [{"type": "command", "command": "nohup rails-services-up >/tmp/rails-services-up.log 2>&1 &"}]}]' \
   "$settings" > "$settings.tmp" && mv "$settings.tmp" "$settings"
 
 cat >> ~/.claude/CLAUDE.md <<'EOF'
