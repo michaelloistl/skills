@@ -36,6 +36,16 @@ for d in ~/.claude ~/.claude-on; do
   sed -i "s#$MAC_HOME#$HOME#g" "$d/settings.json"
 done
 
+# settings.json only enables plugins; install them (and their marketplaces) per config
+for d in ~/.claude ~/.claude-on; do
+  for repo in anthropics/claude-plugins-official $(jq -r '.extraKnownMarketplaces // {} | .[].source | select(.source == "github") | .repo' "$d/settings.json"); do
+    CLAUDE_CONFIG_DIR=$d claude plugin marketplace add "$repo" >/dev/null 2>&1 || true
+  done
+  for p in $(jq -r '.enabledPlugins // {} | keys[]' "$d/settings.json"); do
+    CLAUDE_CONFIG_DIR=$d claude plugin install "$p" >/dev/null 2>&1 || echo "WARN $d: failed to install $p"
+  done
+done
+
 if command -v herdr >/dev/null; then
   herdr integration install claude >/dev/null
   cp ~/.claude/hooks/herdr-agent-state.sh ~/.claude-on/hooks/
