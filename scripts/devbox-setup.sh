@@ -237,6 +237,7 @@ Done. Next steps (as $DEV_USER — root SSH is now disabled):
   gh auth login                     # pick SSH, upload ~/.ssh/id_ed25519.pub
 
   # From Mac (needs "Host <name>" in ~/.ssh/config):
+  infocmp -x xterm-ghostty | ssh <name> -- tic -x -     # Ghostty terminfo; without it zsh garbles the line
   herdr machine add <name>                              # installs herdr on the box
   ~/Development/skills/scripts/devbox-push-claude-config.sh <name>    # ~/.claude + ~/.claude-on, hooks, statusline, dev-up, herdr hook
   # then log in once per config: claude in ~ (personal) and in ~/Development/on/on-vantage (ON)
