@@ -31,14 +31,15 @@ Another layer earns a test only for a distinct risk the owner cannot reach (a tr
 
 ## Authoring gate
 
-Before adding a test, answer four questions; a missing answer means do not add it yet:
+Before adding a test, answer five questions; a missing answer means do not add it yet:
 
 1. What observable behaviour, invariant, or independent contract does it protect?
 2. What credible regression makes it fail?
 3. Why does existing coverage not already catch it? Prefer adding a row to an existing table/`shared_examples` or reusing a factory trait over a near-duplicate example; consolidate duplicated setup in the same change.
 4. Does it need a production seam no production caller needs? If yes, move the test to the owner boundary instead.
+5. Does it give the same result on any date, at any time of day, in any test order, and in any parallel worker? Name what pins each one (`travel_to`, a scoped selector, its own namespace).
 
-Then check it against every [junk pattern](#junk-patterns); a match fails the gate unless the [retention bar](#retention-bar) names the contract it independently guards. A test that goes red under a behaviour-preserving refactor asserts implementation; rewrite it at the owner before landing.
+Then check it against every [junk pattern](#junk-patterns); a match fails the gate unless the [retention bar](#retention-bar) names the contract it independently guards. Check it against every [flake pattern](#flake-patterns) too; a match always fails the gate — the retention bar does not excuse it, so fix the test. A test that goes red under a behaviour-preserving refactor asserts implementation; rewrite it at the owner before landing.
 
 A bug regression test must go red on the pre-fix code for the intended reason and green after the fix at the owner. One regression at the owner covers the bug; replay it at another layer only for a distinct risk.
 
@@ -59,6 +60,21 @@ Shared checklist: the gate rejects new tests that match; audits hunt existing on
 - names or contexts that promise more than the setup exercises (`"when the subscription has expired"` with no expiry in the setup);
 - tests whose only purpose is preserving a seam: `attr_writer`/`attr_accessor` for injection, `if Rails.env.test?` branches, `reset!` class methods, methods made public for the spec;
 - dead production code whose only callers are specs.
+
+## Flake patterns
+
+A flaky test passes on the run that lands it and fails later, on an unrelated PR. One green run proves nothing; read for these:
+
+- **Selectors and lookups that match more than intended.** `option[value=?]`, `[data-id=?]`, `find_by(id:)` or a text match by id or name alone, when another element or table can hold the same value. Scope to the element under test (`[data-…-target=personSelect] option[value=?]`).
+- **Literal ids.** `id: 11`, `/projects/1`, ids in expected strings. Take ids from the records the test creates.
+- **Date and time read from the clock.** `Date.today`, `Time.current`, `Time.now`, `1.week.from_now`, or a working-day calculation with no `travel_to` / `freeze_time`. These fail at the weekend, near midnight UTC, at a month or DST boundary, or across a timezone.
+- **Fixed dates that expire.** A hardcoded date the code compares to "now" (a contract that "is still running", a date "in the future"). Freeze the clock relative to it.
+- **Order-dependent state.** Class-level caches, memoised constants, `Current`/thread-locals, settings, ENV, Redis, files under a fixed `tmp/` path, globals toggled without an `ensure` reset. The test passes alone and fails after a neighbour, or the other way round.
+- **Unordered collections compared in order.** `assert_equal [a, b], relation.to_a` with no `ORDER BY`; first/last on an unordered relation.
+- **Real time and concurrency.** `sleep`, timeouts, system-test animations, assertions that do not wait for Turbo/JS to settle.
+- **Random data in assertions.** Faker or sequence values that can collide with a uniqueness rule, or sort differently from the expectation.
+
+When a flake is found, fix the class, not the instance: if the harness can make the whole pattern impossible (separate id ranges per table, a reset in the global `setup`), prefer that over patching one test.
 
 ## Retention bar
 
@@ -81,7 +97,8 @@ Read-only; report evidence before editing. For broad scope, dispatch parallel re
 - controllers, request/integration specs, policies, serializers;
 - jobs, mailers, channels, external clients;
 - system specs;
-- a cross-cutting grep sweep for the junk patterns (`send(:`, `receive_message_chain`, `allow_any_instance_of`, `Rails.env.test?`, `have_http_status(:ok)$`, `it { is_expected.to`).
+- a cross-cutting grep sweep for the junk patterns (`send(:`, `receive_message_chain`, `allow_any_instance_of`, `Rails.env.test?`, `have_http_status(:ok)$`, `it { is_expected.to`);
+- a cross-cutting grep sweep for the flake patterns (`Date.today`, `Time.current`, `Time.now`, `from_now`, `ago` in files with no `travel_to`/`freeze_time`; `id: \d`; `option\[value=`; `sleep`; `.first`/`.last` with no `order`).
 
 Outside campaign mode, prefer a few high-confidence candidates over a large speculative inventory.
 
@@ -105,11 +122,12 @@ Pick one coherent owner-boundary batch. Delete obsolete seams and dead productio
 ### 4. Validation
 
 1. Run the touched files and their siblings: `bundle exec rspec <paths>` or `bin/rails test <paths>`.
-2. Run the mutations recorded for deleted candidates once more against the final keepers.
-3. `bundle exec rubocop <changed files>` if configured, then `git diff --check`.
-4. If SimpleCov is present, compare line coverage of each touched production owner before and after; any drop needs a named reason.
-5. Run the full suite (or the project's CI command from `bin/ci` / `.github/workflows`).
-6. `git diff --numstat`: report production separately from tests and support.
+2. Run each new or changed test three more times with different seeds (`--seed <n>`), and with the touched file's neighbours in the same run. If it reads the clock, run it once more with the clock at a weekend and at 23:30 UTC (`travel_to` in a scratch edit, reverted afterwards).
+3. Run the mutations recorded for deleted candidates once more against the final keepers.
+4. `bundle exec rubocop <changed files>` if configured, then `git diff --check`.
+5. If SimpleCov is present, compare line coverage of each touched production owner before and after; any drop needs a named reason.
+6. Run the full suite (or the project's CI command from `bin/ci` / `.github/workflows`).
+7. `git diff --numstat`: report production separately from tests and support.
 
 Done when every step is green and each deleted test's contract has a named keeper or a stated "no contract".
 
