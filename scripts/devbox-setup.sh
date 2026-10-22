@@ -149,9 +149,9 @@ command -v ~/.local/bin/claude &>/dev/null || curl -fsSL https://claude.ai/insta
 # Skills: third-party via `npx skills` into ~/.agents/skills (symlinked into ~/.claude/skills),
 # own repo cloned to ~/Development/skills and linked by its link-skills.sh.
 # No -a flag: naming a single agent makes the CLI copy instead of symlink.
-npx -y skills@latest add mattpocock/skills -g -y -s $MATT_SKILLS
-npx -y skills@latest add humanlayer/skills -g -y -s show-me
-npx -y skills@latest add vercel-labs/skills -g -y -s find-skills
+npx -y skills@latest add mattpocock/skills -g -y -s $MATT_SKILLS </dev/null
+npx -y skills@latest add humanlayer/skills -g -y -s show-me </dev/null
+npx -y skills@latest add vercel-labs/skills -g -y -s find-skills </dev/null
 if [ ! -d ~/Development/skills ]; then
   # https: public, works before gh auth; ssh remote so pushes work after it
   git clone "https://github.com/$SKILLS_REPO" ~/Development/skills
