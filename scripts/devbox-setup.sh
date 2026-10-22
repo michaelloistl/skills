@@ -28,7 +28,7 @@ apt-get update
 apt-get upgrade -y
 apt-get install -y \
   build-essential git curl wget ca-certificates gnupg unzip zip \
-  zsh tmux htop jq ripgrep fd-find tree direnv \
+  zsh htop jq ripgrep fd-find tree direnv \
   ufw fail2ban unattended-upgrades \
   libssl-dev libyaml-dev libreadline-dev zlib1g-dev libffi-dev libgmp-dev \
   libpq-dev libvips libvips-dev pkg-config \
@@ -220,17 +220,6 @@ _claude_config_dir_update
 # host tag so remote panes are distinguishable from local ones
 PROMPT="%{$fg[yellow]%}%m%{$reset_color%} $PROMPT"
 PROMPT+='%{$fg_bold[blue]%}ai:(%{$fg[red]%}${CLAUDE_PROMPT_LABEL}%{$fg_bold[blue]%})%{$reset_color%} '
-
-# reattach to main tmux session on ssh login (not inside herdr panes, which inherit SSH_CONNECTION)
-if [[ -z "$TMUX" && -z "$HERDR_ENV" && -n "$SSH_CONNECTION" && -o interactive ]]; then tmux new -A -s main; fi
-EOF
-
-cat > ~/.tmux.conf <<'EOF'
-set -g mouse on
-set -g history-limit 100000
-set -g default-terminal "tmux-256color"
-set -sg escape-time 10
-set -g set-clipboard on
 EOF
 
 mkdir -p ~/Development/on
