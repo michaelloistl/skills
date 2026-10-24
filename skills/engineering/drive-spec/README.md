@@ -2,6 +2,14 @@
 
 Skill: builds a spec's tracer-bullet issues, each in its own worktree, into one draft PR. Entry point is [`SKILL.md`](SKILL.md).
 
+## The `drive-spec` script
+
+Python 3, standard library only, with `gh` and `git` on the PATH. Run it from inside the repo. It holds the run's deterministic rules, so the model calls them rather than remembers them.
+
+- `drive-spec plan <spec> [--json]`: the spec's slices in build order, each with its state, blockers, branch and PR. Read-only. Exit 2 refuses the spec (a `## Parent` of its own, no tracer-bullets, a cycle), with the reason on the `refuse:` line; exit 1 is a failed tracker or git call. Contract: [`TRACKER.md`](TRACKER.md), Discovery.
+
+Tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/drive-spec`, from the repo root. They run the pure logic on fixtures and the script end to end against fake `gh` and `git`.
+
 ## status.sh
 
 Writes the run's status file so a dispatcher can watch every drive-spec on the machine without reading transcripts. Contract and states: [`STATUS.md`](STATUS.md).

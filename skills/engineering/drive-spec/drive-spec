@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""drive-spec: the deterministic half of a drive-spec run. See README.md."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REF = re.compile(r"#(\d+)\b")
+HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*#*\s*$")
+
+
+class Failed(Exception):
+    pass
+
+
+def sh(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Failed(f"{cmd[0]}: {e}")
+    if out.returncode != 0:
+        raise Failed(f"{' '.join(cmd[:3])}: {out.stderr.strip() or f'exit {out.returncode}'}")
+    return out.stdout
+
+
+def json_lines(text):
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def repo_slug(url):
+    parts = re.split(r"[/:]", re.sub(r"(\.git)?/*$", "", url.strip()))
+    return f"{parts[-2]}/{parts[-1]}"
+
+
+def sections(body):
+    """Body text under each `#`/`##` heading, keyed by lowercased heading."""
+    out, current = {}, None
+    for line in (body or "").replace("\r\n", "\n").split("\n"):
+        m = HEADING.match(line)
+        if m:
+            current = m.group(1).lower()
+            out.setdefault(current, "")
+        elif current is not None:
+            out[current] += line + "\n"
+    return out
+
+
+def parent_of(body):
+    m = REF.search(sections(body).get("parent", ""))
+    return int(m.group(1)) if m else None
+
+
+def blockers_of(body):
+    return sorted({int(n) for n in REF.findall(sections(body).get("blocked by", ""))})
+
+
+def cycle_members(edges, nodes):
+    """Slices on a cycle among `nodes` (Tarjan), excluding those only downstream of one."""
+    index, low, stack, on, found, counter = {}, {}, [], set(), [], [0]
+
+    def visit(v):
+        index[v] = low[v] = counter[0]
+        counter[0] += 1
+        stack.append(v)
+        on.add(v)
+        for w in edges[v]:
+            if w not in nodes:
+                continue
+            if w not in index:
+                visit(w)
+                low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], index[w])
+        if low[v] == index[v]:
+            comp = []
+            while True:
+                w = stack.pop()
+                on.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            if len(comp) > 1 or v in edges[v]:
+                found.extend(comp)
+
+    for v in sorted(nodes):
+        if v not in index:
+            visit(v)
+    return sorted(found)
+
+
+def build_plan(spec, issues, heads, open_prs, sub_issues=(), held_label=None, cloud=False):
+    """The run's plan from tracker and branch facts alone.
+
+    spec: the spec issue; issues: every issue whose body may reference it;
+    heads: branch names on origin; open_prs: head refs of open PRs into the spec branch;
+    sub_issues: native sub-issue numbers of the spec.
+    """
+    n = spec["number"]
+    plan = {"spec": n, "title": spec.get("title", ""), "refuse": None}
+
+    if spec.get("pull_request") is not None:
+        plan["refuse"] = f"#{n} is a pull request, not a spec issue"
+        return plan
+    own_parent = parent_of(spec.get("body"))
+    if own_parent is not None:
+        plan["refuse"] = f"#{n} has a ## Parent of its own (#{own_parent}): it is a slice, not a spec"
+        return plan
+
+    slices = {i["number"]: i for i in issues
+              if i.get("pull_request") is None and i["number"] != n and parent_of(i.get("body")) == n}
+    plan["invisible"] = sorted(set(sub_issues) - set(slices))
+    if not slices:
+        plan["refuse"] = f"#{n} has no tracer-bullets: no issue names it first under ## Parent"
+        return plan
+
+    edges, external = {}, {}
+    for m, i in slices.items():
+        refs = blockers_of(i.get("body"))
+        edges[m] = [b for b in refs if b in slices]
+        external[m] = [b for b in refs if b not in slices]
+
+    order, taken = [], set()
+    while True:
+        ready = [m for m in slices if m not in taken and all(b in taken for b in edges[m])]
+        if not ready:
+            break
+        m = min(ready)
+        order.append(m)
+        taken.add(m)
+    left = set(slices) - taken
+    if left:
+        cycle = cycle_members(edges, left)
+        plan["refuse"] = "blockers form a cycle: " + ", ".join(f"#{m}" for m in cycle)
+        plan["cycle"] = cycle
+        return plan
+
+    specs = [h for h in heads if h.startswith(f"agent/local-spec-{n}-")]
+    if len(specs) > 1:
+        raise Failed(f"several spec branches on origin for #{n}: {', '.join(specs)}")
+    plan["spec_branch"] = specs[0] if specs else None
+
+    out = []
+    for m in order:
+        i = slices[m]
+        prefix = f"agent/issue-{m}-"
+        pr = next((p for p in open_prs if p["head"].startswith(prefix)), None)
+        branch = next((h for h in heads if h.startswith(prefix)), None)
+        labels = i.get("labels", [])
+        if i.get("state") == "closed":
+            state = "closed"
+        elif cloud and held_label and held_label in labels:
+            state = "held"
+        elif pr:
+            state, branch = "open-pr", pr["head"]
+        elif branch:
+            state = "in-flight"
+        else:
+            state = "todo"
+        out.append({
+            "number": m,
+            "title": i.get("title", ""),
+            "state": state,
+            "blockers": edges[m],
+            "external_blockers": external[m],
+            "labels": labels,
+            "branch": branch if state != "closed" else None,
+            "pr": pr["number"] if pr and state == "open-pr" else None,
+        })
+    plan["slices"] = out
+    return plan
+
+
+def render(plan):
+    lines = [f"spec #{plan['spec']} {plan['title']}"]
+    if plan["refuse"]:
+        lines.append(f"refuse: {plan['refuse']}")
+        return "\n".join(lines)
+    lines.append(f"spec branch: {plan['spec_branch'] or 'none on origin'}")
+    lines.append("order:")
+    width = max(len(f"#{s['number']}") for s in plan["slices"])
+    for s in plan["slices"]:
+        state = f"open-pr #{s['pr']}" if s["pr"] else s["state"]
+        after = f"  after {', '.join(f'#{b}' for b in s['blockers'])}" if s["blockers"] else ""
+        num = f"#{s['number']}"
+        lines.append(f"  {num:<{width}}  {state:<12} {s['title']}{after}")
+    ext = [f"#{b} (for #{s['number']})" for s in plan["slices"] for b in s["external_blockers"]]
+    if ext:
+        lines.append("outside the spec, ignored: " + ", ".join(ext))
+    if plan["invisible"]:
+        lines.append("invisible (sub-issue without ## Parent, not built): "
+                     + ", ".join(f"#{m}" for m in plan["invisible"]))
+    return "\n".join(lines)
+
+
+def load_config(root):
+    try:
+        return json.loads((Path(root) / ".claude" / "drive-spec.json").read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError as e:
+        raise Failed(f".claude/drive-spec.json: {e}")
+
+
+def fetch(spec):
+    repo = repo_slug(sh(["git", "remote", "get-url", "origin"]))
+    spec_issue = json.loads(sh(["gh", "api", f"repos/{repo}/issues/{spec}",
+                                "--jq", "{number,title,body,state,pull_request}"]))
+    issues = [i for i in json_lines(sh([
+        "gh", "api", "--paginate", f"repos/{repo}/issues?state=all&per_page=100",
+        "--jq", ".[] | {number,title,body,state,pull_request,labels: [.labels[].name]}"]))
+        if f"#{spec}" in (i.get("body") or "")]
+    heads = [line.split("refs/heads/", 1)[1] for line in
+             sh(["git", "ls-remote", "--heads", "origin", "agent/*"]).splitlines() if "refs/heads/" in line]
+    try:
+        sub_issues = [i["number"] for i in json_lines(sh(
+            ["gh", "api", "--paginate", f"repos/{repo}/issues/{spec}/sub_issues", "--jq", ".[] | {number}"]))]
+    except Failed:
+        sub_issues = []
+    spec_branch = next((h for h in heads if h.startswith(f"agent/local-spec-{spec}-")), None)
+    open_prs = json_lines(sh([
+        "gh", "api", "--paginate", f"repos/{repo}/pulls?state=open&base={spec_branch}&per_page=100",
+        "--jq", ".[] | {number, head: .head.ref}"])) if spec_branch else []
+    return spec_issue, issues, heads, open_prs, sub_issues
+
+
+def cmd_plan(spec, as_json):
+    root = sh(["git", "rev-parse", "--show-toplevel"]).strip()
+    label = (load_config(root).get("localOnly") or {}).get("label")
+    cloud = os.environ.get("CLAUDE_CODE_REMOTE") == "true"
+    spec_issue, issues, heads, open_prs, sub_issues = fetch(spec)
+    plan = build_plan(spec_issue, issues, heads, open_prs, sub_issues, label, cloud)
+    print(json.dumps(plan, indent=2) if as_json else render(plan))
+    return 2 if plan["refuse"] else 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="drive-spec")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    pl = sub.add_parser("plan", help="a spec's slices in build order, each with its state; exit 2 to refuse the spec")
+    pl.add_argument("spec")
+    pl.add_argument("--json", action="store_true")
+    args = p.parse_args()
+    try:
+        if args.cmd == "plan":
+            sys.exit(cmd_plan(int(args.spec.lstrip("#")), args.json))
+    except Failed as e:
+        sys.exit(f"drive-spec: {e}")
+
+
+if __name__ == "__main__":
+    main()

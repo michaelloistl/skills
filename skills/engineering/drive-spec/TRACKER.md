@@ -10,39 +10,17 @@ repo=$(git remote get-url origin | sed -E 's#(\.git)?/*$##' | awk -F'[/:]' '{pri
 
 REST reports state in lowercase: `open`, `closed`. The issues endpoints also return pull requests; drop any item with a `pull_request` key.
 
-## Discovery
+## Discovery, blockers and slice state
 
-The spec is identified structurally: it has tracer-bullets and no `## Parent` section of its own. Nothing about its title or labels matters.
+`drive-spec plan <spec>` computes all three; this section is the contract it implements, and `test_drive_spec.py` holds it to it.
 
-```sh
-gh api "repos/$repo/issues/<spec>" --jq '{number,title,body,state}'
-gh api --paginate "repos/$repo/issues?state=all&per_page=100" \
-  --jq '.[] | select(.pull_request | not) | select((.body // "") | contains("#<spec>"))
-        | {number,title,body,state,labels: [.labels[].name]}'
-```
-
-Listing and filtering locally, not the search endpoint: search indexes lag, and a ticket written seconds ago must be found.
-
-A candidate is a tracer-bullet when the first `#N` in its `## Parent` section is the spec. Membership is textual only; a native sub-issue without `## Parent` is invisible to the run, so list it in the preview as invisible rather than building it.
-
-## Blockers
-
-The `#<m>` refs in each slice's `## Blocked by` section, already in hand from discovery.
-
-For ordering, keep only blockers that are themselves slices of this spec; a blocker outside the spec is printed in the preview and otherwise ignored. A blocker that is still open gates the slice.
-
-Topological order: repeatedly take the open or closed slice with every blocker already taken, lowest number first. Anything left over is a cycle: refuse, naming the slices in it.
-
-## Slice state
-
-| State | Evidence |
-|---|---|
-| closed | issue `state` is `closed` |
-| open PR | `gh api "repos/$repo/pulls?state=open&base=<spec branch>&per_page=100" --jq '.[] \| select(.head.ref \| startswith("agent/issue-<m>-")) \| .number'` returns one |
-| in-flight | `git ls-remote --heads origin 'agent/issue-<m>-*'` returns a branch and no open PR |
-| todo | none of the above |
-
-Check in that order: a closed slice's branch may linger on origin (see WORKTREES.md, Remove), and closed wins.
+- **Spec**: identified structurally: it has tracer-bullets and no `## Parent` of its own. Title and labels do not matter.
+- **Discovery** lists every issue and filters locally, never the search endpoint: search indexes lag, and a ticket written seconds ago must be found.
+- **Membership**: a slice is an issue whose first `#N` under `## Parent` is the spec. Textual only: a native sub-issue without `## Parent` is printed as invisible and never built.
+- **Blockers**: the `#<m>` refs under `## Blocked by`. Only blockers that are slices of this spec order the build; any other is printed and ignored.
+- **Order**: repeatedly take the slice, open or closed, whose blockers are all taken, lowest number first. Anything left over is a cycle: refuse, naming only the slices on it.
+- **State**, first match wins: `closed` (issue closed; a closed slice's branch may linger on origin, see WORKTREES.md, Remove); `held` (a cloud session and the `localOnly` label); `open-pr` (an open PR into the spec branch from `agent/issue-<m>-*`); `in-flight` (that branch on origin, no PR); `todo`.
+- A failed tracker or git call fails the plan loudly, never an empty plan: an empty one would refuse the spec for the wrong reason.
 
 ## Labels
 
