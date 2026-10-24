@@ -10,7 +10,19 @@ One JSON file per spec, read by a dispatcher that watches every run on the machi
 
 ## When
 
-At the end of every step, and within step 6 at each dispatch, landing and halt. Every write carries `step`, `state`, `summary` and `next`; add `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
+At the end of every step, and within step 6 at each dispatch, landing and halt. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
+
+| Step | Written by |
+|---|---|
+| `resolve` | `drive-spec gate <spec> '<verify>' --base <base>` |
+| `guard` | `drive-spec plan <spec>`, while the run is at step 1 or 2; refused: `finish refused` |
+| `worktree` | `drive-spec open` |
+| `preview` | `drive-spec preview`; `paused` with `--dry-run` |
+| `explore` | `drive-spec explored`; conflicts: `finish conflicts` |
+| `build` | `start`, `land`, `halt`, `finish ceiling\|held` |
+| `review` | `drive-spec reviewed` |
+| `confirm`, `cleanup` | `drive-spec confirm`, `drive-spec cleanup` |
+| `review-pr` | `finish done`, or `finish halted --step review-pr` |
 
 `step` is the step's name: `resolve`, `guard`, `worktree`, `preview`, `explore`, `build`, `review`, `confirm`, `cleanup`, `review-pr`.
 
@@ -38,7 +50,7 @@ A judgement call the run made on its own and the operator may want to revisit is
 
 ## Inbox
 
-The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step: before each step, and in step 6 before picking from the frontier and before integrating each slice. `drive-spec frontier` and `drive-spec integrate` read it themselves: with notes waiting, they print them and exit 5, and run again once the notes are handled.
+The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step, and only once the spec branch exists: the end of `drive-spec open` (step 3), then the start of `preview`, `frontier` (before every pick, and before step 7), `integrate`, `confirm` and `cleanup`. Each reads it itself: with notes waiting, it prints them and exits 5, and runs again once the notes are handled. Notes that arrive before step 3 wait in the inbox for `open`; notes that arrive during step 10 stay unread; once the run is `done`, the dispatcher stops writing notes and alerts the operator itself when base touches files the draft PR changes (from `branch`).
 
 ```sh
 <skill dir>/status.sh <spec> --inbox
@@ -48,7 +60,7 @@ Prints any unread notes and archives them; prints nothing when the inbox is empt
 
 A **base note** starts `## <base> advanced:` and names what landed in base, the files it changed, and an `Overlaps your branch:` line: the files the spec branch changes too.
 
-- Overlap listed: at this boundary, merge `origin/<base>` into the spec branch in the spec worktree. Conflicts go to a merger subagent, as in the integration queue; then `drive-spec verify <spec> <spec worktree>`, then push. Slices dispatched afterwards start from the merged branch; slices already in flight take it up at integration. Before step 3 there is no spec branch: carry the note to the first boundary after it. Before step 10 the spec worktree is gone: `drive-spec open <spec>` for the merge, pin the gate again with `drive-spec gate`, and remove the worktree after the push.
+- Overlap listed: at this boundary, merge `origin/<base>` into the spec branch in the spec worktree. Conflicts go to a merger subagent, as in the integration queue; then `drive-spec verify <spec> <spec worktree>`, then push. Slices dispatched afterwards start from the merged branch; slices already in flight take it up at integration.
 - `Overlaps your branch: none`: nothing to merge.
 
 Either way, say in the next `summary` what the note led to: `merged develop (#2998)` or `develop #2998: no overlap`.

@@ -271,12 +271,22 @@ class Run:
             query += f"&head={self.repo.split('/')[0]}:{head}"
         return json_lines(gh("--paginate", f"repos/{self.repo}/pulls?{query}", "--jq", PR_FIELDS))
 
-    def base(self):
+    def current(self):
+        """The status file as last written, `{}` when there is none."""
         try:
-            base = json.loads((self.common / "drive-spec" / "status" / f"spec-{self.spec}.json").read_text()).get("base")
+            return json.loads((self.common / "drive-spec" / "status" / f"spec-{self.spec}.json").read_text())
         except (OSError, ValueError):
-            base = None
+            return {}
+
+    def base(self, fresh=False):
+        """The run's base: the status file's (written from step 1 on), then config, then the repo default.
+        `fresh` skips the status file, for step 1 itself, where it may still hold an earlier run's base."""
+        base = None if fresh else self.current().get("base")
         return base or self.config.get("baseBranch") or gh(f"repos/{self.repo}", "--jq", ".default_branch").strip()
+
+    def mode(self, sequential, max_slices):
+        parallel = not sequential and self.config.get("parallel", True) is not False
+        return parallel, self.config.get("maxSlices") if max_slices is None else max_slices
 
     def status(self, **fields):
         script = Path(__file__).resolve().with_name("status.sh")
@@ -308,9 +318,15 @@ def make_plan(run):
 
 
 def cmd_plan(spec, as_json):
-    plan = make_plan(Run(spec))
+    run = Run(spec)
+    plan = make_plan(run)
     print(json.dumps(plan, indent=2) if as_json else render(plan))
-    return REFUSE if plan["refuse"] else 0
+    if plan["refuse"]:
+        return REFUSE
+    if not as_json and run.current().get("step") in (None, "resolve", "guard"):
+        run.status(step="guard", state="running", summary=f"plan: {progress_summary(plan)}",
+                   next="open the spec worktree")
+    return 0
 
 
 def progress_summary(plan):
@@ -360,13 +376,16 @@ def pinned_gate(run):
         return None
 
 
-def cmd_gate(spec, command):
+def cmd_gate(spec, command, base):
     run = Run(spec)
     if command:
         old = pinned_gate(run)
         run.notes.mkdir(parents=True, exist_ok=True)
         (run.notes / "gate").write_text(command + "\n")
         (run.notes / "run.json").write_text(json.dumps({"started_at": stamp(), "gate": command}))
+        base = base or run.base(fresh=True)
+        run.status(step="resolve", state="running", summary=f"resolved: base {base}, gate pinned",
+                   next="guard the spec", base=base, question="")
         print(f"gate pinned: {command}" + (f" (was: {old})" if old and old != command else ""))
         return 0
     gate = pinned_gate(run) or run.config.get("verify")
@@ -720,9 +739,7 @@ def cmd_frontier(spec, running, sequential, max_slices, as_json):
     if inbox(run):
         return INBOX
     plan = checked_plan(run)
-    parallel = not sequential and run.config.get("parallel", True) is not False
-    if max_slices is None:
-        max_slices = run.config.get("maxSlices")
+    parallel, max_slices = run.mode(sequential, max_slices)
     f = pick(plan, running, parallel, max_slices, landed_this_run(run) if max_slices is not None else 0,
              (run.config.get("localOnly") or {}).get("label"))
     if f["stop"] == "blocked":
@@ -883,7 +900,94 @@ def cmd_open(spec, base):
     run.status(step="worktree", state="running", summary=f"spec worktree {how}: {branch}", next="preview",
                branch=branch, base=base)
     print(f"worktree {wt} on {branch} ({how})")
+    return INBOX if inbox(run) else 0
+
+
+# preview, explore and review: the ends of steps 4, 5 and 7
+
+def cmd_preview(spec, sequential, max_slices, dry_run):
+    run = Run(spec)
+    if inbox(run):
+        return INBOX
+    plan = checked_plan(run)
+    base = run.base()
+    parallel, max_slices = run.mode(sequential, max_slices)
+    post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
+    print(f"base: {base}\nspec branch: {plan['spec_branch']}\nworktree root: {run.root}\n"
+          f"mode: {'parallel' if parallel else 'sequential'}\nceiling: {max_slices or 'none'}\n")
+    print(render(plan))
+    summary = progress_summary(plan)
+    if dry_run:
+        run.status(step="preview", state="paused", summary=f"dry run: {summary}", next=f"/drive-spec {spec}")
+    else:
+        run.status(step="preview", state="running", summary=summary, next="explore the open slices")
     return 0
+
+
+def run_started(run):
+    try:
+        return datetime.fromisoformat(json.loads((run.notes / "run.json").read_text())["started_at"])
+    except (OSError, ValueError, KeyError):
+        raise Failed("no run start: pin the gate at step 1 (`drive-spec gate <spec> '<verify>'`)", REFUSE)
+
+
+def cmd_explored(spec):
+    run = Run(spec)
+    plan = checked_plan(run)
+    started = run_started(run)
+    missing = [f"issue-{x['number']}.md" for x in plan["slices"]
+               if x["state"] != "closed" and not (run.notes / f"issue-{x['number']}.md").is_file()]
+    conflicts = run.notes / "conflicts.md"
+    if not conflicts.is_file():
+        missing.append("conflicts.md")
+    if missing:
+        raise Failed(f"explore is not done: no {', '.join(missing)} in {run.notes}", REFUSE)
+    if datetime.fromtimestamp(conflicts.stat().st_mtime, timezone.utc) < started:
+        raise Failed(f"{conflicts} predates this run: check the open slices again and write it fresh", REFUSE)
+    if conflicts.read_text().strip():
+        finish(run, "conflicts")
+        return CONFLICT
+    open_ = sum(x["state"] != "closed" for x in plan["slices"])
+    run.status(step="explore", state="running", summary=f"explored {open_} open slice(s), no conflicts; "
+               f"{progress_summary(plan)}", next="build the frontier", branch=plan["spec_branch"])
+    print(f"explored: notes for {open_} open slice(s), no conflicts")
+    return 0
+
+
+def cmd_reviewed(spec, left):
+    run = Run(spec)
+    plan = checked_plan(run)
+    open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
+    if open_:
+        raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
+    wt = run.root / f"spec-{spec}"
+    if not wt.is_dir():
+        raise Failed(f"no spec worktree at {wt}: `drive-spec open {spec}`", REFUSE)
+    if dirty(wt):
+        raise Failed(f"{wt} has uncommitted changes: commit the fixes, verify, push", REFUSE)
+    branch = plan["spec_branch"]
+    git(wt, "fetch", "--quiet", "origin")
+    head = git(wt, "rev-parse", "HEAD")
+    if head != git(wt, "rev-parse", f"origin/{branch}"):
+        raise Failed(f"{wt} is not at origin/{branch}: push the fixes, or pull what landed", REFUSE)
+    if record(run, head).get("exit") != 0:
+        raise Failed(f"{head[:12]} is not verified green: `drive-spec verify {spec} {wt}`", REFUSE)
+    kept = run.notes / "left.md"
+    if left and left.strip():
+        kept.write_text(left.strip() + "\n")
+    else:
+        kept.unlink(missing_ok=True)
+    spec_pr = spec_pr_of(run, run.base(), branch)
+    summary = "review left findings open" if kept.exists() else "review clean"
+    run.status(step="review", state="running", summary=f"{summary} at {head[:12]}", next="confirm the spec PR",
+               branch=branch, **({"pr_url": spec_pr["url"]} if spec_pr else {}))
+    print(f"{summary} at {head[:12]}")
+    return 0
+
+
+def left_of(body):
+    m = re.search(r"^Left from review:\s*\n(.*)\Z", body or "", re.S | re.M)
+    return m.group(1).strip() if m else ""
 
 
 def deviations_of(body):
@@ -894,7 +998,14 @@ def deviations_of(body):
 
 def cmd_confirm(spec, left):
     run = Run(spec)
+    if inbox(run):
+        return INBOX
     plan = checked_plan(run)
+    if left is None:
+        try:
+            left = (run.notes / "left.md").read_text()
+        except FileNotFoundError:
+            pass
     open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
     if open_:
         raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
@@ -924,6 +1035,8 @@ def cmd_confirm(spec, left):
 
 def cmd_cleanup(spec):
     run = Run(spec)
+    if inbox(run):
+        return INBOX
     plan = checked_plan(run)
     open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
     if open_:
@@ -982,6 +1095,8 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=Non
             spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"]) if plan["spec_branch"] else None
             if not spec_pr:
                 raise Failed("not done: no open spec PR", REFUSE)
+            if left is None:
+                left = left_of(json.loads(gh(f"repos/{run.repo}/pulls/{spec_pr['number']}", "--jq", "{body}"))["body"])
             review = "review left findings open" if left else "review clean"
             first = f"drive-spec done: all {len(slices)} slices landed, {review}. Spec PR #{spec_pr['number']}."
             if left:
@@ -1046,6 +1161,7 @@ def main():
     g = sub.add_parser("gate", help="print the run's verify gate, or pin one for the run")
     g.add_argument("spec")
     g.add_argument("command", nargs="?")
+    g.add_argument("--base", help="with a command: the run's base branch; default config, then the repo's")
     v = sub.add_parser("verify", help="run the gate on a worktree's HEAD and record the verdict; exit 4 when red")
     v.add_argument("spec")
     v.add_argument("worktree")
@@ -1077,6 +1193,16 @@ def main():
     co = sub.add_parser("confirm", help="with every slice closed: the spec PR closes the spec and lists deviations")
     co.add_argument("spec")
     co.add_argument("--left", help="what the last review left open, or `-` for stdin")
+    pv = sub.add_parser("preview", help="print the run, refresh the progress comment; --dry-run pauses there")
+    pv.add_argument("spec")
+    pv.add_argument("--sequential", action="store_true")
+    pv.add_argument("--max", type=int, dest="max_slices", help="maxSlices; default from .claude/drive-spec.json")
+    pv.add_argument("--dry-run", action="store_true")
+    ex = sub.add_parser("explored", help="end of explore: notes for every open slice; exit 3 halts on conflicts")
+    ex.add_argument("spec")
+    rv = sub.add_parser("reviewed", help="end of review: the spec branch is pushed and green; keep what is left")
+    rv.add_argument("spec")
+    rv.add_argument("--left", help="what the last review left open, or `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
     fi = sub.add_parser("finish", help="post the run's status comment and final status")
@@ -1093,7 +1219,7 @@ def main():
         if args.cmd == "plan":
             code = cmd_plan(spec, args.json)
         elif args.cmd == "gate":
-            code = cmd_gate(spec, args.command)
+            code = cmd_gate(spec, args.command, args.base)
         elif args.cmd == "verify":
             code = cmd_verify(spec, args.worktree)
         elif args.cmd == "integrate":
@@ -1108,6 +1234,12 @@ def main():
             code = cmd_confirm(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "cleanup":
             code = cmd_cleanup(spec)
+        elif args.cmd == "preview":
+            code = cmd_preview(spec, args.sequential, args.max_slices, args.dry_run)
+        elif args.cmd == "explored":
+            code = cmd_explored(spec)
+        elif args.cmd == "reviewed":
+            code = cmd_reviewed(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "frontier":
             running = [int(x.strip().lstrip("#")) for x in args.running.split(",") if x.strip()]
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
