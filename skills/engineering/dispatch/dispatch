@@ -628,6 +628,26 @@ def cmd_watch(dirs):
             herdr.drain()
 
 
+def cmd_answer(spec, text, dirs):
+    data = read_status_files(dirs).get(spec)
+    row = next((r for r in snapshot(dirs) if r["spec"] == spec), None)
+    if not data or not row:
+        sys.exit(f"{spec} not answered: no status file")
+    question = data.get("question")
+    if data.get("state") != "waiting" or not question or not data.get("question_blocking"):
+        sys.exit(f"{spec} not answered: it is not waiting on a question ({data.get('state')})")
+    if not row["pane"]:
+        sys.exit(f"{spec} not answered: no pane holds its session; recover it first")
+    if row["herdr"] in ("working", "blocked") or row["session"] == "busy":
+        sys.exit(f"{spec} not answered: it is {row['herdr'] if row['herdr'] in ('working', 'blocked') else 'busy'}; send it once it settles")
+    prompt = f"The operator's answer to your question ({question}): {text}"
+    try:
+        herdr_json("agent", "prompt", row["pane"], prompt)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+        sys.exit(f"{spec} not answered: {e}")
+    print(f"{spec} answered in {row['pane']}: {question} → {text}")
+
+
 def cmd_ack(spec, dirs):
     data = read_status_files(dirs).get(spec)
     if not data:
@@ -647,6 +667,9 @@ def main():
     sub.add_parser("watch", help="print a line whenever a spec starts or stops needing you")
     a = sub.add_parser("ack", help="hide a done spec until its status changes")
     a.add_argument("spec")
+    an = sub.add_parser("answer", help="send the operator's answer to a spec waiting on its question")
+    an.add_argument("spec")
+    an.add_argument("text", nargs="+")
     lp = sub.add_parser("launch", help="start drive-specs in new herdr tabs, or queue them under pressure")
     lp.add_argument("specs", nargs="+")
     lp.add_argument("--force", action="store_true", help="start even under pressure")
@@ -668,6 +691,8 @@ def main():
             pass
     elif args.cmd == "ack":
         cmd_ack(args.spec, dirs)
+    elif args.cmd == "answer":
+        cmd_answer(args.spec.lstrip("#"), " ".join(args.text), dirs)
     elif args.cmd == "launch":
         cmd_launch([n.lstrip("#") for n in args.specs], dirs, args.force)
     elif args.cmd == "recover":
