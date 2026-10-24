@@ -1,10 +1,12 @@
 """Tests for the drive-spec script. Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/drive-spec"""
 
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -149,75 +151,419 @@ class States(unittest.TestCase):
             plan([issue(11, 10)], ["agent/local-spec-10-a", "agent/local-spec-10-b"])
 
 
+FAKE_GH = r"""
+import json, os, subprocess, sys, tempfile, urllib.parse
+from datetime import datetime, timezone
+
+STATE = os.path.join(os.environ["FIX"], "gh.json")
+st = json.load(open(STATE))
+args = sys.argv[1:]
+st["calls"].append(" ".join(args))
+assert args[0] == "api", args
+method, endpoint, fields, jq, silent, i = None, None, {}, None, False, 1
+while i < len(args):
+    a = args[i]
+    if a == "--paginate": pass
+    elif a == "--silent": silent = True
+    elif a == "--jq": i += 1; jq = args[i]
+    elif a == "-X": i += 1; method = args[i]
+    elif a in ("-f", "-F"):
+        i += 1; k, v = args[i].split("=", 1)
+        fields[k] = (v == "true") if a == "-F" and v in ("true", "false") else v
+    else: endpoint = a
+    i += 1
+method = method or ("POST" if fields else "GET")
+path, _, query = endpoint.partition("?")
+q = dict(urllib.parse.parse_qsl(query))
+parts = path.split("/")[3:]
+origin = st["origin"]
+
+
+def die(msg):
+    json.dump(st, open(STATE, "w"))
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def sha(ref):
+    out = subprocess.run(["git", "--git-dir", origin, "rev-parse", "--verify", "-q", f"refs/heads/{ref}"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() or None
+
+
+def pull(p):
+    return {"number": p["number"], "state": p["state"], "draft": p["draft"], "title": p["title"],
+            "body": p["body"], "merged_at": p["merged_at"], "mergeable": p.get("mergeable", True),
+            "html_url": f"https://github.com/acme/app/pull/{p['number']}",
+            "base": {"ref": p["base"]}, "head": {"ref": p["head"], "sha": p.get("merged_sha") or sha(p["head"])}}
+
+
+def issue(n):
+    i = st["issues"].get(str(n)) or die(f"HTTP 404 issue {n}")
+    return dict(i, labels=[{"name": l} for l in i["labels"]])
+
+
+out = None
+if method == "GET" and parts == []:
+    out = {"default_branch": "main"}
+elif parts == ["issues"] and method == "GET":
+    out = [issue(n) for n in st["issues"]]
+elif len(parts) == 2 and parts[0] == "issues" and method == "GET":
+    out = issue(parts[1])
+elif len(parts) == 2 and parts[0] == "issues" and method == "PATCH":
+    st["issues"][parts[1]].update(state=fields["state"])
+elif parts[:1] == ["issues"] and parts[2:] == ["sub_issues"]:
+    out = [{"number": n} for n in st.get("sub_issues", [])]
+elif parts[:1] == ["issues"] and parts[2:] == ["comments"] and method == "GET":
+    out = [c for c in st["comments"] if c["issue"] == int(parts[1])]
+elif parts[:1] == ["issues"] and parts[2:] == ["comments"] and method == "POST":
+    st["comments"].append({"id": 900 + len(st["comments"]), "issue": int(parts[1]), "body": fields["body"]})
+elif parts[:2] == ["issues", "comments"] and method == "PATCH":
+    next(c for c in st["comments"] if c["id"] == int(parts[2]))["body"] = fields["body"]
+elif parts[:1] == ["issues"] and parts[2:3] == ["labels"] and method == "DELETE":
+    labels = st["issues"][parts[1]]["labels"]
+    name = urllib.parse.unquote(parts[3])
+    if name not in labels:
+        die("HTTP 404 label")
+    labels.remove(name)
+elif parts == ["pulls"] and method == "GET":
+    head = q.get("head", "").split(":")[-1]
+    out = [pull(p) for p in st["pulls"] if (q.get("state") in (None, "all") or p["state"] == q["state"])
+           and p["base"] == q.get("base", p["base"]) and (not head or p["head"] == head)]
+elif parts == ["pulls"] and method == "POST":
+    if not sha(fields["head"]):
+        die("HTTP 422 head not on origin")
+    p = {"number": 100 + len(st["pulls"]), "state": "open", "draft": fields.get("draft", False),
+         "title": fields["title"], "body": fields["body"], "base": fields["base"], "head": fields["head"],
+         "merged_at": None}
+    st["pulls"].append(p)
+    out = pull(p)
+elif parts[:1] == ["pulls"] and len(parts) == 2:
+    out = pull(next(p for p in st["pulls"] if p["number"] == int(parts[1])))
+elif parts[:1] == ["pulls"] and parts[2:] == ["merge"] and method == "PUT":
+    p = next(p for p in st["pulls"] if p["number"] == int(parts[1]))
+    if fields.get("sha") != sha(p["head"]):
+        die("HTTP 409 head moved")
+    work = tempfile.mkdtemp()
+    for cmd in (["clone", "-q", origin, work], ["-C", work, "checkout", "-q", p["base"]],
+                ["-C", work, "merge", "-q", "--no-ff", "-m", f"Merge pull request #{p['number']} from acme/{p['head']}",
+                 f"origin/{p['head']}"], ["-C", work, "push", "-q", "origin", p["base"]]):
+        subprocess.run(["git", *cmd], check=True, capture_output=True)
+    p.update(state="closed", merged_at=datetime.now(timezone.utc).isoformat(), merged_sha=sha(p["head"]))
+else:
+    die(f"unexpected gh {' '.join(args)}")
+
+json.dump(st, open(STATE, "w"))
+if out is not None and not silent:
+    if jq:
+        sys.stdout.write(subprocess.run(["jq", "-rc", jq], input=json.dumps(out), capture_output=True,
+                                        text=True, check=True).stdout)
+    else:
+        print(json.dumps(out))
+"""
+
+GATE = 'echo run >> "$COUNTER"; test ! -f RED'
+
+
 class Cli(unittest.TestCase):
-    """The script end to end, against fake `gh` and `git` on PATH."""
+    """The script end to end: real git against a bare origin, a fake `gh` holding the tracker."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.origin = self.tmp / "origin.git"
+        self.repo = self.tmp / "repo"
+        self.counter = self.tmp / "gate-runs"
         (self.tmp / "bin").mkdir()
-        (self.tmp / "repo" / ".claude").mkdir(parents=True)
-        (self.tmp / "repo" / ".claude" / "drive-spec.json").write_text(
-            json.dumps({"localOnly": {"label": "needs:desktop", "proof": "x.md"}}))
-        self.fake("git", """
-            case "$*" in
-              "remote get-url origin") echo git@github.com:acme/app.git ;;
-              "rev-parse --show-toplevel") echo "$REPO" ;;
-              "ls-remote --heads origin agent/*")
-                printf 'a\\trefs/heads/agent/local-spec-10-export\\nb\\trefs/heads/agent/issue-12-route\\n' ;;
-              *) echo "unexpected git $*" >&2; exit 1 ;;
-            esac""")
-        self.fake("gh", """
-            case "$2" in
-              repos/acme/app/issues/10) cat "$FIX/spec.json" ;;
-              "--paginate")
-                case "$3" in
-                  repos/acme/app/issues\\?*) cat "$FIX/issues.jsonl" ;;
-                  repos/acme/app/issues/10/sub_issues) echo '{"number":11}' ;;
-                  repos/acme/app/pulls\\?state=open\\&base=agent/local-spec-10-export\\&*) echo '{"number":40,"head":"agent/issue-12-route"}' ;;
-                  *) echo "unexpected gh $*" >&2; exit 1 ;;
-                esac ;;
-              *) echo "unexpected gh $*" >&2; exit 1 ;;
-            esac""")
-        (self.tmp / "spec.json").write_text(json.dumps(SPEC))
-        rows = [issue(11, 10, labels=["needs:desktop"]), issue(12, 10, [11]), issue(13, 10, [12], state="closed"),
-                issue(14), issue(15, 10, [12], title="Unrelated #10 mention? no: real slice")]
-        (self.tmp / "issues.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        gh = self.tmp / "bin" / "gh"
+        gh.write_text(f"#!{sys.executable}\n{FAKE_GH}")
+        gh.chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{self.tmp / 'bin'}:{os.environ['PATH']}", FIX=str(self.tmp),
+                        COUNTER=str(self.counter), DRIVE_SPEC_POLL_SECONDS="0", CLAUDE_CODE_REMOTE="false",
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                        GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.origin))
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(self.repo))
+        self.commit(self.repo, "README", "hello\n", "Start")
+        self.git(self.repo, "push", "-q", "origin", "main", "main:agent/local-spec-10-export")
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE}))
+        with open(self.repo / ".git" / "info" / "exclude", "a") as f:
+            f.write(".claude/\n")
+        self.spec_wt = self.repo / ".claude" / "worktrees" / "spec-10"
+        self.git(self.repo, "worktree", "add", "-q", str(self.spec_wt), "-b", "agent/local-spec-10-export",
+                 "origin/agent/local-spec-10-export")
+        self.wt = self.slice(11, "serializer")
+        self.commit(self.wt, "a.txt", "a\n", "Add the serializer")
+        self.state = {
+            "origin": str(self.origin), "calls": [], "pulls": [], "comments": [],
+            "issues": {
+                "10": self.issue(10, "Export reports", "## Problem\n\nNo export.\n"),
+                "11": self.issue(11, "Create the serializer", "## Parent\n\n#10\n", ["agent:in-progress"]),
+                "12": self.issue(12, "Wire the route", "## Parent\n\n#10\n\n## Blocked by\n\n#11\n"),
+            },
+        }
+        self.save()
 
-    def fake(self, name, body):
-        f = self.tmp / "bin" / name
-        f.write_text("#!/bin/sh\n" + textwrap.dedent(body).strip() + "\n")
-        f.chmod(0o755)
+    def issue(self, n, title, body, labels=()):
+        return {"number": n, "title": title, "body": body, "state": "open", "labels": list(labels)}
 
-    def run_plan(self, *args, cloud="false"):
-        env = dict(os.environ, PATH=f"{self.tmp / 'bin'}:{os.environ['PATH']}", FIX=str(self.tmp),
-                   REPO=str(self.tmp / "repo"), CLAUDE_CODE_REMOTE=cloud)
-        return subprocess.run([str(SCRIPT), "plan", *args], capture_output=True, text=True, env=env)
+    def slice(self, m, slug):
+        wt = self.repo / ".claude" / "worktrees" / f"issue-{m}"
+        self.git(self.repo, "worktree", "add", "-q", str(wt), "-b", f"agent/issue-{m}-{slug}", "agent/local-spec-10-export")
+        return wt
 
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, cwd, name, text, message):
+        (Path(cwd) / name).write_text(text)
+        self.git(cwd, "add", name)
+        self.git(cwd, "commit", "-q", "-m", message)
+        return self.git(cwd, "rev-parse", "HEAD")
+
+    def save(self):
+        (self.tmp / "gh.json").write_text(json.dumps(self.state))
+
+    def gh_state(self):
+        return json.loads((self.tmp / "gh.json").read_text())
+
+    def run_ds(self, *args, cwd=None):
+        return subprocess.run([str(SCRIPT), *args], cwd=cwd or self.repo, capture_output=True, text=True,
+                              env=self.env)
+
+    def gate_runs(self):
+        return len(self.counter.read_text().splitlines()) if self.counter.exists() else 0
+
+    def origin_sha(self, ref):
+        return self.git(self.tmp, "--git-dir", str(self.origin), "rev-parse", ref)
+
+    def advance_spec(self, name, text):
+        """Another slice lands on the spec branch."""
+        work = self.tmp / f"other-{name}"
+        self.git(self.tmp, "clone", "-q", "-b", "agent/local-spec-10-export", str(self.origin), str(work))
+        self.commit(work, name, text, f"Add {name}")
+        self.git(work, "push", "-q", "origin", "agent/local-spec-10-export")
+
+
+class Plan(Cli):
     def test_json(self):
-        out = self.run_plan("#10", "--json", cloud="true")
+        self.state["sub_issues"] = [11, 15]
+        self.state["issues"]["11"]["labels"].append("needs:desktop")
+        self.save()
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"localOnly": {"label": "needs:desktop"}}))
+        self.env["CLAUDE_CODE_REMOTE"] = "true"
+        out = self.run_ds("plan", "#10", "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
         p = json.loads(out.stdout)
         self.assertEqual(p["spec_branch"], "agent/local-spec-10-export")
-        self.assertEqual([(s["number"], s["state"]) for s in p["slices"]],
-                         [(11, "held"), (12, "open-pr"), (13, "closed"), (15, "todo")])
+        self.assertEqual(p["invisible"], [15])
+        self.assertEqual([(s["number"], s["state"]) for s in p["slices"]], [(11, "held"), (12, "todo")])
 
-    def test_text(self):
-        out = self.run_plan("10")
+    def test_text_from_inside_a_worktree(self):
+        self.git(self.wt, "push", "-q", "origin", "agent/issue-11-serializer")
+        out = self.run_ds("plan", "10", cwd=self.wt)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("#12  open-pr #40  Slice 12  after #11", out.stdout)
-        self.assertIn("#11  todo", out.stdout)
+        self.assertIn("#11  in-flight    Create the serializer", out.stdout)
+        self.assertIn("#12  todo         Wire the route  after #11", out.stdout)
 
     def test_refusal_exits_2(self):
-        (self.tmp / "spec.json").write_text(json.dumps(dict(SPEC, body="## Parent\n\n#1\n")))
-        out = self.run_plan("10")
+        self.state["issues"]["10"]["body"] = "## Parent\n\n#1\n"
+        self.save()
+        out = self.run_ds("plan", "10")
         self.assertEqual(out.returncode, 2)
         self.assertIn("refuse: #10 has a ## Parent of its own", out.stdout)
 
     def test_tracker_failure_is_loud(self):
-        self.fake("gh", "echo 'HTTP 401' >&2; exit 1")
-        out = self.run_plan("10")
+        (self.tmp / "bin" / "gh").write_text("#!/bin/sh\necho 'HTTP 401' >&2; exit 1\n")
+        out = self.run_ds("plan", "10")
         self.assertEqual(out.returncode, 1)
         self.assertIn("HTTP 401", out.stderr)
+
+
+class Verify(Cli):
+    def test_green_is_recorded_once_per_commit(self):
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertRegex(out.stdout, r"^green [0-9a-f]{12}\n$")
+        again = self.run_ds("verify", "10", str(self.wt))
+        self.assertIn("(already verified)", again.stdout)
+        self.assertEqual(self.gate_runs(), 1)
+
+    def test_red_exits_4_and_is_not_trusted(self):
+        self.commit(self.wt, "RED", "", "Break the gate")
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 4)
+        self.assertIn("red ", out.stdout)
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+        self.assertEqual(self.gate_runs(), 2)
+
+    def test_uncommitted_changes_refused(self):
+        (self.wt / "b.txt").write_text("b")
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("uncommitted changes", out.stderr)
+        self.assertEqual(self.gate_runs(), 0)
+
+    def test_pinned_gate_wins_over_config(self):
+        self.assertEqual(self.run_ds("gate", "10").stdout.strip(), GATE)
+        self.run_ds("gate", "10", "false")
+        self.assertEqual(self.run_ds("gate", "10").stdout.strip(), "false")
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+
+    def test_no_gate_refused(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text("{}")
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no verify gate", out.stderr)
+
+
+class Integrate(Cli):
+    def test_opens_pr_and_merges_at_the_verified_head(self):
+        out = self.run_ds("integrate", "10", "11", "--deviations", "Deviations:\n- none of note")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        pr = self.gh_state()["pulls"][0]
+        self.assertEqual((pr["base"], pr["head"], pr["state"]),
+                         ("agent/local-spec-10-export", "agent/issue-11-serializer", "closed"))
+        self.assertEqual(pr["title"], "Create the serializer")
+        self.assertEqual(pr["body"], "Slice of #10. Ref #11.\n\nDeviations:\n- none of note")
+        self.git(self.wt, "fetch", "-q", "origin")
+        self.assertEqual(self.git(self.wt, "show", "origin/agent/local-spec-10-export:a.txt"), "a")
+
+    def test_skips_the_gate_on_an_already_verified_head(self):
+        self.run_ds("verify", "10", str(self.wt))
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gate_runs(), 1)
+
+    def test_reverifies_after_merging_an_advanced_spec_branch(self):
+        self.run_ds("verify", "10", str(self.wt))
+        self.advance_spec("other.txt", "o\n")
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gate_runs(), 2)
+        self.assertTrue((self.wt / "other.txt").exists())
+
+    def test_red_after_merge_does_not_merge(self):
+        self.run_ds("verify", "10", str(self.wt))
+        self.advance_spec("RED", "")
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 4)
+        self.assertIn("halt the run", out.stdout)
+        self.assertEqual(self.gh_state()["pulls"][0]["state"], "open")
+
+    def test_conflict_exits_3_with_a_clean_worktree(self):
+        self.advance_spec("a.txt", "theirs\n")
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 3, out.stderr)
+        self.assertIn("conflict merging agent/local-spec-10-export", out.stdout)
+        self.assertIn("a.txt", out.stdout)
+        self.assertEqual(self.git(self.wt, "status", "--porcelain"), "")
+        self.assertEqual(self.gh_state()["pulls"][0]["state"], "open")
+
+    def test_conflict_resolved_by_a_merger_then_integrates(self):
+        self.advance_spec("a.txt", "theirs\n")
+        self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.git(self.wt, "fetch", "-q", "origin")
+        subprocess.run(["git", "merge", "origin/agent/local-spec-10-export"], cwd=self.wt, env=self.env,
+                       capture_output=True)
+        (self.wt / "a.txt").write_text("both\n")
+        self.git(self.wt, "commit", "-qam", "Merge the spec branch")
+        out = self.run_ds("integrate", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_commit_with_a_body_refused(self):
+        (self.wt / "b.txt").write_text("b")
+        self.git(self.wt, "add", "b.txt")
+        self.git(self.wt, "commit", "-q", "-m", "Add b", "-m", "Co-Authored-By: someone")
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("Add b", out.stderr)
+        self.assertEqual(self.gh_state()["pulls"], [])
+
+    def test_new_pr_needs_deviations(self):
+        out = self.run_ds("integrate", "10", "11")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--deviations", out.stderr)
+
+    def test_deviations_from_stdin(self):
+        out = subprocess.run([str(SCRIPT), "integrate", "10", "11", "--deviations", "-"], cwd=self.repo,
+                             input="- built as a modal\n", capture_output=True, text=True, env=self.env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(self.gh_state()["pulls"][0]["body"].endswith("Deviations:\n- built as a modal"))
+
+    def test_one_integration_at_a_time(self):
+        notes = self.repo / ".git" / "drive-spec" / "spec-10"
+        notes.mkdir(parents=True)
+        with open(notes / "integrate.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("one slice at a time", out.stderr)
+
+    def test_dirty_worktree_refused(self):
+        (self.wt / "a.txt").write_text("changed")
+        self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 2)
+
+
+class Land(Cli):
+    def integrate(self):
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_lands_a_merged_slice(self):
+        self.integrate()
+        out = self.run_ds("land", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("landed #11 via #100; landed 1/2", out.stdout)
+        st = self.gh_state()
+        self.assertEqual(st["issues"]["11"]["state"], "closed")
+        self.assertEqual(st["issues"]["11"]["labels"], [])
+        comments = {c["issue"]: c["body"] for c in st["comments"]}
+        self.assertEqual(comments[11], "Landed in #100 on `agent/local-spec-10-export`.")
+        self.assertIn("- [x] #11 Create the serializer\n- [ ] #12 Wire the route\n\nSpec PR: #101", comments[10])
+        spec_pr = st["pulls"][1]
+        self.assertEqual((spec_pr["base"], spec_pr["head"], spec_pr["draft"]), ("main", "agent/local-spec-10-export", True))
+        self.assertTrue(spec_pr["body"].startswith("Ref #10\n"))
+        self.assertFalse(self.wt.exists())
+        self.assertEqual(self.git(self.repo, "branch", "--list", "agent/issue-11-*"), "")
+        self.assertEqual(self.git(self.repo, "ls-remote", "--heads", "origin", "agent/issue-11-*"), "")
+        self.assertEqual(self.git(self.spec_wt, "rev-parse", "HEAD"), self.origin_sha("agent/local-spec-10-export"))
+        status = json.loads((self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").read_text())
+        self.assertEqual((status["step"], status["state"], status["summary"]), ("build", "running", "landed 1/2"))
+        self.assertEqual(status["pr_url"], "https://github.com/acme/app/pull/101")
+
+    def test_rerun_is_idempotent(self):
+        self.integrate()
+        self.run_ds("land", "10", "11")
+        out = self.run_ds("land", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        st = self.gh_state()
+        self.assertEqual(len(st["pulls"]), 2)
+        self.assertEqual(sorted(c["issue"] for c in st["comments"]), [10, 11])
+
+    def test_second_landing_reuses_the_spec_pr_and_marks_building(self):
+        self.integrate()
+        self.run_ds("land", "10", "11")
+        self.state = self.gh_state()
+        self.state["issues"]["12"]["labels"] = ["agent:in-progress"]
+        self.save()
+        out = self.run_ds("progress", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        st = self.gh_state()
+        self.assertEqual(len(st["pulls"]), 2)
+        progress = [c["body"] for c in st["comments"] if c["issue"] == 10]
+        self.assertEqual(len(progress), 1)
+        self.assertIn("- [ ] #12 Wire the route ← building", progress[0])
+
+    def test_unmerged_slice_refused(self):
+        out = self.run_ds("land", "10", "11")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("integrate it first", out.stderr)
+        self.assertTrue(self.wt.exists())
+
+    def test_not_a_slice_refused(self):
+        self.assertEqual(self.run_ds("land", "10", "99").returncode, 2)
 
 
 if __name__ == "__main__":

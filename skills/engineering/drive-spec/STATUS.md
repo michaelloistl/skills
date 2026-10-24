@@ -48,7 +48,7 @@ Prints any unread notes and archives them; prints nothing when the inbox is empt
 
 A **base note** starts `## <base> advanced:` and names what landed in base, the files it changed, and an `Overlaps your branch:` line: the files the spec branch changes too.
 
-- Overlap listed: at this boundary, merge `origin/<base>` into the spec branch in the spec worktree. Conflicts go to a merger subagent, as in the integration queue; then the verify gate, then push. Slices dispatched afterwards start from the merged branch; slices already in flight take it up at integration. Before step 3 there is no spec branch: carry the note to the first boundary after it. Before step 10 the spec worktree is gone: open it again per WORKTREES.md for the merge, and remove it after the push.
+- Overlap listed: at this boundary, merge `origin/<base>` into the spec branch in the spec worktree. Conflicts go to a merger subagent, as in the integration queue; then `drive-spec verify <spec> <spec worktree>`, then push. Slices dispatched afterwards start from the merged branch; slices already in flight take it up at integration. Before step 3 there is no spec branch: carry the note to the first boundary after it. Before step 10 the spec worktree is gone: open it again per WORKTREES.md for the merge, and remove it after the push.
 - `Overlaps your branch: none`: nothing to merge.
 
 Either way, say in the next `summary` what the note led to: `merged develop (#2998)` or `develop #2998: no overlap`.

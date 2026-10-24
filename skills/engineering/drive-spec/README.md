@@ -7,8 +7,17 @@ Skill: builds a spec's tracer-bullet issues, each in its own worktree, into one 
 Python 3, standard library only, with `gh` and `git` on the PATH. Run it from inside the repo. It holds the run's deterministic rules, so the model calls them rather than remembers them.
 
 - `drive-spec plan <spec> [--json]`: the spec's slices in build order, each with its state, blockers, branch and PR. Read-only. Exit 2 refuses the spec (a `## Parent` of its own, no tracer-bullets, a cycle), with the reason on the `refuse:` line; exit 1 is a failed tracker or git call. Contract: [`TRACKER.md`](TRACKER.md), Discovery.
+- `drive-spec gate <spec> [<command>]`: prints the run's verify gate, or pins one for the run (pinned wins over `verify` in `.claude/drive-spec.json`).
+- `drive-spec verify <spec> <worktree>`: runs the gate on a clean worktree's HEAD, under the host-wide `flock` when available, and records the verdict against that commit. Exit 4 when red, with the log's tail. A commit already green is not run again.
+- `drive-spec integrate <spec> <m> [--deviations <text>|-]`: opens the slice PR, merges the spec branch in, verifies, pushes, and merges the PR at the verified SHA, looping while the spec branch moves. Exit 3 on a conflict, 4 when red.
+- `drive-spec land <spec> <m>`: closes a merged slice, removes its worktree and branches, opens the draft spec PR at the first landing, refreshes the progress comment, writes status. Safe to run again.
+- `drive-spec progress <spec>`: posts or refreshes the progress comment.
 
-Tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/drive-spec`, from the repo root. They run the pure logic on fixtures and the script end to end against fake `gh` and `git`.
+Exit codes: 0 done, 1 a failed call, 2 refused (a rule would break; the message names it), 3 conflict, 4 red. Contract for the last four: [`TRACKER.md`](TRACKER.md), Integration and landing.
+
+State, all under `$GIT_COMMON_DIR/drive-spec/spec-<n>/`, removed with the notes in step 9: `gate` (the pinned gate), `verified/<sha>.json` (each verdict), `logs/<sha>.log`, `integrate.lock`.
+
+Tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/drive-spec`, from the repo root. They run the pure logic on fixtures, and the script end to end with real git against a bare origin and a fake `gh` that answers through real `jq`.
 
 ## status.sh
 

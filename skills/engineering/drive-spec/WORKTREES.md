@@ -68,19 +68,4 @@ Run `bootstrap` from the config in every new worktree, from that worktree's dire
 
 ## Remove
 
-After a slice lands:
-
-```sh
-git worktree remove --force "$root/issue-<m>"
-git branch -D agent/issue-<m>-<slug>
-[ "$CLAUDE_CODE_REMOTE" = true ] || ! git ls-remote --exit-code --heads origin agent/issue-<m>-<slug> >/dev/null \
-  || git push origin --delete agent/issue-<m>-<slug>
-```
-
-A repo with "Automatically delete head branches" on has already removed the remote branch at merge, so the delete runs only when it is still there. A cloud session's GitHub proxy rejects branch deletion, so there the remote branch stays until that setting removes it.
-
-At cleanup: remove the spec worktree the same way but keep the branch, local and remote, until the PR merges.
-
-On halt: keep the slice worktree in place so the developer can look, and print its path.
-
-Finish every run, including a halt, with `git worktree prune`.
+`drive-spec land` removes a landed slice's worktree, its local branch, and its remote branch. A repo with "Automatically delete head branches" on has already removed the remote branch at merge, so the delete runs only when it is still there. A cloud session's GitHub proxy rejects branch deletion, so there the remote branch stays until that setting removes it.

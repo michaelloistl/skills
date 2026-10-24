@@ -2,19 +2,32 @@
 """drive-spec: the deterministic half of a drive-spec run. See README.md."""
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 REF = re.compile(r"#(\d+)\b")
 HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*#*\s*$")
+MARKER = "<!-- implement-spec -->"
+PR_FIELDS = ".[] | {number, head: .head.ref, url: .html_url, merged_at}"
+VERIFY_LOCK = "/tmp/drive-spec-verify.lock"
+POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
+SPEC_MOVES = 5
+REFUSE, CONFLICT, RED = 2, 3, 4
 
 
 class Failed(Exception):
-    pass
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
 
 
 def sh(cmd):
@@ -196,6 +209,8 @@ def render(plan):
     return "\n".join(lines)
 
 
+
+
 def load_config(root):
     try:
         return json.loads((Path(root) / ".claude" / "drive-spec.json").read_text())
@@ -205,36 +220,374 @@ def load_config(root):
         raise Failed(f".claude/drive-spec.json: {e}")
 
 
-def fetch(spec):
-    repo = repo_slug(sh(["git", "remote", "get-url", "origin"]))
-    spec_issue = json.loads(sh(["gh", "api", f"repos/{repo}/issues/{spec}",
-                                "--jq", "{number,title,body,state,pull_request}"]))
-    issues = [i for i in json_lines(sh([
-        "gh", "api", "--paginate", f"repos/{repo}/issues?state=all&per_page=100",
-        "--jq", ".[] | {number,title,body,state,pull_request,labels: [.labels[].name]}"]))
+def git(cwd, *args):
+    return sh(["git", "-C", str(cwd), *args]).strip()
+
+
+def gh(*args):
+    return sh(["gh", "api", *args])
+
+
+def dirty(wt):
+    return git(wt, "status", "--porcelain") != ""
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Run:
+    """Where a spec's run lives: repo, worktree root, notes, config."""
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.common = Path(sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]).strip())
+        self.repo_dir = self.common.parent
+        self.config = load_config(self.repo_dir)
+        self.repo = repo_slug(git(self.repo_dir, "remote", "get-url", "origin"))
+        self.root = self.repo_dir / (self.config.get("worktreeRoot") or ".claude/worktrees")
+        self.notes = self.common / "drive-spec" / f"spec-{spec}"
+        self.cloud = os.environ.get("CLAUDE_CODE_REMOTE") == "true"
+
+    def heads(self, pattern="agent/*"):
+        out = git(self.repo_dir, "ls-remote", "--heads", "origin", pattern)
+        return [line.split("refs/heads/", 1)[1] for line in out.splitlines() if "refs/heads/" in line]
+
+    def spec_branch(self):
+        found = self.heads(f"agent/local-spec-{self.spec}-*")
+        if len(found) != 1:
+            raise Failed(f"expected one spec branch agent/local-spec-{self.spec}-* on origin, found "
+                         f"{', '.join(found) or 'none'}", REFUSE)
+        return found[0]
+
+    def prs(self, state, base, head=None):
+        query = f"state={state}&base={base}&per_page=100"
+        if head:
+            query += f"&head={self.repo.split('/')[0]}:{head}"
+        return json_lines(gh("--paginate", f"repos/{self.repo}/pulls?{query}", "--jq", PR_FIELDS))
+
+    def base(self):
+        try:
+            base = json.loads((self.common / "drive-spec" / "status" / f"spec-{self.spec}.json").read_text()).get("base")
+        except (OSError, ValueError):
+            base = None
+        return base or self.config.get("baseBranch") or gh(f"repos/{self.repo}", "--jq", ".default_branch").strip()
+
+    def status(self, **fields):
+        script = Path(__file__).resolve().with_name("status.sh")
+        subprocess.run([str(script), str(self.spec), *(f"{k}={v}" for k, v in fields.items())],
+                       cwd=self.repo_dir, timeout=60)
+
+
+def fetch(run):
+    spec, repo = run.spec, run.repo
+    spec_issue = json.loads(gh(f"repos/{repo}/issues/{spec}", "--jq", "{number,title,body,state,pull_request}"))
+    issues = [i for i in json_lines(gh(
+        "--paginate", f"repos/{repo}/issues?state=all&per_page=100",
+        "--jq", ".[] | {number,title,body,state,pull_request,labels: [.labels[].name]}"))
         if f"#{spec}" in (i.get("body") or "")]
-    heads = [line.split("refs/heads/", 1)[1] for line in
-             sh(["git", "ls-remote", "--heads", "origin", "agent/*"]).splitlines() if "refs/heads/" in line]
+    heads = run.heads()
     try:
-        sub_issues = [i["number"] for i in json_lines(sh(
-            ["gh", "api", "--paginate", f"repos/{repo}/issues/{spec}/sub_issues", "--jq", ".[] | {number}"]))]
+        sub_issues = [i["number"] for i in json_lines(gh(
+            "--paginate", f"repos/{repo}/issues/{spec}/sub_issues", "--jq", ".[] | {number}"))]
     except Failed:
         sub_issues = []
     spec_branch = next((h for h in heads if h.startswith(f"agent/local-spec-{spec}-")), None)
-    open_prs = json_lines(sh([
-        "gh", "api", "--paginate", f"repos/{repo}/pulls?state=open&base={spec_branch}&per_page=100",
-        "--jq", ".[] | {number, head: .head.ref}"])) if spec_branch else []
+    open_prs = run.prs("open", spec_branch) if spec_branch else []
     return spec_issue, issues, heads, open_prs, sub_issues
 
 
+def make_plan(run):
+    label = (run.config.get("localOnly") or {}).get("label")
+    return build_plan(*fetch(run), held_label=label, cloud=run.cloud)
+
+
 def cmd_plan(spec, as_json):
-    root = sh(["git", "rev-parse", "--show-toplevel"]).strip()
-    label = (load_config(root).get("localOnly") or {}).get("label")
-    cloud = os.environ.get("CLAUDE_CODE_REMOTE") == "true"
-    spec_issue, issues, heads, open_prs, sub_issues = fetch(spec)
-    plan = build_plan(spec_issue, issues, heads, open_prs, sub_issues, label, cloud)
+    plan = make_plan(Run(spec))
     print(json.dumps(plan, indent=2) if as_json else render(plan))
-    return 2 if plan["refuse"] else 0
+    return REFUSE if plan["refuse"] else 0
+
+
+# verify
+
+def pinned_gate(run):
+    try:
+        return (run.notes / "gate").read_text().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def cmd_gate(spec, command):
+    run = Run(spec)
+    if command:
+        old = pinned_gate(run)
+        run.notes.mkdir(parents=True, exist_ok=True)
+        (run.notes / "gate").write_text(command + "\n")
+        print(f"gate pinned: {command}" + (f" (was: {old})" if old and old != command else ""))
+        return 0
+    gate = pinned_gate(run) or run.config.get("verify")
+    if not gate:
+        raise Failed("no verify gate: pin one with `drive-spec gate <spec> '<command>'`", REFUSE)
+    print(gate)
+    return 0
+
+
+def record(run, sha):
+    try:
+        return json.loads((run.notes / "verified" / f"{sha}.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def verify(run, wt):
+    """Run the gate on the worktree's HEAD and record the verdict against that commit. True when green."""
+    wt = Path(wt).resolve()
+    if dirty(wt):
+        raise Failed(f"{wt} has uncommitted changes: commit them first, the verdict is recorded against a commit",
+                     REFUSE)
+    head = git(wt, "rev-parse", "HEAD")
+    if record(run, head).get("exit") == 0:
+        print(f"green {head[:12]} (already verified)")
+        return True
+    gate = pinned_gate(run) or run.config.get("verify")
+    if not gate:
+        raise Failed("no verify gate: pin one with `drive-spec gate <spec> '<command>'`", REFUSE)
+    cmd = ["flock", VERIFY_LOCK, "sh", "-c", gate] if shutil.which("flock") else ["sh", "-c", gate]
+    logs = run.notes / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"{head}.log"
+    started = now()
+    with open(log, "w") as out:
+        code = subprocess.run(cmd, cwd=wt, stdout=out, stderr=subprocess.STDOUT).returncode
+    if git(wt, "rev-parse", "HEAD") != head:
+        raise Failed(f"HEAD moved while the gate ran on {head[:12]}: nothing recorded")
+    (run.notes / "verified").mkdir(exist_ok=True)
+    (run.notes / "verified" / f"{head}.json").write_text(json.dumps(
+        {"sha": head, "gate": gate, "exit": code, "started_at": started, "finished_at": now(), "log": str(log)}))
+    if code == 0:
+        print(f"green {head[:12]}")
+        return True
+    print("".join(log.read_text().splitlines(keepends=True)[-40:]), end="")
+    print(f"red {head[:12]}: exit {code}; log {log}")
+    return False
+
+
+def cmd_verify(spec, wt):
+    return 0 if verify(Run(spec), wt) else RED
+
+
+# integrate
+
+def slice_worktree(run, m):
+    wt = run.root / f"issue-{m}"
+    if not wt.is_dir():
+        raise Failed(f"no slice worktree at {wt}", REFUSE)
+    branch = git(wt, "branch", "--show-current")
+    if not branch.startswith(f"agent/issue-{m}-"):
+        raise Failed(f"{wt} is on {branch or 'a detached HEAD'}, not agent/issue-{m}-*", REFUSE)
+    return wt, branch
+
+
+def bodied_commits(wt, since):
+    out = git(wt, "log", "--no-merges", "--format=%h%x01%s%x01%b%x02", f"{since}..HEAD")
+    commits = [c.strip().split("\x01") for c in out.split("\x02") if c.strip()]
+    return [c[:2] for c in commits if c[2].strip()]
+
+
+def merge_pr(run, pr, head):
+    """Merge the PR at exactly `head`. True when merged, False when GitHub says it cannot merge."""
+    for _ in range(40):
+        state = json.loads(gh(f"repos/{run.repo}/pulls/{pr}", "--jq", "{mergeable, merged_at, head: .head.sha}"))
+        if state["merged_at"]:
+            return state["head"] == head
+        if state["head"] == head and state["mergeable"] is not None:
+            break
+        time.sleep(POLL_SECONDS)
+    else:
+        raise Failed(f"GitHub never reported #{pr} mergeable at {head[:12]}")
+    if not state["mergeable"]:
+        return False
+    gh("-X", "PUT", f"repos/{run.repo}/pulls/{pr}/merge", "-f", "merge_method=merge", "-f", f"sha={head}", "--silent")
+    merged_at = gh(f"repos/{run.repo}/pulls/{pr}", "--jq", ".merged_at").strip()
+    if merged_at in ("", "null"):
+        raise Failed(f"#{pr} merge is queued or blocked: not landed")
+    return True
+
+
+def cmd_integrate(spec, m, deviations):
+    run = Run(spec)
+    wt, branch = slice_worktree(run, m)
+    if Path(git(wt, "rev-parse", "--absolute-git-dir"), "MERGE_HEAD").exists():
+        raise Failed(f"a merge is in progress in {wt}: commit or abort it first", REFUSE)
+    if dirty(wt):
+        raise Failed(f"{wt} has uncommitted changes: the implementer commits everything first", REFUSE)
+    run.notes.mkdir(parents=True, exist_ok=True)
+    lock = open(run.notes / "integrate.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Failed("another integration into the spec branch is running: one slice at a time", REFUSE)
+
+    spec_branch = run.spec_branch()
+    git(wt, "fetch", "--quiet", "origin")
+    bad = bodied_commits(wt, f"origin/{spec_branch}")
+    if bad:
+        raise Failed("commits carry a body or trailer; reword each to its subject line only: "
+                     + "; ".join(f"{sha} {subject}" for sha, subject in bad), REFUSE)
+
+    open_prs = run.prs("open", spec_branch, branch)
+    if open_prs:
+        pr = open_prs[0]["number"]
+    else:
+        if not deviations:
+            raise Failed("opening the slice PR needs --deviations: the implementer's list, or `none`", REFUSE)
+        text = sys.stdin.read() if deviations == "-" else deviations
+        text = re.sub(r"^\s*Deviations:\s*", "", text.strip())
+        title = gh(f"repos/{run.repo}/issues/{m}", "--jq", ".title").strip()
+        git(wt, "push", "--quiet", "-u", "origin", branch)
+        pr = json.loads(gh(f"repos/{run.repo}/pulls", "-f", f"base={spec_branch}", "-f", f"head={branch}",
+                           "-f", f"title={title}",
+                           "-f", f"body=Slice of #{spec}. Ref #{m}.\n\nDeviations:\n{text}",
+                           "--jq", "{number}"))["number"]
+        print(f"opened #{pr}")
+
+    for _ in range(SPEC_MOVES):
+        git(wt, "fetch", "--quiet", "origin")
+        target = git(wt, "rev-parse", f"origin/{spec_branch}")
+        try:
+            git(wt, "merge", "--quiet", "--no-edit", target)
+        except Failed:
+            files = git(wt, "diff", "--name-only", "--diff-filter=U").split()
+            subprocess.run(["git", "-C", str(wt), "merge", "--abort"], capture_output=True)
+            if not files:
+                raise
+            print(f"conflict merging {spec_branch} {target[:12]} into #{m}: {', '.join(files)}")
+            print(f"next: a merger subagent runs `git merge {target}` in {wt}, resolves every conflict and "
+                  f"commits; then `drive-spec integrate {spec} {m}` again")
+            return CONFLICT
+        if not verify(run, wt):
+            print(f"#{m} is red on the spec branch: halt the run; worktree kept at {wt}")
+            return RED
+        head = git(wt, "rev-parse", "HEAD")
+        git(wt, "push", "--quiet", "origin", branch)
+        git(wt, "fetch", "--quiet", "origin")
+        if git(wt, "rev-parse", f"origin/{spec_branch}") != target:
+            continue
+        if merge_pr(run, pr, head):
+            print(f"merged #{pr}: #{m} into {spec_branch} at {head[:12]}; next: drive-spec land {spec} {m}")
+            return 0
+        if git(wt, "rev-parse", f"origin/{spec_branch}") == target:
+            raise Failed(f"GitHub reports #{pr} not mergeable, and the spec branch has not moved")
+    raise Failed(f"the spec branch moved {SPEC_MOVES} times during integration: run integrate again")
+
+
+# land
+
+def progress_body(plan, base, spec_pr):
+    lines = [MARKER, f"**Building `{plan['spec_branch']}` → `{base}`**", ""]
+    for s in plan["slices"]:
+        done = s["state"] == "closed"
+        mark = (" ← held for a local run" if s["state"] == "held"
+                else " ← building" if not done and "agent:in-progress" in s["labels"] else "")
+        lines.append(f"- [{'x' if done else ' '}] #{s['number']} {s['title']}{mark}")
+    if spec_pr:
+        lines += ["", f"Spec PR: #{spec_pr['number']}"]
+    lines += ["", f"_Updated {now()} from {socket.gethostname()}._"]
+    return "\n".join(lines)
+
+
+def post_progress(run, plan, base, spec_pr):
+    ids = [c["id"] for c in json_lines(gh("--paginate", f"repos/{run.repo}/issues/{run.spec}/comments",
+                                          "--jq", ".[] | {id, body}"))
+           if (c.get("body") or "").startswith(MARKER)]
+    body = progress_body(plan, base, spec_pr)
+    if ids:
+        gh("-X", "PATCH", f"repos/{run.repo}/issues/comments/{ids[0]}", "-f", f"body={body}", "--silent")
+    else:
+        gh(f"repos/{run.repo}/issues/{run.spec}/comments", "-f", f"body={body}", "--silent")
+
+
+def spec_pr_of(run, base, branch):
+    found = run.prs("open", base, branch)
+    return found[0] if found else None
+
+
+def checked_plan(run):
+    plan = make_plan(run)
+    if plan["refuse"]:
+        raise Failed(f"refuse: {plan['refuse']}", REFUSE)
+    if not plan["spec_branch"]:
+        raise Failed(f"no spec branch agent/local-spec-{run.spec}-* on origin", REFUSE)
+    return plan
+
+
+def cmd_progress(spec):
+    run = Run(spec)
+    plan = checked_plan(run)
+    base = run.base()
+    post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
+    print(f"progress comment refreshed on #{spec}")
+    return 0
+
+
+def cmd_land(spec, m):
+    run = Run(spec)
+    plan = checked_plan(run)
+    s = next((s for s in plan["slices"] if s["number"] == m), None)
+    if not s:
+        raise Failed(f"#{m} is not a slice of #{spec}", REFUSE)
+    spec_branch = plan["spec_branch"]
+    prefix = f"agent/issue-{m}-"
+    merged = [p for p in run.prs("closed", spec_branch) if p["head"].startswith(prefix) and p["merged_at"]]
+    if not merged:
+        raise Failed(f"#{m} has no merged PR into {spec_branch}: integrate it first", REFUSE)
+    pr = merged[0]
+
+    spec_wt = run.root / f"spec-{spec}"
+    if spec_wt.is_dir():
+        git(spec_wt, "pull", "--quiet", "--ff-only")
+    if s["state"] != "closed":
+        gh(f"repos/{run.repo}/issues/{m}/comments", "-f",
+           f"body=Landed in #{pr['number']} on `{spec_branch}`.", "--silent")
+        gh("-X", "PATCH", f"repos/{run.repo}/issues/{m}", "-f", "state=closed", "-f", "state_reason=completed",
+           "--silent")
+        s["state"] = "closed"
+    if "agent:in-progress" in s["labels"]:
+        try:
+            gh("-X", "DELETE", f"repos/{run.repo}/issues/{m}/labels/agent%3Ain-progress", "--silent")
+        except Failed:
+            pass
+        s["labels"].remove("agent:in-progress")
+
+    wt = run.root / f"issue-{m}"
+    if wt.is_dir():
+        git(run.repo_dir, "worktree", "remove", "--force", str(wt))
+    git(run.repo_dir, "worktree", "prune")
+    for b in git(run.repo_dir, "branch", "--list", f"{prefix}*", "--format=%(refname:short)").split():
+        git(run.repo_dir, "branch", "-D", b)
+    if not run.cloud:
+        for b in run.heads(f"{prefix}*"):
+            git(run.repo_dir, "push", "--quiet", "origin", "--delete", b)
+
+    base = run.base()
+    spec_pr = spec_pr_of(run, base, spec_branch)
+    if not spec_pr:
+        listing = "\n".join(f"- #{x['number']} {x['title']}" for x in plan["slices"])
+        spec_pr = json.loads(gh(f"repos/{run.repo}/pulls", "-F", "draft=true", "-f", f"base={base}",
+                                "-f", f"head={spec_branch}", "-f", f"title={plan['title']}",
+                                "-f", f"body=Ref #{spec}\n\nSlices, in build order:\n{listing}",
+                                "--jq", "{number, url: .html_url}"))
+        print(f"opened draft spec PR {spec_pr['url']}")
+    post_progress(run, plan, base, spec_pr)
+
+    landed = sum(x["state"] == "closed" for x in plan["slices"])
+    building = [f"#{x['number']}" for x in plan["slices"]
+                if x["state"] != "closed" and "agent:in-progress" in x["labels"]]
+    summary = f"landed {landed}/{len(plan['slices'])}" + (f"; building {', '.join(building)}" if building else "")
+    run.status(step="build", state="running", summary=summary, pr_url=spec_pr["url"],
+               next="integrate the next completed slice, or pick from the frontier")
+    print(f"landed #{m} via #{pr['number']}; {summary}")
+    return 0
 
 
 def main():
@@ -243,12 +596,40 @@ def main():
     pl = sub.add_parser("plan", help="a spec's slices in build order, each with its state; exit 2 to refuse the spec")
     pl.add_argument("spec")
     pl.add_argument("--json", action="store_true")
+    g = sub.add_parser("gate", help="print the run's verify gate, or pin one for the run")
+    g.add_argument("spec")
+    g.add_argument("command", nargs="?")
+    v = sub.add_parser("verify", help="run the gate on a worktree's HEAD and record the verdict; exit 4 when red")
+    v.add_argument("spec")
+    v.add_argument("worktree")
+    i = sub.add_parser("integrate", help="merge the spec branch into a slice, verify, push, merge its PR")
+    i.add_argument("spec")
+    i.add_argument("slice")
+    i.add_argument("--deviations", help="the implementer's Deviations list, `none`, or `-` for stdin")
+    la = sub.add_parser("land", help="close a merged slice, remove its worktree and branch, open the spec PR")
+    la.add_argument("spec")
+    la.add_argument("slice")
+    pr = sub.add_parser("progress", help="refresh the progress comment on the spec")
+    pr.add_argument("spec")
     args = p.parse_args()
+    spec = int(args.spec.lstrip("#"))
     try:
         if args.cmd == "plan":
-            sys.exit(cmd_plan(int(args.spec.lstrip("#")), args.json))
+            code = cmd_plan(spec, args.json)
+        elif args.cmd == "gate":
+            code = cmd_gate(spec, args.command)
+        elif args.cmd == "verify":
+            code = cmd_verify(spec, args.worktree)
+        elif args.cmd == "integrate":
+            code = cmd_integrate(spec, int(args.slice.lstrip("#")), args.deviations)
+        elif args.cmd == "land":
+            code = cmd_land(spec, int(args.slice.lstrip("#")))
+        elif args.cmd == "progress":
+            code = cmd_progress(spec)
     except Failed as e:
-        sys.exit(f"drive-spec: {e}")
+        print(f"drive-spec: {e}", file=sys.stderr)
+        code = e.code
+    sys.exit(code)
 
 
 if __name__ == "__main__":

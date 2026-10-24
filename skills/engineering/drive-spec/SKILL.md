@@ -12,6 +12,8 @@ Drive a spec issue from its tracer-bullet issues to one draft PR `spec branch �
 
 The tickets are a task graph. Slices whose blockers have all closed form the **frontier**. State lives only in the tracker and the branches, so any session can resume any spec, and the same slice never builds twice.
 
+`drive-spec`, the script beside this file, runs every deterministic part of a step; `drive-spec --help` lists its commands. Its refusals (exit 2) name the broken rule: fix that, never route around it.
+
 Reference, read when a step points at it:
 
 - [`TRACKER.md`](TRACKER.md) — discovery, blockers, labels, the progress comment, PRs.
@@ -21,13 +23,13 @@ Reference, read when a step points at it:
 
 Record status per STATUS.md at the end of every step and at each dispatch, landing and halt in step 6. Read the inbox per STATUS.md at every boundary it names.
 
-Communicate with subagents through context pointers: issue numbers, worktree paths, research notes, the verify gate. Everything else they read themselves.
+Communicate with subagents through context pointers: issue numbers, worktree paths, research notes, the `drive-spec verify` command. Everything else they read themselves.
 
 An interim notification from a background subagent gets a one-line status; act on its final report.
 
 ## Steps
 
-1. **Resolve the run.** For each of `baseBranch`, `bootstrap`, `verify`, `parallel`, `maxSlices`, `localOnly`: a flag wins, then `.claude/drive-spec.json` in the repo root, then the default. Defaults: repository default branch, no bootstrap, verify gate read from the repo's `CLAUDE.md` or `AGENTS.md`, parallel, no ceiling, no local-only slices. `--sequential` sets `parallel` to false. Resolve the worktree root per WORKTREES.md. A cloud session is one where `CLAUDE_CODE_REMOTE` is `true`. When `flock` is on the PATH, wrap the resolved verify gate as `flock /tmp/drive-spec-verify.lock sh -c '<verify>'`: every drive-spec session on the machine then runs its gate one at a time, so parallel slices and concurrent specs queue for the full suite instead of exhausting CPU and memory. Without `flock`, the gate runs as resolved. Done when every value is printed with where it came from.
+1. **Resolve the run.** For each of `baseBranch`, `bootstrap`, `verify`, `parallel`, `maxSlices`, `localOnly`: a flag wins, then `.claude/drive-spec.json` in the repo root, then the default. Defaults: repository default branch, no bootstrap, verify gate read from the repo's `CLAUDE.md` or `AGENTS.md`, parallel, no ceiling, no local-only slices. `--sequential` sets `parallel` to false. Resolve the worktree root per WORKTREES.md. A cloud session is one where `CLAUDE_CODE_REMOTE` is `true`. Pin the resolved gate with `drive-spec gate <spec> '<verify>'`, unless it came from `.claude/drive-spec.json`: every verdict in the run comes from `drive-spec verify`, which runs the pinned gate, and only that gate. Done when every value is printed with where it came from.
 
    `localOnly` marks slices only the developer's machine can prove, such as tests that need a desktop app: `label` names them, and `proof` is a file in the repo saying how to prove one beyond the verify gate. In a cloud session these slices are **held**: never built, and anything they block waits. Locally they build one at a time, and their implementer also follows `proof`.
 
@@ -35,23 +37,23 @@ An interim notification from a background subagent gets a one-line status; act o
 
 3. **Open the spec worktree.** Branch `agent/local-spec-<n>-<slug>` — the `local-` segment is load-bearing: a repo whose CI advances specs off merges into `agent/spec-*` would otherwise dispatch the next slice itself on every merge here and build it twice. Reuse it from origin when it exists, that is a resume; else cut it from `origin/<base>` and push it. Add the worktree and run bootstrap per WORKTREES.md. Done when the worktree is on the spec branch at origin's HEAD.
 
-4. **Preview.** Print base, spec branch, worktree root, mode, ceiling, and the plan from step 2. Post or refresh the progress comment per TRACKER.md. With `--dry-run`, stop here.
+4. **Preview.** Print base, spec branch, worktree root, mode, ceiling, and the plan from step 2. Post or refresh the progress comment with `drive-spec progress <spec>` once the spec branch exists. With `--dry-run`, stop here.
 
 5. **Explore.** One general-purpose subagent in the spec worktree reads the spec and every slice not yet closed, explores the code and external docs they touch, and writes notes into the notes directory per WORKTREES.md: `shared.md` for what several slices need, `issue-<m>.md` for each slice. Notes name files, seams, existing patterns to follow, and doc links; they leave the design to the implementer. A slice whose notes file already exists is skipped, so a resume explores only what is new. The subagent also checks every open slice against the spec and against each other, on every run, and writes `conflicts.md` fresh: each place two issues ask for opposite behaviour, naming both issues and quoting both lines. Done when every open slice has a notes file and `conflicts.md` exists. A non-empty `conflicts.md` halts the run before any build: post its list on the spec in the status comment per TRACKER.md, and stop; the operator settles each conflict in the issues and resumes.
 
 6. **Build the frontier.** Repeat until every slice is closed, the ceiling is reached, or only held slices and the slices they block remain:
    - Pick from the frontier: open slices whose blockers are all closed. Parallel: all of them, each in a background subagent; completed slices enter the integration queue in finish order. Sequential: the lowest-numbered one. Held slices are never picked. Locally, `localOnly` slices never build beside each other.
    - A slice with an open PR into the spec branch gets its worktree back and goes straight to the integration queue. A slice with an in-flight branch on origin gets its worktree back and its implementer told to continue.
-   - Otherwise open its worktree on `agent/issue-<m>-<slug>` from the spec branch HEAD, run bootstrap, label the issue `agent:in-progress`, and dispatch an implementer subagent with IMPLEMENTER.md filled in. The subagent is done when the verify gate is green and every change is committed.
-   - Integrate one slice at a time per TRACKER.md: push and open its PR, with the implementer's reported deviations in its body, merge the latest spec branch into the slice, resolve conflicts, run the verify gate on that exact integration unless it is the tree the implementer already verified, push, then merge the PR. If the spec branch advances before the PR merges, integrate and verify again. GitHub's initial mergeable result never substitutes for this gate.
-   - Land: confirm the PR merged, pull the spec worktree, close the issue naming the PR, remove the slice worktree and branch, refresh the progress comment. After the first landing, open the spec PR per TRACKER.md when absent: the spec branch now has commits ahead of base, and the draft shows the work while it is underway. Only then integrate the next completed slice.
+   - Otherwise open its worktree on `agent/issue-<m>-<slug>` from the spec branch HEAD, run bootstrap, label the issue `agent:in-progress`, and dispatch an implementer subagent with IMPLEMENTER.md filled in. The subagent is done when every change is committed and `drive-spec verify` is green on that HEAD.
+   - Integrate one slice at a time: `drive-spec integrate <spec> <m> --deviations -`, the implementer's `Deviations:` list on stdin. It opens the slice PR, merges the latest spec branch into the slice, verifies that exact integration, pushes, and merges the PR at the verified HEAD, again whenever the spec branch moves. Exit 3 is a conflict: a merger subagent in the slice worktree runs the `git merge` it names, resolves and commits, then integrate again. Exit 4 is red. Exit 2 refuses and says why: fix that, never route around it.
+   - Land: `drive-spec land <spec> <m>`. It closes the issue naming the PR, removes the slice worktree and branches, opens the draft spec PR at the first landing, refreshes the progress comment, and writes status. Only then integrate the next completed slice.
    - A slice whose implementation or integration reports red halts the run: label it `agent:blocked`, comment why, print the resume command. Every later slice assumes this one landed.
    - At `maxSlices`, stop cleanly and print the resume command.
-   - When only held slices block progress, stop cleanly: list them, refresh the progress comment, and say to resume in a local session.
+   - When only held slices block progress, stop cleanly: list them, refresh the progress comment with `drive-spec progress <spec>`, and say to resume in a local session.
 
-7. **Review the whole.** With every slice closed, run `/code-review` on the spec branch against base. One implementer subagent in the spec worktree fixes every finding; verify gate green; push. A Spec finding that something is missing or built differently is a finding for the fixer, the same as a Standards one: the spec already decided it. Then run `/code-review` again on the result. Done when a review raises nothing new; after a third review that still does, list what is left in the spec PR body and the status comment.
+7. **Review the whole.** With every slice closed, run `/code-review` on the spec branch against base. One implementer subagent in the spec worktree fixes every finding; `drive-spec verify <spec> <spec worktree>` green; push. A Spec finding that something is missing or built differently is a finding for the fixer, the same as a Standards one: the spec already decided it. Then run `/code-review` again on the result. Done when a review raises nothing new; after a third review that still does, list what is left in the spec PR body and the status comment.
 
-8. **Confirm the spec PR.** The draft (TRACKER.md) opened at the first landing stays draft; open it now if absent. With every slice closed, its body's `Ref #<spec>` becomes `Closes #<spec>`, and it lists every deviation the slices reported. Refresh the progress comment.
+8. **Confirm the spec PR.** The draft (TRACKER.md) opened at the first landing stays draft; open it now if absent. With every slice closed, its body's `Ref #<spec>` becomes `Closes #<spec>`, and it lists every deviation the slices reported. `drive-spec progress <spec>`.
 
 9. **Clean up.** Remove the spec worktree, any slice worktree still present, and the notes directory; prune, and print the PR URL. The spec branch stays on origin until the PR merges.
 

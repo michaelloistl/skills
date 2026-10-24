@@ -40,20 +40,11 @@ gh api "repos/$repo/issues/<m>/labels" -f 'labels[]=agent:in-progress' --silent
 gh api -X DELETE "repos/$repo/issues/<m>/labels/agent%3Ain-progress" --silent
 ```
 
-`agent:in-progress` goes on when the implementer is dispatched and comes off when the issue closes. `agent:blocked` goes on with a comment when a slice halts the run, and the operator removes it after fixing.
+`agent:in-progress` goes on when the implementer is dispatched; `drive-spec land` takes it off when the issue closes. `agent:blocked` goes on with a comment when a slice halts the run, and the operator removes it after fixing.
 
 ## Progress comment
 
-One comment on the spec issue, found by the marker and edited in place; created when absent.
-
-```sh
-id=$(gh api --paginate "repos/$repo/issues/<spec>/comments" \
-  --jq '.[] | select(.body | startswith("<!-- implement-spec -->")) | .id' | head -1)
-# absent:
-gh api "repos/$repo/issues/<spec>/comments" -f body="$body" --silent
-# present:
-gh api -X PATCH "repos/$repo/issues/comments/$id" -f body="$body" --silent
-```
+One comment on the spec issue, found by its marker and edited in place, created when absent. `drive-spec progress <spec>` writes it, and `drive-spec land` refreshes it after every landing.
 
 ```markdown
 <!-- implement-spec -->
@@ -64,10 +55,12 @@ gh api -X PATCH "repos/$repo/issues/comments/$id" -f body="$body" --silent
 - [ ] #14 Add the download button
 - [ ] #15 Check the export in the desktop app ← held for a local run
 
+Spec PR: #<pr>
+
 _Updated <ISO timestamp> from <hostname>._
 ```
 
-Every slice in topological order; closed slices ticked; the one in flight marked; held slices marked. When the spec PR exists, a last line names it.
+Every slice in build order; closed slices ticked; `← building` on open slices labelled `agent:in-progress`; held slices marked; the spec PR line once it exists.
 
 ## Status comment
 
@@ -85,68 +78,27 @@ gh api "repos/$repo/issues/<spec>/comments" --silent -f body="$body"
 | ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` |
 | held | `drive-spec paused: only held slices remain (#<m>, …). Resume in a local session.` |
 
-## Slice PRs
+## Integration and landing
 
-```sh
-git push -u origin agent/issue-<m>-<slug>
-gh api "repos/$repo/pulls" -f base=agent/local-spec-<n>-<slug> -f head=agent/issue-<m>-<slug> \
-  -f title="<issue title>" -f body="Slice of #<spec>. Ref #<m>.
+`drive-spec integrate <spec> <m>` and `drive-spec land <spec> <m>`; this is the contract they implement, held by `test_drive_spec.py`.
 
-<the implementer's Deviations list>" --jq .number
-```
-
-`Ref`, never `Closes`: merging into a non-default branch would not auto-close, and the run closes the issue itself only after the merge is confirmed.
-
-### Integration queue
-
-Integrate one completed slice at a time. Implementers may continue in parallel, but the orchestrator is the sole writer advancing the spec branch.
-
-For the slice at the head of the queue:
-
-1. Push the slice and create its PR when absent.
-2. Fetch origin in the slice worktree and record the current `origin/agent/local-spec-<n>-<slug>` SHA.
-3. Merge that SHA into the slice branch. A conflicted merge goes to a merger subagent in the slice worktree; it resolves every conflict and commits the merge.
-4. Run the verify gate on the resulting HEAD, including when the merge was clean. Skip it only when HEAD is still the SHA the implementer reported green: that exact tree is already verified. Red halts the run with the worktree intact.
-5. Push the slice branch. Fetch origin again; when the spec branch SHA differs from the recorded SHA, return to step 2.
-6. Merge the PR only after GitHub reports it mergeable, then confirm `merged_at` is non-null. `mergeable` reads `null` while GitHub computes it: wait a few seconds and read again. A queued or blocked merge is not landed.
-
-```sh
-git -C <slice-worktree> fetch origin
-integrated_spec=$(git -C <slice-worktree> rev-parse origin/agent/local-spec-<n>-<slug>)
-git -C <slice-worktree> merge --no-edit "$integrated_spec"
-<verify>
-git -C <slice-worktree> push origin agent/issue-<m>-<slug>
-git -C <slice-worktree> fetch origin
-current_spec=$(git -C <slice-worktree> rev-parse origin/agent/local-spec-<n>-<slug>)
-# Repeat merge and verify unless "$current_spec" = "$integrated_spec".
-gh api "repos/$repo/pulls/<pr>" --jq '{mergeable, merged_at}'
-gh api -X PUT "repos/$repo/pulls/<pr>/merge" -f merge_method=merge --silent
-gh api "repos/$repo/pulls/<pr>" --jq .merged_at
-gh api "repos/$repo/issues/<m>/comments" \
-  -f body="Landed in #<pr> on \`agent/local-spec-<n>-<slug>\`." --silent
-gh api -X PATCH "repos/$repo/issues/<m>" -f state=closed -f state_reason=completed --silent
-```
-
-Pull the spec worktree and finish the slice's land and cleanup steps before taking the next queue entry. Branches still owned by active implementers stay untouched until they enter the queue.
+- **Verdicts**: `drive-spec verify <spec> <worktree>` runs the run's gate (pinned with `drive-spec gate`, else `verify` from `.claude/drive-spec.json`) on a clean worktree's HEAD, under `flock /tmp/drive-spec-verify.lock` when `flock` exists, so every drive-spec on the machine queues for the full suite. It records the verdict against that commit in the notes directory. Only a green record lets a commit merge; an implementer's claim never does. A commit already green is not run again.
+- **One at a time**: integrate holds a lock per spec, so the orchestrator stays the sole writer advancing the spec branch. Implementers may keep building in parallel.
+- **Refusals**, exit 2: a dirty worktree, a merge in progress, a commit with a body or trailer (subject line only), or a new PR without `--deviations`.
+- **Slice PR**: `slice branch → spec branch`, titled after the issue, body `Slice of #<spec>. Ref #<m>.` and the implementer's `Deviations:` list. `Ref`, never `Closes`: merging into a non-default branch would not auto-close, and land closes the issue only after the merge is confirmed.
+- **Loop**: fetch, record the spec branch SHA, merge it into the slice, verify, push. When the spec branch moved meanwhile, go again. A conflict aborts the merge and exits 3, naming the SHA and files for a merger subagent. Red exits 4 with the worktree intact.
+- **Merge**: only after GitHub computes `mergeable` (it reads `null` until then) on exactly the verified HEAD, and with that SHA pinned in the merge call, so a branch that moved underneath cannot merge. `merged_at` must then be set: a queued or blocked merge is not landed.
+- **Land**: refuses a slice with no merged PR. Then pulls the spec worktree, comments `Landed in #<pr> on \`<spec branch>\`.` and closes the issue, removes `agent:in-progress`, removes the slice worktree and local branch, and deletes the remote branch unless a cloud session's proxy forbids it or the repo already deleted it. Running it again finishes whatever a failed run left.
 
 ## Spec PR
 
-Draft, `spec branch → base`, opened when the first slice lands; an open one already there is left as is. The body lists every slice in topological order, including those not yet built. It says `Ref #<spec>` while any slice is open, so merging the draft early cannot close the spec; step 8 changes it to `Closes #<spec>`.
+Draft, `spec branch → base`, opened by `drive-spec land` when the first slice lands; an open one already there is left as is. Base comes from the status file, then `baseBranch` in `.claude/drive-spec.json`, then the repo's default branch. The body lists every slice in build order, including those not yet built. It says `Ref #<spec>` while any slice is open, so merging the draft early cannot close the spec; step 8 changes it to `Closes #<spec>`:
 
 ```sh
 owner=${repo%/*}
 gh api "repos/$repo/pulls?state=open&base=<base>&head=$owner:agent/local-spec-<n>-<slug>" \
-  --jq '.[] | {number, url: .html_url}'
-gh api "repos/$repo/pulls" -F draft=true -f base=<base> -f head=agent/local-spec-<n>-<slug> \
-  -f title="<spec title>" -f body="$(cat <<'EOF'
-Ref #<spec>
-
-Slices, in build order:
-- #12 Create the serializer
-- #13 Wire the export route
-- #14 Add the download button
-EOF
-)" --jq .html_url
+  --jq '.[] | {number, body, url: .html_url}'
+gh api -X PATCH "repos/$repo/pulls/<pr>" -f body="$body" --silent
 ```
 
 ## Halting
