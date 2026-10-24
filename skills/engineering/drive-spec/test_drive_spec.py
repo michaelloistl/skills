@@ -251,6 +251,8 @@ elif parts == ["pulls"] and method == "POST":
          "merged_at": None}
     st["pulls"].append(p)
     out = pull(p)
+elif parts[:1] == ["pulls"] and len(parts) == 2 and method == "PATCH":
+    next(p for p in st["pulls"] if p["number"] == int(parts[1]))["body"] = fields["body"]
 elif parts[:1] == ["pulls"] and len(parts) == 2:
     out = pull(next(p for p in st["pulls"] if p["number"] == int(parts[1])))
 elif parts[:1] == ["pulls"] and parts[2:] == ["merge"] and method == "PUT":
@@ -809,7 +811,7 @@ DISPATCH = SCRIPT.parent.parent / "dispatch" / "dispatch"
 STATUS_DOC = SCRIPT.with_name("STATUS.md").read_text()
 
 
-class Dispatcher(Cli):
+class DispatcherCase(Cli):
     """What the script writes is what the dispatcher reads: the contract in STATUS.md, read by `dispatch`."""
 
     def setUp(self):
@@ -832,6 +834,8 @@ class Dispatcher(Cli):
         self.assertEqual(out.returncode, 0, out.stderr)
         return next(r for r in json.loads(out.stdout) if str(r["spec"]) == "10")
 
+
+class Dispatcher(DispatcherCase):
     def test_landing_is_running_with_branch_and_pr(self):
         self.land_11()
         st = self.status_file()
@@ -893,6 +897,132 @@ class Dispatcher(Cli):
         self.run_ds("finish", "10", "refused")
         r = self.row()
         self.assertEqual((r["attention"], r["step"]), ("HALT", "guard"))
+
+
+class Open(DispatcherCase):
+    def remove_spec_worktree(self):
+        self.git(self.repo, "worktree", "remove", str(self.spec_wt))
+
+    def test_fresh_spec_branch_is_cut_from_base_and_pushed(self):
+        self.edit_state(lambda st: st["issues"].update({
+            "30": self.issue(30, "Import reports!", "## Problem\n"),
+            "31": self.issue(31, "Parse the file", "## Parent\n\n#30\n")}))
+        out = self.run_ds("open", "30", "--base", "main")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        wt = self.repo / ".claude" / "worktrees" / "spec-30"
+        self.assertEqual(out.stdout, f"worktree {wt} on agent/local-spec-30-import-reports (cut from origin/main)\n")
+        self.assertEqual(self.origin_sha("agent/local-spec-30-import-reports"), self.origin_sha("main"))
+        st = json.loads((self.repo / ".git" / "drive-spec" / "status" / "spec-30.json").read_text())
+        self.assertEqual((st["step"], st["branch"], st["base"]), ("worktree", "agent/local-spec-30-import-reports", "main"))
+
+    def test_resume_takes_origin(self):
+        self.remove_spec_worktree()
+        self.advance_spec("other.txt", "o\n")
+        out = self.run_ds("open", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("(resumed)", out.stdout)
+        self.assertEqual(self.git(self.spec_wt, "rev-parse", "HEAD"), self.origin_sha("agent/local-spec-10-export"))
+        self.assertEqual(self.row()["step"], "worktree")
+
+    def test_resume_keeps_unpushed_local_commits(self):
+        head = self.commit(self.spec_wt, "merged-base.txt", "m\n", "Merge main")
+        self.remove_spec_worktree()
+        out = self.run_ds("open", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.origin_sha("agent/local-spec-10-export"), head)
+
+    def test_existing_worktree_pulls(self):
+        self.advance_spec("other.txt", "o\n")
+        out = self.run_ds("open", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("(reused)", out.stdout)
+        self.assertTrue((self.spec_wt / "other.txt").exists())
+
+    def test_bootstrap_only_for_a_new_worktree(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"bootstrap": 'echo b >> "$COUNTER.boot"'}))
+        self.run_ds("open", "10")
+        self.assertFalse(Path(f"{self.counter}.boot").exists())
+        self.remove_spec_worktree()
+        self.run_ds("open", "10")
+        self.assertEqual(Path(f"{self.counter}.boot").read_text(), "b\n")
+
+    def test_refusals(self):
+        self.git(self.spec_wt, "checkout", "-q", "-b", "elsewhere")
+        out = self.run_ds("open", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("is on elsewhere", out.stderr)
+        self.edit_state(lambda st: st["issues"]["10"].update(body="## Parent\n\n#1\n"))
+        self.assertEqual(self.run_ds("open", "10").returncode, 2)
+
+
+class Confirm(DispatcherCase):
+    def close_12(self):
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+
+    def test_refuses_with_an_open_slice(self):
+        self.land_11()
+        out = self.run_ds("confirm", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("#12", out.stderr)
+
+    def test_closes_the_spec_and_lists_deviations(self):
+        out = self.run_ds("integrate", "10", "11", "--deviations", "Deviations:\n- export runs inline, no job")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.run_ds("land", "10", "11")
+        self.close_12()
+        out = self.run_ds("confirm", "10", "--left", "- rename ExportJob")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        spec_pr = self.gh_state()["pulls"][1]
+        self.assertEqual(spec_pr["body"], "Closes #10\n\nSlices, in build order:\n- #11 Create the serializer\n"
+                                          "- #12 Wire the route\n\nDeviations:\n\n#11 Create the serializer\n"
+                                          "- export runs inline, no job\n\nLeft from review:\n- rename ExportJob")
+        self.assertTrue(spec_pr["draft"])
+        r = self.row()
+        self.assertEqual((r["step"], r["pr_url"]), ("confirm", "https://github.com/acme/app/pull/101"))
+
+    def test_no_deviations_and_opens_a_missing_spec_pr(self):
+        self.edit_state(lambda st: [st["issues"][n].update(state="closed") for n in ("11", "12")])
+        out = self.run_ds("confirm", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        spec_pr = self.gh_state()["pulls"][0]
+        self.assertEqual((spec_pr["base"], spec_pr["draft"]), ("main", True))
+        self.assertTrue(spec_pr["body"].startswith("Closes #10\n"))
+        self.assertTrue(spec_pr["body"].endswith("Deviations: none"))
+
+
+class Cleanup(DispatcherCase):
+    def finish_slices(self):
+        self.run_ds("gate", "10", GATE)
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+
+    def test_removes_worktrees_and_notes(self):
+        self.finish_slices()
+        stray = self.slice(12, "route")
+        out = self.run_ds("cleanup", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "removed spec-10, issue-12, notes\nhttps://github.com/acme/app/pull/101\n")
+        self.assertFalse(self.spec_wt.exists() or stray.exists())
+        self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10").exists())
+        self.assertTrue((self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").exists())
+        self.assertEqual(self.origin_sha("agent/local-spec-10-export"),
+                         self.git(self.repo, "rev-parse", "agent/local-spec-10-export"))
+        r = self.row()
+        self.assertEqual((r["step"], r["state"], r["pr_url"]), ("cleanup", "running", "https://github.com/acme/app/pull/101"))
+
+    def test_refuses_with_an_open_slice(self):
+        out = self.run_ds("cleanup", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertTrue(self.wt.exists())
+
+    def test_refuses_to_lose_spec_work(self):
+        self.finish_slices()
+        (self.spec_wt / "wip.txt").write_text("w")
+        self.assertIn("uncommitted", self.run_ds("cleanup", "10").stderr)
+        self.git(self.spec_wt, "add", "wip.txt")
+        self.git(self.spec_wt, "commit", "-qm", "Fix a review finding")
+        self.assertIn("push them first", self.run_ds("cleanup", "10").stderr)
+        self.assertTrue(self.spec_wt.exists())
 
 
 if __name__ == "__main__":

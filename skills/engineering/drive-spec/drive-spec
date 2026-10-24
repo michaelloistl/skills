@@ -558,6 +558,21 @@ def spec_pr_of(run, base, branch):
     return found[0] if found else None
 
 
+def slice_listing(plan):
+    return "Slices, in build order:\n" + "\n".join(f"- #{x['number']} {x['title']}" for x in plan["slices"])
+
+
+def ensure_spec_pr(run, plan, base):
+    spec_pr = spec_pr_of(run, base, plan["spec_branch"])
+    if not spec_pr:
+        spec_pr = json.loads(gh(f"repos/{run.repo}/pulls", "-F", "draft=true", "-f", f"base={base}",
+                                "-f", f"head={plan['spec_branch']}", "-f", f"title={plan['title']}",
+                                "-f", f"body=Ref #{run.spec}\n\n{slice_listing(plan)}",
+                                "--jq", "{number, url: .html_url}"))
+        print(f"opened draft spec PR {spec_pr['url']}")
+    return spec_pr
+
+
 def checked_plan(run):
     plan = make_plan(run)
     if plan["refuse"]:
@@ -614,14 +629,7 @@ def cmd_land(spec, m):
             git(run.repo_dir, "push", "--quiet", "origin", "--delete", b)
 
     base = run.base()
-    spec_pr = spec_pr_of(run, base, spec_branch)
-    if not spec_pr:
-        listing = "\n".join(f"- #{x['number']} {x['title']}" for x in plan["slices"])
-        spec_pr = json.loads(gh(f"repos/{run.repo}/pulls", "-F", "draft=true", "-f", f"base={base}",
-                                "-f", f"head={spec_branch}", "-f", f"title={plan['title']}",
-                                "-f", f"body=Ref #{spec}\n\nSlices, in build order:\n{listing}",
-                                "--jq", "{number, url: .html_url}"))
-        print(f"opened draft spec PR {spec_pr['url']}")
+    spec_pr = ensure_spec_pr(run, plan, base)
     post_progress(run, plan, base, spec_pr)
 
     with open(run.notes / "landed.jsonl", "a") as f:
@@ -825,6 +833,127 @@ def cmd_start(spec, m):
     return 0
 
 
+# open, confirm, cleanup
+
+def cmd_open(spec, base):
+    run = Run(spec)
+    plan = make_plan(run)
+    if plan["refuse"]:
+        raise Failed(f"refuse: {plan['refuse']}", REFUSE)
+    base = base or run.base()
+    ensure_excluded(run)
+    wt = run.root / f"spec-{spec}"
+    prefix = f"agent/local-spec-{spec}-"
+    git(run.repo_dir, "fetch", "--quiet", "--prune", "origin")
+    remote = run.heads(f"{prefix}*")
+    if len(remote) > 1:
+        raise Failed(f"several spec branches on origin: {', '.join(remote)}", REFUSE)
+    created = False
+    if wt.is_dir():
+        branch = git(wt, "branch", "--show-current")
+        if not branch.startswith(prefix):
+            raise Failed(f"{wt} is on {branch or 'a detached HEAD'}, not {prefix}*", REFUSE)
+        if remote:
+            git(wt, "pull", "--quiet", "--ff-only", "origin", branch)
+        how = "reused"
+    elif remote:
+        branch = remote[0]
+        ahead = subprocess.run(["git", "-C", str(run.repo_dir), "merge-base", "--is-ancestor", f"origin/{branch}",
+                                f"refs/heads/{branch}"], capture_output=True).returncode == 0
+        if ahead:
+            git(run.repo_dir, "worktree", "add", "-q", str(wt), branch)
+        else:
+            git(run.repo_dir, "worktree", "add", "-q", str(wt), "-B", branch, f"origin/{branch}")
+        git(wt, "branch", "--quiet", "--set-upstream-to", f"origin/{branch}")
+        created, how = True, "resumed"
+    else:
+        local = git(run.repo_dir, "branch", "--list", f"{prefix}*", "--format=%(refname:short)").split()
+        branch = local[0] if local else prefix + slug_of(plan["title"])
+        git(run.repo_dir, "worktree", "add", "-q", str(wt), *([branch] if local else ["-b", branch, f"origin/{base}"]))
+        created, how = True, "cut from " + ("the local branch" if local else f"origin/{base}")
+    if not remote or git(wt, "rev-list", "--count", f"origin/{branch}..HEAD") != "0":
+        git(wt, "push", "--quiet", "-u", "origin", branch)
+    if git(wt, "rev-parse", "HEAD") != git(wt, "rev-parse", f"origin/{branch}"):
+        raise Failed(f"{wt} is not at origin/{branch}: it has diverged; settle it by hand", REFUSE)
+    bootstrap = run.config.get("bootstrap")
+    if created and bootstrap:
+        code = subprocess.run(["sh", "-c", bootstrap], cwd=wt).returncode
+        if code != 0:
+            raise Failed(f"bootstrap exited {code} in {wt}")
+    run.status(step="worktree", state="running", summary=f"spec worktree {how}: {branch}", next="preview",
+               branch=branch, base=base)
+    print(f"worktree {wt} on {branch} ({how})")
+    return 0
+
+
+def deviations_of(body):
+    m = re.search(r"^Deviations:\s*\n?(.*)\Z", body or "", re.S | re.M)
+    text = (m.group(1) if m else "").strip()
+    return "" if text.lower().rstrip(".") in ("", "none") else text
+
+
+def cmd_confirm(spec, left):
+    run = Run(spec)
+    plan = checked_plan(run)
+    open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
+    if open_:
+        raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
+    base = run.base()
+    spec_pr = ensure_spec_pr(run, plan, base)
+    merged = [p for p in run.prs("closed", plan["spec_branch"]) if p["merged_at"]]
+    pr_body = {}
+    for p in merged:
+        m = re.match(r"agent/issue-(\d+)-", p["head"])
+        if m:
+            pr_body[int(m.group(1))] = json.loads(gh(f"repos/{run.repo}/pulls/{p['number']}", "--jq", "{body}"))["body"]
+    found = [(x, deviations_of(pr_body.get(x["number"]))) for x in plan["slices"]]
+    found = [(x, d) for x, d in found if d]
+    body = f"Closes #{spec}\n\n{slice_listing(plan)}\n\n"
+    body += ("Deviations:\n\n" + "\n\n".join(f"#{x['number']} {x['title']}\n{d}" for x, d in found)) if found \
+        else "Deviations: none"
+    if left:
+        body += "\n\nLeft from review:\n" + left.strip()
+    gh("-X", "PATCH", f"repos/{run.repo}/pulls/{spec_pr['number']}", "-f", f"body={body}", "--silent")
+    post_progress(run, plan, base, spec_pr)
+    summary = f"spec PR #{spec_pr['number']} closes #{spec}; {len(found)} slice(s) with deviations"
+    run.status(step="confirm", state="running", summary=summary, next="clean up", pr_url=spec_pr["url"],
+               branch=plan["spec_branch"])
+    print(f"{summary}: {spec_pr['url']}")
+    return 0
+
+
+def cmd_cleanup(spec):
+    run = Run(spec)
+    plan = checked_plan(run)
+    open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
+    if open_:
+        raise Failed(f"not every slice is closed: {', '.join(open_)}; their worktrees hold work", REFUSE)
+    spec_wt = run.root / f"spec-{spec}"
+    if spec_wt.is_dir():
+        if dirty(spec_wt):
+            raise Failed(f"{spec_wt} has uncommitted changes", REFUSE)
+        branch = git(spec_wt, "branch", "--show-current")
+        git(spec_wt, "fetch", "--quiet", "origin")
+        if branch and git(spec_wt, "rev-list", "--count", f"origin/{branch}..HEAD") != "0":
+            raise Failed(f"{spec_wt} has commits not on origin/{branch}: push them first", REFUSE)
+    removed = []
+    for wt in [spec_wt] + [run.root / f"issue-{x['number']}" for x in plan["slices"]]:
+        if wt.is_dir():
+            git(run.repo_dir, "worktree", "remove", "--force", str(wt))
+            removed.append(wt.name)
+    git(run.repo_dir, "worktree", "prune")
+    if run.notes.is_dir():
+        shutil.rmtree(run.notes)
+        removed.append("notes")
+    spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"])
+    url = spec_pr["url"] if spec_pr else None
+    run.status(step="cleanup", state="running", summary="cleaned up: " + (", ".join(removed) or "nothing left"),
+               next="review and fix the spec PR", branch=plan["spec_branch"], **({"pr_url": url} if url else {}))
+    print("removed " + (", ".join(removed) or "nothing"))
+    print(url or "no open spec PR")
+    return 0
+
+
 # halt and finish
 
 OUTCOMES = {"done": ("done", "review-pr"), "halted": ("halted", "build"), "conflicts": ("halted", "explore"),
@@ -942,6 +1071,14 @@ def main():
     h.add_argument("spec")
     h.add_argument("slice")
     h.add_argument("why", nargs="+")
+    op = sub.add_parser("open", help="open the spec worktree: resume the spec branch from origin, or cut and push it")
+    op.add_argument("spec")
+    op.add_argument("--base", help="base branch; default from the status file, config, or the repo")
+    co = sub.add_parser("confirm", help="with every slice closed: the spec PR closes the spec and lists deviations")
+    co.add_argument("spec")
+    co.add_argument("--left", help="what the last review left open, or `-` for stdin")
+    cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
+    cl.add_argument("spec")
     fi = sub.add_parser("finish", help="post the run's status comment and final status")
     fi.add_argument("spec")
     fi.add_argument("outcome", choices=sorted(OUTCOMES))
@@ -965,6 +1102,12 @@ def main():
             code = cmd_land(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "progress":
             code = cmd_progress(spec)
+        elif args.cmd == "open":
+            code = cmd_open(spec, args.base)
+        elif args.cmd == "confirm":
+            code = cmd_confirm(spec, sys.stdin.read() if args.left == "-" else args.left)
+        elif args.cmd == "cleanup":
+            code = cmd_cleanup(spec)
         elif args.cmd == "frontier":
             running = [int(x.strip().lstrip("#")) for x in args.running.split(",") if x.strip()]
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)

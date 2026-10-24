@@ -73,14 +73,9 @@ A fresh comment on the spec issue as the run's last action, never an edit: edits
 
 ## Spec PR
 
-Draft, `spec branch → base`, opened by `drive-spec land` when the first slice lands; an open one already there is left as is. Base comes from the status file, then `baseBranch` in `.claude/drive-spec.json`, then the repo's default branch. The body lists every slice in build order, including those not yet built. It says `Ref #<spec>` while any slice is open, so merging the draft early cannot close the spec; step 8 changes it to `Closes #<spec>`:
+Draft, `spec branch → base`, opened by `drive-spec land` when the first slice lands; an open one already there is left as is. Base comes from the status file, then `baseBranch` in `.claude/drive-spec.json`, then the repo's default branch. The body lists every slice in build order, including those not yet built. It says `Ref #<spec>` while any slice is open, so merging the draft early cannot close the spec.
 
-```sh
-owner=${repo%/*}
-gh api "repos/$repo/pulls?state=open&base=<base>&head=$owner:agent/local-spec-<n>-<slug>" \
-  --jq '.[] | {number, body, url: .html_url}'
-gh api -X PATCH "repos/$repo/pulls/<pr>" -f body="$body" --silent
-```
+`drive-spec confirm` (step 8) refuses while a slice is open, then rewrites the body: `Closes #<spec>`, the slices, then `Deviations:` with each slice's list from its merged PR (a slice whose list is `none` is left out; `Deviations: none` when no slice has one), then `Left from review:` with `--left`. It never marks the PR ready.
 
 ## Halting
 

@@ -34,33 +34,12 @@ A branch already on origin keeps whatever slug it has; look it up with `git ls-r
 
 ## Create
 
-Always `git fetch --prune origin` first.
+`drive-spec open` creates the spec worktree and `drive-spec start` a slice's; this is the contract they implement. Both fetch with `--prune` first.
 
-Spec, resume (branch on origin):
-
-```sh
-git worktree add "$root/spec-<n>" -B agent/local-spec-<n>-<slug> origin/agent/local-spec-<n>-<slug>
-```
-
-Spec, fresh:
-
-```sh
-git worktree add "$root/spec-<n>" -b agent/local-spec-<n>-<slug> origin/<base>
-git -C "$root/spec-<n>" push -u origin agent/local-spec-<n>-<slug>
-```
-
-Pushing at once is what lets another session, or a later resume, see the spec is underway.
-
-Slice, fresh, from the spec worktree's current HEAD:
-
-```sh
-git -C "$root/spec-<n>" pull --ff-only
-git worktree add "$root/issue-<m>" -b agent/issue-<m>-<slug> agent/local-spec-<n>-<slug>
-```
-
-Slice, resume (branch on origin, with or without an open PR): same as spec resume with the slice names. Restore the worktree before continuing implementation or entering the integration queue.
-
-A path that already exists is reused when it is on the expected branch, and is an error otherwise. A branch checked out in a worktree the run did not create belongs to another session: stop and say which path holds it.
+- **Spec**: an existing worktree on the spec branch is reused and fast-forwarded; else the branch on origin is resumed (a local branch already ahead of it is kept, never reset); else it is cut from `origin/<base>` and pushed at once, which is what lets another session, or a later resume, see the spec is underway.
+- **Slice**: an existing worktree is reused; else the local branch, else the branch on origin (with or without an open PR); else a fresh branch from the spec worktree's HEAD after `pull --ff-only`. A crashed run's unpushed commits are never reset away.
+- A path that already exists is reused when it is on the expected branch, and refused otherwise. A branch checked out in a worktree the run did not create belongs to another session: git refuses to check it out twice, and the command stops naming the path.
+- Bootstrap runs only in a worktree the command just created.
 
 ## Bootstrap
 
