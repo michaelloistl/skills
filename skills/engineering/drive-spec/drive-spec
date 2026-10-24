@@ -627,7 +627,7 @@ def cmd_land(spec, m):
     with open(run.notes / "landed.jsonl", "a") as f:
         f.write(json.dumps({"slice": m, "pr": pr["number"], "at": stamp()}) + "\n")
     summary = progress_summary(plan)
-    run.status(step="build", state="running", summary=summary, pr_url=spec_pr["url"],
+    run.status(step="build", state="running", summary=summary, pr_url=spec_pr["url"], branch=spec_branch,
                next="integrate the next completed slice, or pick from the frontier")
     print(f"landed #{m} via #{pr['number']}; {summary}")
     return 0
@@ -811,7 +811,7 @@ def cmd_start(spec, m):
     if "agent:in-progress" not in s["labels"]:
         add_label(run, m, "agent:in-progress")
         s["labels"].append("agent:in-progress")
-    run.status(step="build", state="running", summary=progress_summary(plan),
+    run.status(step="build", state="running", summary=progress_summary(plan), branch=plan["spec_branch"],
                next=f"integrate #{m}" if s["state"] == "open-pr" else f"implementer builds #{m}")
     print(f"worktree {wt} on {branch}")
     if s["state"] == "open-pr":
@@ -831,11 +831,12 @@ OUTCOMES = {"done": ("done", "review-pr"), "halted": ("halted", "build"), "confl
             "ceiling": ("paused", "build"), "held": ("paused", "build"), "refused": ("halted", "guard")}
 
 
-def finish(run, outcome, why=None, slice_=None, step=None, resume=None):
+def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=None):
     spec = run.spec
     plan = make_plan(run)
     resume = resume or f"/drive-spec {spec}"
     extra = ""
+    spec_pr = None
     if outcome == "refused":
         if not plan["refuse"]:
             raise Failed(f"`drive-spec plan {spec}` does not refuse the spec", REFUSE)
@@ -852,7 +853,10 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None):
             spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"]) if plan["spec_branch"] else None
             if not spec_pr:
                 raise Failed("not done: no open spec PR", REFUSE)
-            first = f"drive-spec done: all {len(slices)} slices landed, review clean. Spec PR #{spec_pr['number']}."
+            review = "review left findings open" if left else "review clean"
+            first = f"drive-spec done: all {len(slices)} slices landed, {review}. Spec PR #{spec_pr['number']}."
+            if left:
+                extra = "Left from review:\n" + left.strip()
         elif outcome == "halted":
             if not why:
                 raise Failed("a halt needs --why", REFUSE)
@@ -874,18 +878,23 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None):
             first = f"drive-spec paused: only held slices remain ({', '.join(held)}). Resume in a local session."
     body = first + ("" if outcome == "done" else f"\n`{resume}`") + (f"\n\n{extra}" if extra else "")
     gh(f"repos/{run.repo}/issues/{spec}/comments", "-f", f"body={body}", "--silent")
+    known = {}
     if outcome != "refused" and plan["spec_branch"]:
         base = run.base()
-        post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
+        spec_pr = spec_pr or spec_pr_of(run, base, plan["spec_branch"])
+        post_progress(run, plan, base, spec_pr)
+        known = {"branch": plan["spec_branch"], **({"pr_url": spec_pr["url"]} if spec_pr else {})}
     state, default_step = OUTCOMES[outcome]
     run.status(step=step or default_step, state=state, summary=first,
-               next="none" if outcome == "done" else resume, question="")
+               next="none" if outcome == "done" else resume, question="", **known)
     print(body)
     return 0
 
 
-def cmd_finish(spec, outcome, why, slice_, step, resume):
-    return finish(Run(spec), outcome, why, slice_, step, resume)
+def cmd_finish(spec, outcome, why, slice_, step, resume, left):
+    if left and outcome != "done":
+        raise Failed("--left goes with done only", REFUSE)
+    return finish(Run(spec), outcome, why, slice_, step, resume, sys.stdin.read() if left == "-" else left)
 
 
 def cmd_halt(spec, m, why):
@@ -940,6 +949,7 @@ def main():
     fi.add_argument("--slice", type=lambda v: int(v.lstrip("#")))
     fi.add_argument("--step")
     fi.add_argument("--resume", help="resume command; default /drive-spec <spec>")
+    fi.add_argument("--left", help="with done: what the last review left open, or `-` for stdin")
     args = p.parse_args()
     spec = int(args.spec.lstrip("#"))
     try:
@@ -964,7 +974,7 @@ def main():
             code = cmd_halt(spec, int(args.slice.lstrip("#")), " ".join(args.why).rstrip("."))
         elif args.cmd == "finish":
             code = cmd_finish(spec, args.outcome, args.why and args.why.rstrip("."), args.slice, args.step,
-                              args.resume)
+                              args.resume, args.left)
     except Failed as e:
         print(f"drive-spec: {e}", file=sys.stderr)
         code = e.code

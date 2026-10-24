@@ -48,11 +48,11 @@ Every slice in build order; closed slices ticked; `← building` on open slices 
 
 ## Status comment
 
-A fresh comment on the spec issue as the run's last action, never an edit: edits notify no one, and this comment is how the operator learns the run is over. `drive-spec finish <spec> <outcome>` posts it, refreshes the progress comment, and writes the final status; `drive-spec halt` finishes as `halted`. The first line is the outcome; every outcome but done adds the resume command (default `/drive-spec <spec>`, else `--resume`) on a second line.
+A fresh comment on the spec issue as the run's last action, never an edit: edits notify no one, and this comment is how the operator learns the run is over. `drive-spec finish <spec> <outcome>` posts it, refreshes the progress comment, and writes the final status, with `branch` and `pr_url` so the dispatcher can relay the PR and watch it for overlaps; `drive-spec halt` finishes as `halted`. The first line is the outcome; every outcome but done adds the resume command (default `/drive-spec <spec>`, else `--resume`) on a second line.
 
 | Outcome | First line | Refused when |
 |---|---|---|
-| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` | a slice is open, or no spec PR is |
+| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` With `--left`, `review left findings open`, then the list | a slice is open, or no spec PR is |
 | halted | `drive-spec halted on #<m>: <why>.`, or without a slice `drive-spec halted: <why>.` | no `--why` |
 | conflicts | `drive-spec halted before building: the spec and its slices disagree.`, then the list from `conflicts.md` | `conflicts.md` is empty |
 | ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` | |

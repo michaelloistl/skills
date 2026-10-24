@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -802,6 +803,96 @@ class Finish(Cli):
         self.assertEqual(self.run_ds("finish", "10", "refused").returncode, 0)
         self.assertTrue(self.comments(10)[0].startswith("drive-spec refused #10: #10 has a ## Parent of its own"))
         self.assertEqual(self.status_file()["step"], "guard")
+
+
+DISPATCH = SCRIPT.parent.parent / "dispatch" / "dispatch"
+STATUS_DOC = SCRIPT.with_name("STATUS.md").read_text()
+
+
+class Dispatcher(Cli):
+    """What the script writes is what the dispatcher reads: the contract in STATUS.md, read by `dispatch`."""
+
+    def setUp(self):
+        super().setUp()
+        for name, out in (("herdr", "{}"), ("claude", "[]")):
+            f = self.tmp / "bin" / name
+            f.write_text(f"#!/bin/sh\necho '{out}'\n")
+            f.chmod(0o755)
+
+    def row(self):
+        st = self.status_file()
+        steps = re.search(r"`step` is the step's name: (.*)\.", STATUS_DOC).group(1)
+        self.assertIn(f"`{st['step']}`", steps)
+        self.assertIn(f"| `{st['state']}` |", STATUS_DOC)
+        for key in ("step", "state", "summary", "next"):
+            self.assertTrue(st.get(key), key)
+        self.assertNotIn("\n", st["summary"])
+        out = subprocess.run([str(DISPATCH), "--repo", str(self.repo), "status", "--json"], capture_output=True,
+                             text=True, env=self.env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return next(r for r in json.loads(out.stdout) if str(r["spec"]) == "10")
+
+    def test_landing_is_running_with_branch_and_pr(self):
+        self.land_11()
+        st = self.status_file()
+        self.assertEqual((st["branch"], st["pr_url"]),
+                         ("agent/local-spec-10-export", "https://github.com/acme/app/pull/101"))
+        self.assertEqual((self.row()["state"], self.row()["summary"]), ("running", "landed 1/2"))
+
+    def test_start_is_running(self):
+        self.run_ds("start", "10", "11")
+        self.assertEqual(self.row()["state"], "running")
+        self.assertEqual(self.status_file()["branch"], "agent/local-spec-10-export")
+
+    def test_halt_relays_why_and_resume(self):
+        self.run_ds("halt", "10", "11", "export test red")
+        r = self.row()
+        self.assertEqual((r["attention"], r["detail"]),
+                         ("HALT", "drive-spec halted on #11: export test red. → /drive-spec 10"))
+
+    def test_review_halt_resumes_with_review_fix_pr(self):
+        self.land_11()
+        self.run_ds("finish", "10", "halted", "--why", "fix pass red", "--step", "review-pr",
+                    "--resume", "/review-fix-pr 101")
+        r = self.row()
+        self.assertEqual((r["attention"], r["step"]), ("HALT", "review-pr"))
+        self.assertTrue(r["detail"].endswith("→ /review-fix-pr 101"))
+
+    def test_pauses(self):
+        self.run_ds("gate", "10", GATE)
+        self.land_11()
+        self.run_ds("finish", "10", "ceiling")
+        r = self.row()
+        self.assertEqual((r["attention"], r["detail"]),
+                         ("PAUSE", "drive-spec paused at maxSlices: 1 of 2 slices landed. → /drive-spec 10"))
+
+    def test_done_relays_the_pr_and_clears_a_question(self):
+        self.land_11()
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "question=keep CSV?", "question_blocking=false"],
+                       cwd=self.repo, env=self.env)
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        self.run_ds("finish", "10", "done")
+        r = self.row()
+        self.assertEqual((r["attention"], r["detail"], r["step"]),
+                         ("PR", "https://github.com/acme/app/pull/101", "review-pr"))
+        self.assertIsNone(self.status_file()["question"])
+
+    def test_done_with_review_leftovers(self):
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        out = subprocess.run([str(SCRIPT), "finish", "10", "done", "--left", "-"], cwd=self.repo, env=self.env,
+                             input="- rename ExportJob\n", capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.comments(10)[-1], "drive-spec done: all 2 slices landed, review left findings open. "
+                                                "Spec PR #101.\n\nLeft from review:\n- rename ExportJob")
+        self.assertEqual(self.row()["attention"], "PR")
+        self.assertEqual(self.run_ds("finish", "10", "held", "--left", "x").returncode, 2)
+
+    def test_refusal_halts_at_guard(self):
+        self.edit_state(lambda st: st["issues"]["10"].update(body="## Parent\n\n#1\n"))
+        self.run_ds("finish", "10", "refused")
+        r = self.row()
+        self.assertEqual((r["attention"], r["step"]), ("HALT", "guard"))
 
 
 if __name__ == "__main__":
