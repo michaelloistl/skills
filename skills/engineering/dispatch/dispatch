@@ -655,7 +655,21 @@ def cmd_ack(spec, dirs):
     acked = load_acked()
     acked[spec] = data.get("updated_at")
     save_json(ACKED, acked)
-    print(f"{spec} acked")
+    row = next((r for r in snapshot(dirs) if r["spec"] == spec), None)
+    pane = (row or {}).get("pane")
+    if data.get("state") != "done" or not pane:
+        print(f"{spec} acked" + ("; pane kept, not done" if pane else ""))
+        return
+    if row["herdr"] in ("working", "blocked") or row["session"] == "busy" or pane == os.environ.get("HERDR_PANE_ID"):
+        print(f"{spec} acked; pane {pane} kept, still active")
+        return
+    tab = next((a.get("tab_id") for a in herdr_agents() if a.get("pane_id") == pane), None)
+    try:
+        herdr_json("tab", "close", tab)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, TypeError) as e:
+        print(f"{spec} acked; tab not closed: {e}")
+        return
+    print(f"{spec} acked; tab {tab} closed, resume with claude --resume {data.get('session_id')}")
 
 
 def main():
@@ -665,7 +679,7 @@ def main():
     s = sub.add_parser("status", help="one line per spec, what needs you first")
     s.add_argument("--json", action="store_true")
     sub.add_parser("watch", help="print a line whenever a spec starts or stops needing you")
-    a = sub.add_parser("ack", help="hide a done spec until its status changes")
+    a = sub.add_parser("ack", help="hide a done spec until its status changes; close its tab when idle")
     a.add_argument("spec")
     an = sub.add_parser("answer", help="send the operator's answer to a spec waiting on its question")
     an.add_argument("spec")
