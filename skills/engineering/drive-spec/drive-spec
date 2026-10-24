@@ -323,7 +323,7 @@ def cmd_plan(spec, as_json):
     print(json.dumps(plan, indent=2) if as_json else render(plan))
     if plan["refuse"]:
         return REFUSE
-    if not as_json and run.current().get("step") in (None, "resolve", "guard"):
+    if not as_json and run.current().get("step") in ("resolve", "guard"):
         run.status(step="guard", state="running", summary=f"plan: {progress_summary(plan)}",
                    next="open the spec worktree")
     return 0

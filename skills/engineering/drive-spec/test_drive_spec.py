@@ -1052,6 +1052,8 @@ class Boundaries(DispatcherCase):
         self.assertEqual(self.row()["step"], "resolve")
 
     def test_plan_writes_guard_once(self):
+        self.run_ds("plan", "10")
+        self.assertFalse((self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").exists())
         self.run_ds("gate", "10", GATE)
         self.run_ds("plan", "10", "--json")
         self.assertEqual(self.status_file()["step"], "resolve")

@@ -246,15 +246,11 @@ def pressure(kind, window):
 
 
 def specs_in_tests():
+    """Gate runs queued on the host-wide verify lock: `ps`, since macOS has no /proc."""
     count = 0
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            argv = (proc / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if argv and Path(argv[0].decode(errors="replace")).name == "flock" and VERIFY_LOCK.encode() in argv:
+    for text in run(["ps", "-Ao", "args="]).splitlines():
+        argv = text.split()
+        if argv and Path(argv[0]).name == "flock" and VERIFY_LOCK in argv:
             count += 1
     return count
 
@@ -353,9 +349,14 @@ def cmd_launch(specs, dirs, force):
 
 
 def boot_time():
-    for text in Path("/proc/stat").read_text().splitlines():
-        if text.startswith("btime "):
-            return datetime.fromtimestamp(int(text.split()[1]), timezone.utc)
+    try:
+        for text in Path("/proc/stat").read_text().splitlines():
+            if text.startswith("btime "):
+                return datetime.fromtimestamp(int(text.split()[1]), timezone.utc)
+    except OSError:
+        m = re.search(r"sec = (\d+)", run(["sysctl", "-n", "kern.boottime"]))
+        if m:
+            return datetime.fromtimestamp(int(m.group(1)), timezone.utc)
     return None
 
 

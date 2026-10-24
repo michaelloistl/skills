@@ -15,7 +15,7 @@ At the end of every step, and within step 6 at each dispatch, landing and halt. 
 | Step | Written by |
 |---|---|
 | `resolve` | `drive-spec gate <spec> '<verify>' --base <base>` |
-| `guard` | `drive-spec plan <spec>`, while the run is at step 1 or 2; refused: `finish refused` |
+| `guard` | `drive-spec plan <spec>`, only once `gate` has written `resolve`, so a plan read outside a run writes nothing; refused: `finish refused` |
 | `worktree` | `drive-spec open` |
 | `preview` | `drive-spec preview`; `paused` with `--dry-run` |
 | `explore` | `drive-spec explored`; conflicts: `finish conflicts` |
