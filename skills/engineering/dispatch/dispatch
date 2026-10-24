@@ -21,12 +21,12 @@ QUEUE = STATE_DIR / "queue.json"
 BASES = STATE_DIR / "bases.json"
 FETCH_SECONDS = 120
 MERGED_PR = re.compile(r"Merge pull request #(\d+) from \S+?/(\S+)")
-VERIFY_LOCK = "/tmp/drive-spec-verify.lock"
 MAX_CPU = float(os.environ.get("DISPATCH_MAX_CPU", 40))
 MAX_MEMORY = float(os.environ.get("DISPATCH_MAX_MEMORY", 5))
 MAX_TESTS = int(os.environ.get("DISPATCH_MAX_TESTS", 2))
 STALL_SECONDS = 15 * 60
 TICK_SECONDS = 60
+POLL_SECONDS = 1.0
 TITLE = re.compile(r"\b(?:drive-spec|spec)[- ](\d+)\b")
 
 ORDER = ["DIALOG", "ASK", "HALT", "STALL", "GONE", "PAUSE", "PR"]
@@ -246,11 +246,11 @@ def pressure(kind, window):
 
 
 def specs_in_tests():
-    """Gate runs queued on the host-wide verify lock: `ps`, since macOS has no /proc."""
+    """`drive-spec verify` processes, each running its gate under the host-wide verify lock or waiting for it."""
     count = 0
     for text in run(["ps", "-Ao", "args="]).splitlines():
         argv = text.split()
-        if argv and Path(argv[0]).name == "flock" and VERIFY_LOCK in argv:
+        if any(Path(a).name == "drive-spec" and argv[i + 1:i + 2] == ["verify"] for i, a in enumerate(argv[:2])):
             count += 1
     return count
 
@@ -435,19 +435,50 @@ def cmd_admit():
     print("blocked: " + "; ".join(v["reasons"]) if v["reasons"] else "clear")
 
 
-class Inotify:
+class StatusWatch:
+    """Wakes when a status file changes: inotify on Linux, else a poll of the files' mtimes (macOS)."""
     IN_CLOSE_WRITE, IN_MOVED_TO, IN_NONBLOCK = 0x8, 0x80, 0o4000
 
     def __init__(self, dirs):
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        self.fd = libc.inotify_init1(self.IN_NONBLOCK)
-        if self.fd < 0:
-            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.dirs, self.fd = dirs, None
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
-            libc.inotify_add_watch(self.fd, str(d).encode(), self.IN_CLOSE_WRITE | self.IN_MOVED_TO)
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            fd = libc.inotify_init1(self.IN_NONBLOCK)
+        except (OSError, AttributeError):
+            fd = -1
+        if fd >= 0:
+            self.fd = fd
+            for d in dirs:
+                libc.inotify_add_watch(self.fd, str(d).encode(), self.IN_CLOSE_WRITE | self.IN_MOVED_TO)
+        self.seen = self.stamp()
+
+    def stamp(self):
+        found = set()
+        for d in self.dirs:
+            for f in d.glob("spec-*"):
+                try:
+                    found.add((f.name, f.stat().st_mtime_ns))
+                except OSError:
+                    pass
+        return found
+
+    def wait(self, socks, timeout):
+        """The sockets with data, once a status file changes, a socket has data, or the timeout passes."""
+        if self.fd is not None:
+            ready, _, _ = select.select([self.fd] + socks, [], [], timeout)
+            return ready
+        deadline = time.monotonic() + timeout
+        while True:
+            ready, _, _ = select.select(socks, [], [], max(0.0, min(POLL_SECONDS, deadline - time.monotonic())))
+            if ready or time.monotonic() >= deadline or self.stamp() != self.seen:
+                return ready
 
     def drain(self):
+        if self.fd is None:
+            self.seen = self.stamp()
+            return
         try:
             while os.read(self.fd, 65536):
                 pass
@@ -596,7 +627,7 @@ def cmd_merges(dirs):
 
 
 def cmd_watch(dirs):
-    notify = Inotify(dirs)
+    notify = StatusWatch(dirs)
     herdr = HerdrEvents()
     try:
         reported = json.loads(REPORTED.read_text())
@@ -621,8 +652,7 @@ def cmd_watch(dirs):
             reported = current
             save_json(REPORTED, reported)
 
-        fds = [notify.fd] + ([herdr.sock] if herdr.sock else [])
-        ready, _, _ = select.select(fds, [], [], TICK_SECONDS)
+        ready = notify.wait([herdr.sock] if herdr.sock else [], TICK_SECONDS)
         time.sleep(0.5)
         notify.drain()
         if herdr.sock in ready:

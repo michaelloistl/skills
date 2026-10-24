@@ -469,7 +469,8 @@ class Verify(Cli):
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return
-            if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+            if state.strip().startswith("Z"):
                 return
             time.sleep(0.05)
         self.fail(f"pid {pid} still runs")
@@ -510,7 +511,23 @@ class Verify(Cli):
         out = self.run_ds("verify", "pr-33", str(self.wt), "--gate", "true")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(any((self.repo / ".git" / "drive-spec" / "pr-33" / "verified").iterdir()))
-        self.assertIn("(already verified)", self.run_ds("verify", "pr-33", str(self.wt)).stdout)
+        self.assertIn("(already verified)", self.run_ds("verify", "pr-33", str(self.wt), "--gate", "true").stdout)
+        self.assertNotIn("(already verified)", self.run_ds("verify", "pr-33", str(self.wt), "--gate", "false").stdout)
+
+    def test_only_the_pinned_gate_decides(self):
+        (self.wt / "RED").write_text("x")
+        self.git(self.wt, "add", "RED")
+        self.git(self.wt, "commit", "-qm", "Break the gate")
+        out = self.run_ds("verify", "10", str(self.wt), "--gate", "true")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--gate goes with pr-<n> only", out.stderr)
+        self.run_ds("gate", "10", "true")
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 0)
+        self.run_ds("gate", "10", GATE)
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 4, out.stdout)
+        self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 4)
+        self.assertFalse(any(p["merged_at"] for p in self.gh_state()["pulls"]))
 
 
 class Integrate(Cli):
