@@ -8,7 +8,7 @@ Python 3, standard library only. Run it from inside the repo, or pass `--repo PA
 
 - `dispatch status [--json]`: one line per spec, what needs the operator first.
 - `dispatch watch`: prints a line each time a spec starts or stops needing the operator, and nothing else. It wakes on status-file writes (inotify) and herdr agent-state events (the herdr socket's `events.subscribe`), with a 60-second tick for stalls. No polling loop over the files. Every 2 minutes it also runs `merges`.
-- `dispatch ack <spec>`: hides a done spec until its status changes.
+- `dispatch ack <spec>`: hides a done spec until its status changes. When it is `done` and its session idle, also closes its herdr tab; the session stays resumable with `claude --resume <session_id>` from its status file.
 - `dispatch answer <spec> <text>`: sends the operator's answer to a spec whose status is `waiting` on a blocking question, as a prompt into its pane that quotes the question. It refuses a spec that is not waiting, is still working, or has no pane, so an answer never lands mid-step.
 - `dispatch launch <spec>… [--force]`: starts each spec in a new herdr tab `spec-<n>` in the caller's workspace, cwd the repo root, as Claude session `drive-spec-<n>` running `/drive-spec <n>`. drive-spec makes its own worktree and branch. A spec already live is skipped. Under pressure the spec is queued instead, and `watch` prints `READY` when the head of the queue can start.
 - `dispatch admit`: the pressure readings and the verdict a launch would get.
