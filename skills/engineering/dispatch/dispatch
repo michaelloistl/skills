@@ -32,9 +32,9 @@ TITLE = re.compile(r"\b(?:drive-spec|spec)[- ](\d+)\b")
 ORDER = ["DIALOG", "ASK", "HALT", "STALL", "GONE", "PAUSE", "PR"]
 
 
-def run(cmd):
+def run(cmd, env=None):
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
         return out.stdout if out.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -66,11 +66,22 @@ def herdr_agents():
         return []
 
 
-def claude_sessions():
-    try:
-        return json.loads(run(["claude", "agents", "--json"]) or "[]")
-    except ValueError:
-        return []
+def claude_sessions(files=None):
+    """Sessions from every Claude config dir in play: this one's, and each status file's `config_dir`, since a
+    session is listed only under the config dir it runs in."""
+    own = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    dirs = [own] + sorted({d["config_dir"] for d in (files or {}).values() if d.get("config_dir")} - {own})
+    found, seen = [], set()
+    for d in dirs:
+        try:
+            listed = json.loads(run(["claude", "agents", "--json"], dict(os.environ, CLAUDE_CONFIG_DIR=d)) or "[]")
+        except ValueError:
+            continue
+        for s in listed:
+            if s.get("sessionId") not in seen:
+                seen.add(s.get("sessionId"))
+                found.append(s)
+    return found
 
 
 def spec_of(text):
@@ -111,7 +122,7 @@ def in_repos(cwd, dirs):
 def snapshot(dirs):
     files = read_status_files(dirs)
     all_agents = herdr_agents()
-    all_sessions = claude_sessions()
+    all_sessions = claude_sessions(files)
     agents = [a for a in all_agents if in_repos(a.get("cwd"), dirs)]
     sessions = [s for s in all_sessions if in_repos(s.get("cwd"), dirs)]
     acked = load_acked()

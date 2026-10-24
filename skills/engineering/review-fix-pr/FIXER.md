@@ -18,7 +18,7 @@ Verify gate, run once everything is committed, must print `green` before you fin
 Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer.
 
 Report back:
-- green or red, the commit SHAs, and the HEAD SHA the gate ran on. Red means the verify gate is failing and why; report it as red rather than committing around it.
+- the commit SHAs, and the verdict line the verify command printed, quoted verbatim (`green <sha>`, or `red <sha>: …`). No verdict line yet means the gate is still running: wait for its completion notification. Red means the verify gate is failing and why; report it as red rather than committing around it.
 - **SUMMARY** — short Markdown of what changed, for a top-level PR comment.
 - **REPLIES** — one entry per inline comment in scope: its numeric id and a short reply (what changed, or why declined).
 ```

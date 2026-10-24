@@ -32,7 +32,10 @@ def pipes_out(rest):
     return False
 
 
-for m in re.finditer(rf"(?:{callee})\s+(?:{COMMANDS})\b", cmd):
+# Only where a command starts (a line, or after `;`, `&`, `|`, `(`, `$(`, past any VAR=value prefixes), so a
+# mention inside text, such as a heredoc or a commit message, is not read as a call.
+START = r"(?:^|[;&|(\n])\s*(?:[A-Za-z_]\w*=\S*\s+)*"
+for m in re.finditer(rf"{START}(?:{callee})\s+(?:{COMMANDS})\b", cmd, re.M):
     if pipes_out(cmd[m.end():]):
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",

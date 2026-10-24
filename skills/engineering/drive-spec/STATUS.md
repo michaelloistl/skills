@@ -6,7 +6,7 @@ One JSON file per spec, read by a dispatcher that watches every run on the machi
 <skill dir>/status.sh <spec> step=<step> state=<state> summary="<one line>" next="<one line>" [base=…] [branch=…] [pr_url=…] [question="…" question_blocking=true|false]
 ```
 
-`status.sh` sits beside this file. It writes `$GIT_COMMON_DIR/drive-spec/status/spec-<spec>.json` atomically, merges into the previous write, stamps `updated_at`, `repo`, `host`, `session_id` and `herdr_pane` itself, and always exits 0: a status write never stops the run. `key=` with an empty value clears that key.
+`status.sh` sits beside this file. It writes `$GIT_COMMON_DIR/drive-spec/status/spec-<spec>.json` atomically, merges into the previous write, stamps `updated_at`, `repo`, `host`, `session_id`, `config_dir` (the session's Claude config dir, where the dispatcher looks the session up) and `herdr_pane` itself, and always exits 0: a status write never stops the run. `key=` with an empty value clears that key.
 
 ## When
 

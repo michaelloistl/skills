@@ -19,5 +19,5 @@ Commit in imperative present tense, one commit or a few focused ones, subject li
 
 Build each acceptance criterion as written. When one cannot be met as written, or you build it differently, that is a deviation: a changelog line or ADR does not record it.
 
-Report back in one paragraph: what you built, the commit SHAs, the HEAD SHA `drive-spec verify` ran on, and green or red. Then a `Deviations:` list, one line per acceptance criterion you did not build as written and why, or `Deviations: none`. Red means the verify gate is failing and why; report it as red rather than committing around it.
+Report back in one paragraph: what you built, the commit SHAs, and the verdict line `drive-spec verify` printed, quoted verbatim, such as `green 3a5b17c9eb8c` or `red 3a5b17c9eb8c: exit 1; log …`. No verdict line yet means the gate is still running: wait for its completion notification. Then a `Deviations:` list, one line per acceptance criterion you did not build as written and why, or `Deviations: none`. Red means the verify gate is failing and why; report it as red rather than committing around it.
 ```

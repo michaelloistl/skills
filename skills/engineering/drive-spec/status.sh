@@ -17,6 +17,7 @@ write() {
 
   args=(--arg spec "$spec" --arg now "$now"
     --arg session "${CLAUDE_CODE_SESSION_ID:-}" --arg pane "${HERDR_PANE_ID:-}"
+    --arg config "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     --arg host "$(hostname)" --arg repo "$(git remote get-url origin 2>/dev/null)")
   local updates='{}' pair key value
   for pair in "$@"; do
@@ -41,6 +42,7 @@ write() {
       | .host = $host
       | .repo = (if $repo == "" then .repo else $repo end)
       | .session_id = (if $session == "" then .session_id else $session end)
+      | .config_dir = (if $session == "" then .config_dir else $config end)
       | .herdr_pane = (if $pane == "" then .herdr_pane else $pane end)
       | if .question == null then .question_blocking = false else . end
     ' >"$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }

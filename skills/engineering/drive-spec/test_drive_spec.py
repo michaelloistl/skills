@@ -972,6 +972,19 @@ class Dispatcher(DispatcherCase):
         self.assertEqual(self.row()["attention"], "PR")
         self.assertEqual(self.run_ds("finish", "10", "held", "--left", "x").returncode, 2)
 
+    def test_a_session_under_another_config_dir_is_seen(self):
+        run_dir = self.tmp / "claude-on"
+        (self.tmp / "bin" / "claude").write_text(
+            f'#!/bin/sh\nif [ "$CLAUDE_CONFIG_DIR" = "{run_dir}" ]; then\n'
+            f'echo \'[{{"sessionId": "run-1", "cwd": "{self.repo}", "name": "drive-spec-10", "status": "busy"}}]\'\n'
+            "else echo '[]'; fi\n")
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "step=build", "state=running", "summary=landed 0/2",
+                        "next=x"], cwd=self.repo, env=dict(self.env, CLAUDE_CODE_SESSION_ID="run-1",
+                                                           CLAUDE_CONFIG_DIR=str(run_dir)))
+        self.assertEqual(self.status_file()["config_dir"], str(run_dir))
+        self.env["CLAUDE_CONFIG_DIR"] = str(self.tmp / "claude-default")
+        self.assertEqual(self.row()["session"], "busy")
+
     def test_refusal_halts_at_guard(self):
         self.edit_state(lambda st: st["issues"]["10"].update(body="## Parent\n\n#1\n"))
         self.run_ds("finish", "10", "refused")
