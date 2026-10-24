@@ -19,4 +19,5 @@ skills/
 ├── engineering/   # Development workflow skills
 ├── personal/      # Personal / domain-specific skills
 └── wip/           # Drafts
+hooks/             # Claude Code hooks, see hooks/README.md
 ```
