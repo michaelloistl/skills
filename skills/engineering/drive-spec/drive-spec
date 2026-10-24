@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,7 +19,9 @@ REF = re.compile(r"#(\d+)\b")
 HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*#*\s*$")
 MARKER = "<!-- implement-spec -->"
 PR_FIELDS = ".[] | {number, head: .head.ref, url: .html_url, merged_at}"
-VERIFY_LOCK = "/tmp/drive-spec-verify.lock"
+VERIFY_LOCK = os.environ.get("DRIVE_SPEC_VERIFY_LOCK", "/tmp/drive-spec-verify.lock")
+VERIFY_TIMEOUT_MINUTES = 60
+TIMED_OUT = 124
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 SPEC_MOVES = 5
 REFUSE, CONFLICT, RED, INBOX = 2, 3, 4, 5
@@ -251,7 +254,7 @@ class Run:
         self.config = load_config(self.repo_dir)
         self.repo = repo_slug(git(self.repo_dir, "remote", "get-url", "origin"))
         self.root = self.repo_dir / (self.config.get("worktreeRoot") or ".claude/worktrees")
-        self.notes = self.common / "drive-spec" / f"spec-{spec}"
+        self.notes = self.common / "drive-spec" / (spec if isinstance(spec, str) else f"spec-{spec}")
         self.cloud = os.environ.get("CLAUDE_CODE_REMOTE") == "true"
 
     def heads(self, pattern="agent/*"):
@@ -402,7 +405,63 @@ def record(run, sha):
         return {}
 
 
-def verify(run, wt):
+def verify_lock(head, wt):
+    """The host-wide gate lock, one gate at a time; says who holds it before waiting."""
+    lock = open(VERIFY_LOCK, "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        print(f"waiting for the verify lock, held by {lock.read().strip() or 'a gate run outside drive-spec'}",
+              flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    lock.seek(0)
+    lock.truncate()
+    lock.write(f"pid {os.getpid()} verifying {head[:12]} in {wt} since {now()}\n")
+    lock.flush()
+    return lock
+
+
+def release(lock):
+    lock.seek(0)
+    lock.truncate()
+    lock.close()
+
+
+def stop_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def run_gate(gate, wt, out, minutes):
+    """Run the gate in a process group of its own, stopped whole when it overruns or this script is killed."""
+    proc = subprocess.Popen(["sh", "-c", gate], cwd=wt, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+
+    def killed(signum, _frame):
+        stop_group(proc)
+        sys.exit(128 + signum)
+
+    previous = {sig: signal.signal(sig, killed) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        return proc.wait(timeout=minutes * 60)
+    except subprocess.TimeoutExpired:
+        stop_group(proc)
+        out.write(f"\ndrive-spec: the gate ran past {minutes:g} minutes and was stopped\n")
+        return TIMED_OUT
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def verify(run, wt, gate=None):
     """Run the gate on the worktree's HEAD and record the verdict against that commit. True when green."""
     wt = Path(wt).resolve()
     if dirty(wt):
@@ -412,16 +471,20 @@ def verify(run, wt):
     if record(run, head).get("exit") == 0:
         print(f"green {head[:12]} (already verified)")
         return True
-    gate = pinned_gate(run) or run.config.get("verify")
+    gate = gate or pinned_gate(run) or run.config.get("verify")
     if not gate:
         raise Failed("no verify gate: pin one with `drive-spec gate <spec> '<command>'`", REFUSE)
-    cmd = ["flock", VERIFY_LOCK, "sh", "-c", gate] if shutil.which("flock") else ["sh", "-c", gate]
+    minutes = run.config.get("verifyTimeoutMinutes") or VERIFY_TIMEOUT_MINUTES
     logs = run.notes / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{head}.log"
+    lock = verify_lock(head, wt)
     started = now()
-    with open(log, "w") as out:
-        code = subprocess.run(cmd, cwd=wt, stdout=out, stderr=subprocess.STDOUT).returncode
+    try:
+        with open(log, "w") as out:
+            code = run_gate(gate, wt, out, minutes)
+    finally:
+        release(lock)
     if git(wt, "rev-parse", "HEAD") != head:
         raise Failed(f"HEAD moved while the gate ran on {head[:12]}: nothing recorded")
     (run.notes / "verified").mkdir(exist_ok=True)
@@ -431,12 +494,69 @@ def verify(run, wt):
         print(f"green {head[:12]}")
         return True
     print("".join(log.read_text().splitlines(keepends=True)[-40:]), end="")
-    print(f"red {head[:12]}: exit {code}; log {log}")
+    print(f"red {head[:12]}: " + (f"timed out after {minutes:g} minutes" if code == TIMED_OUT else f"exit {code}")
+          + f"; log {log}")
     return False
 
 
-def cmd_verify(spec, wt):
-    return 0 if verify(Run(spec), wt) else RED
+def cmd_verify(spec, wt, gate):
+    return 0 if verify(Run(spec), wt, gate) else RED
+
+
+def process_tree():
+    """pid -> (parent pid, state, working directory or None) for every process /proc shows."""
+    procs = {}
+    for p in Path("/proc").glob("[0-9]*"):
+        try:
+            stat = (p / "stat").read_text()
+            state, ppid = stat.rsplit(")", 1)[1].split()[:2]
+        except (OSError, ValueError):
+            continue
+        try:
+            cwd = os.readlink(p / "cwd").removesuffix(" (deleted)")
+        except OSError:
+            cwd = None
+        procs[int(p.name)] = (int(ppid), state, cwd)
+    return procs
+
+
+def stop_processes_in(wt):
+    """Stop what still runs inside a worktree about to be removed: a gate or shell left there would run on in a
+    deleted directory and could hold the verify lock for good. Spares this script and its ancestors."""
+    wt = os.path.realpath(wt)
+    procs = process_tree()
+    spared, pid = set(), os.getpid()
+    while pid in procs and pid not in spared:
+        spared.add(pid)
+        pid = procs[pid][0]
+    inside = [pid for pid, (_, state, cwd) in procs.items()
+              if pid not in spared and state not in "ZX" and cwd and (cwd == wt or cwd.startswith(wt + "/"))]
+    for pid in inside:
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            cmd = "?"
+        print(f"stopped pid {pid} in {Path(wt).name}: {cmd[:100]}")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 10
+    while inside and time.time() < deadline:
+        live = process_tree()
+        inside = [pid for pid in inside if pid in live and live[pid][1] not in "ZX"]
+        if inside:
+            time.sleep(0.2)
+    for pid in inside:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def remove_worktree(run, wt):
+    stop_processes_in(wt)
+    git(run.repo_dir, "worktree", "remove", "--force", str(wt))
 
 
 # integrate
@@ -639,7 +759,7 @@ def cmd_land(spec, m):
 
     wt = run.root / f"issue-{m}"
     if wt.is_dir():
-        git(run.repo_dir, "worktree", "remove", "--force", str(wt))
+        remove_worktree(run, wt)
     git(run.repo_dir, "worktree", "prune")
     for b in git(run.repo_dir, "branch", "--list", f"{prefix}*", "--format=%(refname:short)").split():
         git(run.repo_dir, "branch", "-D", b)
@@ -1052,7 +1172,7 @@ def cmd_cleanup(spec):
     removed = []
     for wt in [spec_wt] + [run.root / f"issue-{x['number']}" for x in plan["slices"]]:
         if wt.is_dir():
-            git(run.repo_dir, "worktree", "remove", "--force", str(wt))
+            remove_worktree(run, wt)
             removed.append(wt.name)
     git(run.repo_dir, "worktree", "prune")
     if run.notes.is_dir():
@@ -1163,8 +1283,9 @@ def main():
     g.add_argument("command", nargs="?")
     g.add_argument("--base", help="with a command: the run's base branch; default config, then the repo's")
     v = sub.add_parser("verify", help="run the gate on a worktree's HEAD and record the verdict; exit 4 when red")
-    v.add_argument("spec")
+    v.add_argument("spec", help="the spec, or pr-<n> to verify a PR head outside a spec run")
     v.add_argument("worktree")
+    v.add_argument("--gate", help="the gate to run; default the pinned gate, then `verify` in the config")
     i = sub.add_parser("integrate", help="merge the spec branch into a slice, verify, push, merge its PR")
     i.add_argument("spec")
     i.add_argument("slice")
@@ -1214,14 +1335,14 @@ def main():
     fi.add_argument("--resume", help="resume command; default /drive-spec <spec>")
     fi.add_argument("--left", help="with done: what the last review left open, or `-` for stdin")
     args = p.parse_args()
-    spec = int(args.spec.lstrip("#"))
+    spec = args.spec if args.cmd == "verify" and re.fullmatch(r"pr-\d+", args.spec) else int(args.spec.lstrip("#"))
     try:
         if args.cmd == "plan":
             code = cmd_plan(spec, args.json)
         elif args.cmd == "gate":
             code = cmd_gate(spec, args.command, args.base)
         elif args.cmd == "verify":
-            code = cmd_verify(spec, args.worktree)
+            code = cmd_verify(spec, args.worktree, args.gate)
         elif args.cmd == "integrate":
             code = cmd_integrate(spec, int(args.slice.lstrip("#")), args.deviations)
         elif args.cmd == "land":

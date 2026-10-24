@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import types
 import unittest
 from pathlib import Path
@@ -293,7 +294,8 @@ class Cli(unittest.TestCase):
         gh.write_text(f"#!{sys.executable}\n{FAKE_GH}")
         gh.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.tmp / 'bin'}:{os.environ['PATH']}", FIX=str(self.tmp),
-                        COUNTER=str(self.counter), DRIVE_SPEC_POLL_SECONDS="0", CLAUDE_CODE_REMOTE="false",
+                        COUNTER=str(self.counter), DRIVE_SPEC_POLL_SECONDS="0",
+                        DRIVE_SPEC_VERIFY_LOCK=str(self.tmp / "verify.lock"), CLAUDE_CODE_REMOTE="false",
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
                         GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
         self.git(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.origin))
@@ -448,6 +450,67 @@ class Verify(Cli):
         out = self.run_ds("verify", "10", str(self.wt))
         self.assertEqual(out.returncode, 2)
         self.assertIn("no verify gate", out.stderr)
+
+    def hanging_gate(self, minutes):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"verify": 'sleep 60 & echo $! > "$FIX/sleep.pid"; wait', "verifyTimeoutMinutes": minutes}))
+
+    def sleep_pid(self):
+        f = self.tmp / "sleep.pid"
+        for _ in range(100):
+            if f.exists() and f.read_text().strip():
+                return int(f.read_text())
+            time.sleep(0.05)
+        self.fail("the gate never started")
+
+    def assertGone(self, pid):
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                return
+            time.sleep(0.05)
+        self.fail(f"pid {pid} still runs")
+
+    def test_overrunning_gate_is_stopped_whole_and_red(self):
+        self.hanging_gate(0.02)
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 4)
+        self.assertIn("timed out after 0.02 minutes", out.stdout)
+        self.assertGone(self.sleep_pid())
+        with open(self.tmp / "verify.lock", "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_killed_verify_takes_its_gate_with_it(self):
+        self.hanging_gate(5)
+        proc = subprocess.Popen([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=self.env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pid = self.sleep_pid()
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=15), 128 + 15)
+        self.assertGone(pid)
+        self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10" / "verified").exists())
+
+    def test_waiting_for_the_lock_names_its_holder(self):
+        lock = open(self.tmp / "verify.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock.write("pid 1 verifying abc in /elsewhere\n")
+        lock.flush()
+        proc = subprocess.Popen([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=self.env,
+                                stdout=subprocess.PIPE, text=True)
+        self.assertEqual(proc.stdout.readline(), "waiting for the verify lock, held by pid 1 verifying abc in /elsewhere\n")
+        lock.close()
+        with proc.stdout:
+            self.assertRegex(proc.stdout.read(), r"^green ")
+        self.assertEqual(proc.wait(timeout=15), 0)
+
+    def test_pr_head_verified_outside_a_spec_run(self):
+        out = self.run_ds("verify", "pr-33", str(self.wt), "--gate", "true")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(any((self.repo / ".git" / "drive-spec" / "pr-33" / "verified").iterdir()))
+        self.assertIn("(already verified)", self.run_ds("verify", "pr-33", str(self.wt)).stdout)
 
 
 class Integrate(Cli):
@@ -1009,6 +1072,14 @@ class Cleanup(DispatcherCase):
                          self.git(self.repo, "rev-parse", "agent/local-spec-10-export"))
         r = self.row()
         self.assertEqual((r["step"], r["state"], r["pr_url"]), ("cleanup", "running", "https://github.com/acme/app/pull/101"))
+
+    def test_stops_what_still_runs_in_a_worktree(self):
+        self.finish_slices()
+        left = subprocess.Popen(["sleep", "60"], cwd=self.spec_wt)
+        out = self.run_ds("cleanup", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f"stopped pid {left.pid} in spec-10: sleep 60", out.stdout)
+        self.assertEqual(left.wait(timeout=5), -15)
 
     def test_refuses_with_an_open_slice(self):
         out = self.run_ds("cleanup", "10")

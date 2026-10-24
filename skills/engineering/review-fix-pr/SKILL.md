@@ -9,7 +9,7 @@ description: "Review an open PR, post the review, then fix every finding and rep
 
 Two passes over one PR: one reviews the PR and posts the review, a second fixes the findings, pushes, and replies thread by thread. `<pr>` defaults to the PR whose head is the current branch.
 
-The PR head is worked in its own worktree; the checkout you are standing in is never touched — unless it already *is* the PR head (step 2). Reviewer and fixer are separate subagents so the fixer never grades its own review. Communicate with them through context pointers — PR number, review id, worktree path, verify gate — and let them read the rest themselves.
+The PR head is worked in its own worktree; the checkout you are standing in is never touched — unless it already *is* the PR head (step 2). Reviewer and fixer are separate subagents so the fixer never grades its own review. Communicate with them through context pointers — PR number, review id, worktree path, verify command — and let them read the rest themselves.
 
 Briefs, filled in and handed to the subagents:
 
@@ -24,7 +24,7 @@ repo=$(git remote get-url origin | sed -E 's#(\.git)?/*$##' | awk -F'[/:]' '{pri
 
 ## Steps
 
-1. **Resolve the run.** Without `<pr>`, take the open PR whose head is the current branch: `gh api "repos/$repo/pulls?state=open&head=${repo%/*}:<branch>" --jq '.[0].number'`. Then `gh api "repos/$repo/pulls/<pr>" --jq '{number, title, state, body, base: .base.ref, head: .head.ref, fork: (.head.repo.full_name != .base.repo.full_name)}'`. The linked issue is the first `#<m>` after a closing keyword (`Closes`, `Fixes`, `Resolves`, any tense) in the body. Refuse a closed PR or a fork head (no push access). Read `bootstrap`, `verify`, and `worktreeRoot` from `.claude/drive-spec.json` in the repo root when present; else no bootstrap, verify gate from the repo's `CLAUDE.md` or `AGENTS.md`, root `<repo root>/.claude/worktrees`. Done when PR, base, head, linked issue, verify gate, and worktree path are printed.
+1. **Resolve the run.** Without `<pr>`, take the open PR whose head is the current branch: `gh api "repos/$repo/pulls?state=open&head=${repo%/*}:<branch>" --jq '.[0].number'`. Then `gh api "repos/$repo/pulls/<pr>" --jq '{number, title, state, body, base: .base.ref, head: .head.ref, fork: (.head.repo.full_name != .base.repo.full_name)}'`. The linked issue is the first `#<m>` after a closing keyword (`Closes`, `Fixes`, `Resolves`, any tense) in the body. Refuse a closed PR or a fork head (no push access). Read `bootstrap`, `verify`, and `worktreeRoot` from `.claude/drive-spec.json` in the repo root when present; else no bootstrap, verify gate from the repo's `CLAUDE.md` or `AGENTS.md`, root `<repo root>/.claude/worktrees`. The **verify command** wraps the gate: `<skill dir>/../drive-spec/drive-spec verify pr-<n> <worktree> --gate '<verify>'`. It records each verdict against a commit, stops a gate that overruns, and queues behind the host-wide gate lock. Done when PR, base, head, linked issue, verify command, and worktree path are printed.
 
 2. **Open the PR worktree.** `git fetch --prune origin`, then `git worktree add <root>/pr-<n> -B <head> origin/<head>`. Reuse the path when it is already on `<head>`. When `<head>` is checked out in the worktree you are standing in — the usual case after opening the PR from it — and that tree is clean and level with `origin/<head>`, work there instead and skip the worktree removal in step 6; dirty or diverged, stop and say so. A head checked out at any other path belongs to another session — stop and name the path. Run bootstrap there. Done when the worktree sits at origin's head.
 
@@ -32,9 +32,9 @@ repo=$(git remote get-url origin | sed -E 's#(\.git)?/*$##' | awk -F'[/:]' '{pri
 
 4. **Fix.** Dispatch a fixer subagent with FIXER.md filled in. Done when it reports green with commits and one reply per addressed comment id. Red halts the run: print its reason and the worktree path, leave the worktree, push nothing, and post the status comment.
 
-5. **Push and reply.** Confirm `git -C <worktree> log origin/<head>..HEAD` is non-empty, then push. Post each reply as a thread reply: `gh api --method POST repos/$repo/pulls/<n>/comments/<id>/replies -f body=…`; a since-deleted comment is skipped, never fatal. Post the fixer's summary: `gh api repos/$repo/issues/<n>/comments -f body=…`. Done when every reply and the summary are on the PR.
+5. **Push and reply.** Confirm `git -C <worktree> log origin/<head>..HEAD` is non-empty and the worktree is clean, then run the verify command yourself: it prints `green … (already verified)` when the fixer's gate passed on this HEAD, and otherwise runs the gate. Anything but green halts the run as red, the same as in step 4. Then push. Post each reply as a thread reply: `gh api --method POST repos/$repo/pulls/<n>/comments/<id>/replies -f body=…`; a since-deleted comment is skipped, never fatal. Post the fixer's summary: `gh api repos/$repo/issues/<n>/comments -f body=…`. Done when every reply and the summary are on the PR.
 
-6. **Clean up.** Delete `/tmp/pr-<n>.review.json`. If step 2 created the worktree, `git worktree remove --force <root>/pr-<n>` and `git worktree prune`; a reused worktree stays. Print the PR URL and a count of findings raised, fixed, and declined. Post the status comment last. Done when it is on the PR.
+6. **Clean up.** Delete `/tmp/pr-<n>.review.json` and the verdicts at `$(git rev-parse --git-common-dir)/drive-spec/pr-<n>`. If step 2 created the worktree, `git worktree remove --force <root>/pr-<n>` and `git worktree prune`; a reused worktree stays. Print the PR URL and a count of findings raised, fixed, and declined. Post the status comment last. Done when it is on the PR.
 
 ## Status comment
 
