@@ -17,6 +17,9 @@ Reference, read when a step points at it:
 - [`TRACKER.md`](TRACKER.md) — discovery, blockers, labels, the progress comment, PRs.
 - [`WORKTREES.md`](WORKTREES.md) — root, naming, notes directory, create, bootstrap, resume rules, cleanup.
 - [`IMPLEMENTER.md`](IMPLEMENTER.md) — the brief handed to each implementer subagent.
+- [`STATUS.md`](STATUS.md) — the status file, its states, how to ask the operator a question, and the inbox.
+
+Record status per STATUS.md at the end of every step and at each dispatch, landing and halt in step 6. Read the inbox per STATUS.md at every boundary it names.
 
 Communicate with subagents through context pointers: issue numbers, worktree paths, research notes, the verify gate. Everything else they read themselves.
 
@@ -52,4 +55,6 @@ An interim notification from a background subagent needs no reply: end the turn 
 
 9. **Clean up.** Remove the spec worktree, any slice worktree still present, and the notes directory; prune, and print the PR URL. The spec branch stays on origin until the PR merges.
 
-Every run that gets past step 4, whether it finishes at step 9 or stops in step 6, ends by posting the status comment per TRACKER.md.
+10. **Review and fix the spec PR.** Run `/review-fix-pr <pr>` on the spec PR. It runs after step 9 because it opens the PR head in a worktree of its own and refuses a head checked out elsewhere. The PR stays draft. A run whose PR already carries a `review-fix-pr done` comment newer than the spec branch's last push skips this step. Its fix pass going red halts the run, with resume command `/review-fix-pr <pr>`. Done when its status comment is on the PR.
+
+Every run that gets past step 4, whether it finishes at step 10 or stops in step 6, ends by posting the status comment per TRACKER.md. Every run, including a refusal at step 2, ends with its final status file write.

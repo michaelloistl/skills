@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""dispatch: watch and start drive-spec runs on this machine. See README.md."""
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import select
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "dispatch"
+ACKED = STATE_DIR / "acked.json"
+REPORTED = STATE_DIR / "reported.json"
+QUEUE = STATE_DIR / "queue.json"
+BASES = STATE_DIR / "bases.json"
+FETCH_SECONDS = 120
+MERGED_PR = re.compile(r"Merge pull request #(\d+) from \S+?/(\S+)")
+VERIFY_LOCK = "/tmp/drive-spec-verify.lock"
+MAX_CPU = float(os.environ.get("DISPATCH_MAX_CPU", 40))
+MAX_MEMORY = float(os.environ.get("DISPATCH_MAX_MEMORY", 5))
+MAX_TESTS = int(os.environ.get("DISPATCH_MAX_TESTS", 2))
+STALL_SECONDS = 15 * 60
+TICK_SECONDS = 60
+TITLE = re.compile(r"\b(?:drive-spec|spec)[- ](\d+)\b")
+
+ORDER = ["DIALOG", "ASK", "HALT", "STALL", "GONE", "PAUSE", "PR"]
+
+
+def run(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return out.stdout if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def status_dir(repo):
+    common = run(["git", "-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+    if not common:
+        sys.exit(f"dispatch: {repo} is not a git repository")
+    return Path(common) / "drive-spec" / "status"
+
+
+def read_status_files(dirs):
+    specs = {}
+    for d in dirs:
+        for f in d.glob("spec-*.json"):
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            specs[str(data.get("spec", f.stem.removeprefix("spec-")))] = data
+    return specs
+
+
+def herdr_agents():
+    try:
+        return json.loads(run(["herdr", "agent", "list"]) or "{}").get("result", {}).get("agents", [])
+    except ValueError:
+        return []
+
+
+def claude_sessions():
+    try:
+        return json.loads(run(["claude", "agents", "--json"]) or "[]")
+    except ValueError:
+        return []
+
+
+def spec_of(text):
+    m = TITLE.search(text or "")
+    return m.group(1) if m else None
+
+
+def age(iso):
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    return (datetime.now(timezone.utc) - t).total_seconds()
+
+
+def short_age(seconds):
+    if seconds is None:
+        return "?"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def load_acked():
+    try:
+        return json.loads(ACKED.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def in_repos(cwd, dirs):
+    roots = [str(d.parents[2]) + "/" for d in dirs]
+    return any((cwd or "").rstrip("/") + "/" == r or (cwd or "").startswith(r) for r in roots)
+
+
+def snapshot(dirs):
+    files = read_status_files(dirs)
+    all_agents = herdr_agents()
+    all_sessions = claude_sessions()
+    agents = [a for a in all_agents if in_repos(a.get("cwd"), dirs)]
+    sessions = [s for s in all_sessions if in_repos(s.get("cwd"), dirs)]
+    acked = load_acked()
+
+    by_pane = {a["pane_id"]: a for a in all_agents}
+    pane_of = {}
+    for a in agents:
+        n = spec_of(a.get("name")) or spec_of(a.get("terminal_title_stripped"))
+        if n:
+            pane_of.setdefault(n, a)
+    session_of = {}
+    for s in sessions:
+        n = spec_of(s.get("name"))
+        if n:
+            session_of[n] = s
+    for n, data in files.items():
+        pane = by_pane.get(data.get("herdr_pane"))
+        pane_session = ((pane or {}).get("agent_session") or {}).get("value")
+        if pane and not (pane_session and data.get("session_id") and pane_session != data["session_id"]):
+            pane_of[n] = pane
+        sid = data.get("session_id")
+        for s in all_sessions:
+            if sid and s.get("sessionId") == sid:
+                session_of[n] = s
+
+    rows = []
+    for n in sorted(set(files) | set(pane_of) | set(session_of), key=lambda x: int(x) if x.isdigit() else 0):
+        rows.append(classify(n, files.get(n), pane_of.get(n), session_of.get(n), acked))
+
+    live = {r["spec"] for r in rows if r["pane"] or r["session"]}
+    roots = {repo_root(d) for d in dirs}
+    queued = [q for q in load_queue() if q["repo"] in roots and q["spec"] not in live]
+    verdict = admit() if queued else None
+    for i, q in enumerate(queued):
+        row = classify(q["spec"], None, None, None, acked)
+        ready = i == 0 and not verdict["reasons"]
+        row.update(state="queued", summary=f"queued {short_age(age(q['queued_at']))}: {q['reason']}",
+                   attention="READY" if ready else None, detail="pressure clear; launch it" if ready else None)
+        rows.append(row)
+    return rows
+
+
+def classify(n, data, pane, session, acked):
+    herdr = pane.get("agent_status") if pane else None
+    busy = (session or {}).get("status") == "busy"
+    live = herdr in ("working", "blocked") or busy
+    row = {
+        "spec": n,
+        "pane": pane["pane_id"] if pane else None,
+        "herdr": herdr,
+        "session": (session or {}).get("status"),
+        "state": None,
+        "step": None,
+        "summary": None,
+        "pr_url": None,
+        "age": None,
+        "attention": None,
+        "detail": None,
+    }
+    if data:
+        row.update(state=data.get("state"), step=data.get("step"), summary=data.get("summary"),
+                   pr_url=data.get("pr_url"), age=age(data.get("updated_at")))
+
+    state = row["state"]
+    if herdr == "blocked":
+        row.update(attention="DIALOG", detail="dialog open in the pane")
+    elif not data:
+        row["summary"] = "no status file"
+    elif state == "waiting" and data.get("question") and data.get("question_blocking"):
+        row.update(attention="ASK", detail=data["question"])
+    elif state == "halted":
+        row.update(attention="HALT", detail=f"{row['summary']} → {data.get('next')}")
+    elif state == "running" and not pane and not session:
+        row.update(attention="GONE", detail=f"no session; last {row['step']}: {row['summary']}")
+    elif state == "running" and not live and (row["age"] or 0) > STALL_SECONDS:
+        row.update(attention="STALL", detail=f"quiet {short_age(row['age'])} at {row['step']}")
+    elif state == "paused":
+        row.update(attention="PAUSE", detail=f"{row['summary']} → {data.get('next')}")
+    elif state == "done" and acked.get(n) != data.get("updated_at"):
+        row.update(attention="PR", detail=row["pr_url"] or row["summary"])
+    elif data.get("question") and not data.get("question_blocking"):
+        row["fyi"] = data["question"]
+    return row
+
+
+def attention_key(row):
+    return (row["attention"], row["detail"] if row["attention"] in ("ASK", "HALT", "PAUSE", "PR") else None)
+
+
+def line(row):
+    if row["attention"]:
+        return f"{row['spec']} {row['attention']} {row['detail']}"
+    live = "busy" if row["session"] == "busy" else row["herdr"] or row["session"] or "no pane"
+    if not row["state"]:
+        return f"{row['spec']} no status file ({live})"
+    text = f"{row['spec']} {row['state'] or '?'}·{row['step'] or '?'} {row['summary'] or ''} ({live}, {short_age(row['age'])})"
+    if row.get("fyi"):
+        text += f" FYI: {row['fyi']}"
+    return text
+
+
+def cmd_status(dirs, as_json):
+    rows = snapshot(dirs)
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+    needs = sorted((r for r in rows if r["attention"] in ORDER), key=lambda r: ORDER.index(r["attention"]))
+    queued = [r for r in rows if r["state"] == "queued"]
+    rest = [r for r in rows if r not in needs and r not in queued]
+    if not rows:
+        print("no specs")
+    for title, group in (("NEEDS YOU", needs), ("OK", rest), ("QUEUED", queued)):
+        if group:
+            print(title)
+            for r in group:
+                ready = "READY " if r["attention"] == "READY" else ""
+                print(" " + (f"{r['spec']} {ready}{r['summary']}" if r in queued else line(r)))
+
+
+def repo_root(d):
+    return str(d.parents[2])
+
+
+def pressure(kind, window):
+    try:
+        for text in Path(f"/proc/pressure/{kind}").read_text().splitlines():
+            if text.startswith("some "):
+                return float(dict(p.split("=") for p in text.split()[1:])[window])
+    except (OSError, KeyError, ValueError):
+        pass
+    return 0.0
+
+
+def specs_in_tests():
+    count = 0
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if argv and Path(argv[0].decode(errors="replace")).name == "flock" and VERIFY_LOCK.encode() in argv:
+            count += 1
+    return count
+
+
+def admit():
+    cpu, mem, tests = pressure("cpu", "avg60"), pressure("memory", "avg10"), specs_in_tests()
+    reasons = []
+    if cpu > MAX_CPU:
+        reasons.append(f"cpu {cpu:.0f}% > {MAX_CPU:.0f}%")
+    if mem > MAX_MEMORY:
+        reasons.append(f"memory {mem:.0f}% > {MAX_MEMORY:.0f}%")
+    if tests >= MAX_TESTS:
+        reasons.append(f"{tests} specs in tests (max {MAX_TESTS - 1})")
+    return {"cpu": cpu, "memory": mem, "tests": tests, "reasons": reasons}
+
+
+def load_queue():
+    try:
+        return json.loads(QUEUE.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def save_json(path, data):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def enqueue(spec, root, reason):
+    queue = [q for q in load_queue() if not (q["spec"] == spec and q["repo"] == root)]
+    queue.append({"spec": spec, "repo": root, "reason": reason,
+                  "queued_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    save_json(QUEUE, queue)
+
+
+def dequeue(spec, root):
+    queue = load_queue()
+    rest = [q for q in queue if not (q["spec"] == spec and q["repo"] == root)]
+    if rest != queue:
+        save_json(QUEUE, rest)
+    return rest != queue
+
+
+def herdr_json(*args):
+    out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        try:
+            message = json.loads(out.stderr)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            message = out.stderr.strip() or f"exit {out.returncode}"
+        raise RuntimeError(f"herdr {args[0]} {args[1]}: {message}")
+    return json.loads(out.stdout or "{}").get("result", {})
+
+
+def start(spec, root, session=None):
+    workspace = os.environ.get("HERDR_WORKSPACE_ID")
+    if not workspace:
+        raise RuntimeError("not inside herdr (HERDR_WORKSPACE_ID unset)")
+    tab = herdr_json("tab", "create", "--workspace", workspace, "--cwd", root,
+                     "--label", f"spec-{spec}", "--no-focus")
+    tab_id, pane = tab["tab"]["tab_id"], tab["root_pane"]["pane_id"]
+    try:
+        time.sleep(1)
+        herdr_json("agent", "start", f"spec-{spec}", "--kind", "claude", "--pane", pane,
+                   "--timeout", "90000", "--", "-n", f"drive-spec-{spec}",
+                   *(["--resume", session] if session else []))
+        herdr_json("agent", "prompt", f"spec-{spec}", f"/drive-spec {spec}")
+    except Exception:
+        run(["herdr", "tab", "close", tab_id])
+        raise
+    return tab_id, pane
+
+
+def cmd_launch(specs, dirs, force):
+    root = repo_root(dirs[0])
+    rows = {r["spec"]: r for r in snapshot(dirs[:1])}
+    for spec in specs:
+        row = rows.get(spec, {})
+        if row.get("pane") or row.get("session"):
+            print(f"{spec} already running in {row.get('pane') or 'a Claude session outside herdr'}")
+            continue
+        verdict = admit()
+        if verdict["reasons"] and not force:
+            enqueue(spec, root, "; ".join(verdict["reasons"]))
+            print(f"{spec} queued: {'; '.join(verdict['reasons'])}")
+            continue
+        try:
+            tab_id, pane = start(spec, root)
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+            print(f"{spec} failed to start: {e}")
+            continue
+        was_queued = dequeue(spec, root)
+        print(f"{spec} started in tab {tab_id} (pane {pane}){' from the queue' if was_queued else ''}")
+
+
+def boot_time():
+    for text in Path("/proc/stat").read_text().splitlines():
+        if text.startswith("btime "):
+            return datetime.fromtimestamp(int(text.split()[1]), timezone.utc)
+    return None
+
+
+def recover_plan(dirs):
+    files = read_status_files(dirs)
+    boot = boot_time()
+    plan = []
+    for r in snapshot(dirs):
+        data = files.get(r["spec"])
+        if not data or r["state"] == "queued":
+            continue
+        n, state = r["spec"], r["state"]
+        when = f"{short_age(r['age'])} ago"
+        try:
+            if boot and datetime.fromisoformat(data["updated_at"].replace("Z", "+00:00")) < boot:
+                when += ", before the reboot"
+        except (KeyError, ValueError):
+            pass
+        if state == "running":
+            if r["herdr"] in ("working", "blocked") or r["session"] == "busy":
+                continue
+            if r["pane"]:
+                plan.append((n, "resume", f"interrupted at {r['step']} {when}; session back in {r['pane']}"))
+            elif data.get("session_id"):
+                plan.append((n, "resume", f"interrupted at {r['step']} {when}; reopen its session in a new tab"))
+            else:
+                plan.append((n, "restart", f"interrupted at {r['step']} {when}; no session to reopen"))
+        elif state == "waiting":
+            plan.append((n, "leave", f"waiting on your answer: {data.get('question')}"))
+        elif state in ("halted", "paused"):
+            plan.append((n, "leave", f"{state} at {r['step']}: {r['summary']}"))
+    return plan
+
+
+def cmd_recover(dirs, actions):
+    plan = {n: (action, why) for n, action, why in recover_plan(dirs)}
+    if not actions:
+        if not plan:
+            print("nothing to recover")
+        for n, (action, why) in plan.items():
+            print(f"{n} {action.upper()}? {why}")
+        return
+    root = repo_root(dirs[0])
+    rows = {r["spec"]: r for r in snapshot(dirs[:1])}
+    files = read_status_files(dirs[:1])
+    for item in actions:
+        n, _, action = item.partition("=")
+        n = n.lstrip("#")
+        row, data = rows.get(n, {}), files.get(n, {})
+        try:
+            if action == "leave":
+                print(f"{n} left alone")
+            elif action == "resume" and row.get("pane"):
+                herdr_json("agent", "prompt", row["pane"], f"/drive-spec {n}")
+                print(f"{n} resumed in {row['pane']}")
+            elif action == "resume" and data.get("session_id"):
+                tab_id, pane = start(n, root, data["session_id"])
+                print(f"{n} resumed in tab {tab_id} (pane {pane})")
+            elif action in ("resume", "restart") and row.get("pane"):
+                herdr_json("agent", "prompt", row["pane"], "/clear", "--wait", "--timeout", "30000")
+                herdr_json("agent", "prompt", row["pane"], f"/drive-spec {n}")
+                print(f"{n} restarted fresh in {row['pane']}")
+            elif action in ("resume", "restart"):
+                tab_id, pane = start(n, root)
+                print(f"{n} restarted in tab {tab_id} (pane {pane})")
+            else:
+                print(f"{n} unknown action {action!r}: use resume, restart or leave")
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+            print(f"{n} {action} failed: {e}")
+
+
+def cmd_admit():
+    v = admit()
+    print(f"cpu {v['cpu']:.1f}% (max {MAX_CPU:.0f}), memory {v['memory']:.1f}% (max {MAX_MEMORY:.0f}), "
+          f"specs in tests {v['tests']} (max {MAX_TESTS - 1})")
+    print("blocked: " + "; ".join(v["reasons"]) if v["reasons"] else "clear")
+
+
+class Inotify:
+    IN_CLOSE_WRITE, IN_MOVED_TO, IN_NONBLOCK = 0x8, 0x80, 0o4000
+
+    def __init__(self, dirs):
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        self.fd = libc.inotify_init1(self.IN_NONBLOCK)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+            libc.inotify_add_watch(self.fd, str(d).encode(), self.IN_CLOSE_WRITE | self.IN_MOVED_TO)
+
+    def drain(self):
+        try:
+            while os.read(self.fd, 65536):
+                pass
+        except BlockingIOError:
+            pass
+
+
+class HerdrEvents:
+    GLOBAL = ["pane.agent_detected", "pane.closed", "pane.exited", "pane.created"]
+
+    def __init__(self):
+        self.sock = None
+        self.panes = None
+
+    def ensure(self, panes):
+        if self.sock and panes == self.panes:
+            return
+        self.close()
+        path = os.environ.get("HERDR_SOCKET_PATH")
+        if not path:
+            return
+        subs = [{"type": t} for t in self.GLOBAL]
+        subs += [{"type": "pane.agent_status_changed", "pane_id": p} for p in sorted(panes)]
+        try:
+            self.sock = socket.socket(socket.AF_UNIX)
+            self.sock.connect(path)
+            self.sock.sendall((json.dumps({"id": "dispatch", "method": "events.subscribe",
+                                           "params": {"subscriptions": subs}}) + "\n").encode())
+            self.panes = panes
+        except OSError:
+            self.close()
+
+    def drain(self):
+        try:
+            data = self.sock.recv(65536)
+        except OSError:
+            data = b""
+        if not data:
+            self.close()
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+        self.sock, self.panes = None, None
+
+
+def git(root, *args):
+    return run(["git", "-C", root, *args]).strip()
+
+
+def base_of(root, files):
+    bases = [f.get("base") for f in files.values() if f.get("base")]
+    if bases:
+        return max(set(bases), key=bases.count)
+    head = git(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    return head.removeprefix("origin/") or "main"
+
+
+def landing(root, sha):
+    subject = git(root, "log", "-1", "--format=%s", sha)
+    m = MERGED_PR.match(subject)
+    if m:
+        body = git(root, "log", "-1", "--format=%b", sha).splitlines()
+        title = next((b for b in body if b.strip()), subject)
+        return f"#{m.group(1)} {title}", m.group(2)
+    repo = re.sub(r"(\.git)?/*$", "", git(root, "remote", "get-url", "origin"))
+    repo = "/".join(re.split(r"[/:]", repo)[-2:])
+    found = run(["gh", "api", f"repos/{repo}/commits/{sha}/pulls",
+                 "--jq", '.[0] | select(.) | "\\(.number) \\(.head.ref)"']).split()
+    if len(found) == 2:
+        return f"#{found[0]} {subject}", found[1]
+    return f"{sha[:9]} {subject}", None
+
+
+def check_merges(dirs):
+    alerts, noted = [], []
+    known = load_json(BASES, {})
+    for d in dirs:
+        root = repo_root(d)
+        files = read_status_files([d])
+        base = base_of(root, files)
+        git(root, "fetch", "--quiet", "origin", base)
+        new = git(root, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}")
+        key = f"{root}:{base}"
+        old, known[key] = known.get(key), new or known.get(key)
+        if not new or not old or old == new:
+            continue
+        commits = git(root, "log", "--first-parent", "--reverse", "--format=%H", f"{old}..{new}").split()
+        for sha in commits:
+            what, head = landing(root, sha)
+            changed = git(root, "diff", "--name-only", f"{sha}^1", sha).splitlines()
+            for n, data in list(files.items()):
+                branch = data.get("branch")
+                if branch and head == branch:
+                    archive(d, n)
+                    del files[n]
+                    continue
+                overlap = None
+                if branch and git(root, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
+                    mine = set(git(root, "diff", "--name-only", f"{sha}^1...origin/{branch}").splitlines())
+                    overlap = sorted(mine & set(changed))
+                if data.get("state") == "done":
+                    if overlap:
+                        alerts.append(f"{n} OVERLAP {base} {what.split(' ')[0]} touches files the draft PR changes: "
+                                      f"{', '.join(overlap[:5])}{' …' if len(overlap) > 5 else ''}")
+                    continue
+                note(d, n, base, sha, what, changed, overlap)
+                noted.append(n)
+    save_json(BASES, known)
+    return alerts, sorted(set(noted))
+
+
+def note(d, n, base, sha, what, changed, overlap):
+    shown = changed[:30] + ([f"… {len(changed) - 30} more"] if len(changed) > 30 else [])
+    if overlap is None:
+        overlaps = "unknown (no spec branch on origin yet)"
+    else:
+        overlaps = ", ".join(overlap) or "none"
+    text = (f"## {base} advanced: {what}\n\n"
+            f"Commit {sha[:9]}, seen {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}.\n\n"
+            f"Files ({len(changed)}):\n" + "".join(f"- {f}\n" for f in shown) +
+            f"\nOverlaps your branch: {overlaps}\n\n")
+    with open(d / f"spec-{n}.inbox.md", "a") as f:
+        f.write(text)
+
+
+def archive(d, n):
+    (d / "archive").mkdir(exist_ok=True)
+    for src in (d / f"spec-{n}.json", d / f"spec-{n}.inbox.md", d / f"spec-{n}.inbox-read.md"):
+        if src.exists():
+            src.replace(d / "archive" / src.name)
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def cmd_merges(dirs):
+    alerts, noted = check_merges(dirs)
+    for a in alerts:
+        print(a)
+    print(f"noted to {', '.join(noted)}" if noted else "nothing to note")
+
+
+def cmd_watch(dirs):
+    notify = Inotify(dirs)
+    herdr = HerdrEvents()
+    try:
+        reported = json.loads(REPORTED.read_text())
+    except (OSError, ValueError):
+        reported = {}
+    last_fetch = 0.0
+    while True:
+        if time.monotonic() - last_fetch >= FETCH_SECONDS:
+            last_fetch = time.monotonic()
+            for a in check_merges(dirs)[0]:
+                print(a, flush=True)
+        rows = snapshot(dirs)
+        herdr.ensure(frozenset(a["pane_id"] for a in herdr_agents()))
+        current = {r["spec"]: list(attention_key(r)) for r in rows}
+        for r in rows:
+            n = r["spec"]
+            if current[n] != reported.get(n, [None, None]):
+                print(line(r) if r["attention"] else f"{n} ok {line(r).split(' ', 1)[1]}", flush=True)
+        for n in reported.keys() - current.keys():
+            print(f"{n} gone from view", flush=True)
+        if current != reported:
+            reported = current
+            save_json(REPORTED, reported)
+
+        fds = [notify.fd] + ([herdr.sock] if herdr.sock else [])
+        ready, _, _ = select.select(fds, [], [], TICK_SECONDS)
+        time.sleep(0.5)
+        notify.drain()
+        if herdr.sock in ready:
+            herdr.drain()
+
+
+def cmd_ack(spec, dirs):
+    data = read_status_files(dirs).get(spec)
+    if not data:
+        sys.exit(f"dispatch: no status file for {spec}")
+    acked = load_acked()
+    acked[spec] = data.get("updated_at")
+    save_json(ACKED, acked)
+    print(f"{spec} acked")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dispatch")
+    p.add_argument("--repo", action="append", help="repo to watch (repeatable; default: current repo)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", help="one line per spec, what needs you first")
+    s.add_argument("--json", action="store_true")
+    sub.add_parser("watch", help="print a line whenever a spec starts or stops needing you")
+    a = sub.add_parser("ack", help="hide a done spec until its status changes")
+    a.add_argument("spec")
+    lp = sub.add_parser("launch", help="start drive-specs in new herdr tabs, or queue them under pressure")
+    lp.add_argument("specs", nargs="+")
+    lp.add_argument("--force", action="store_true", help="start even under pressure")
+    sub.add_parser("admit", help="show pressure and whether a launch would start or queue")
+    r = sub.add_parser("recover", help="propose resume, restart or leave per interrupted spec; act only with --do")
+    r.add_argument("--do", nargs="+", default=[], metavar="SPEC=ACTION", help="act: resume, restart or leave")
+    sub.add_parser("merges", help="fetch base once, note what landed to each running spec")
+    u = sub.add_parser("unqueue", help="drop a queued spec")
+    u.add_argument("spec")
+    args = p.parse_args()
+
+    dirs = [status_dir(r) for r in (args.repo or ["."])]
+    if args.cmd == "status":
+        cmd_status(dirs, args.json)
+    elif args.cmd == "watch":
+        try:
+            cmd_watch(dirs)
+        except KeyboardInterrupt:
+            pass
+    elif args.cmd == "ack":
+        cmd_ack(args.spec, dirs)
+    elif args.cmd == "launch":
+        cmd_launch([n.lstrip("#") for n in args.specs], dirs, args.force)
+    elif args.cmd == "recover":
+        cmd_recover(dirs, args.do)
+    elif args.cmd == "merges":
+        cmd_merges(dirs)
+    elif args.cmd == "admit":
+        cmd_admit()
+    elif args.cmd == "unqueue":
+        print(f"{args.spec} unqueued" if dequeue(args.spec, repo_root(dirs[0])) else f"{args.spec} was not queued")
+
+
+if __name__ == "__main__":
+    main()

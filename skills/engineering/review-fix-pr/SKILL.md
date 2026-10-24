@@ -1,7 +1,6 @@
 ---
 name: review-fix-pr
 description: "Review an open PR, post the review, then fix every finding and reply on the PR."
-disable-model-invocation: true
 ---
 
 # review-fix-pr
