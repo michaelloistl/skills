@@ -21,7 +21,7 @@ Reference, read when a step points at it:
 - [`IMPLEMENTER.md`](IMPLEMENTER.md) — the brief handed to each implementer subagent.
 - [`STATUS.md`](STATUS.md) — the status file, its states, how to ask the operator a question, and the inbox.
 
-Every step ends in a `drive-spec` command that writes its status per STATUS.md; the step names it. Commands that read the dispatcher's inbox (STATUS.md, Inbox) exit 5 while notes wait: act on them, then run the command again.
+Every step ends in a `drive-spec` command that writes its status per STATUS.md; the step names it. Its exit code is the verdict, so run each command bare, with nothing piped after it. Commands that read the dispatcher's inbox (STATUS.md, Inbox) exit 5 while notes wait: act on them, then run the command again. A decision only the operator can make goes through `drive-spec ask` and `drive-spec answered` (STATUS.md, Questions).
 
 Communicate with subagents through context pointers: issue numbers, worktree paths, research notes, the `drive-spec verify` command. Everything else they read themselves.
 
@@ -53,7 +53,7 @@ An interim notification from a background subagent gets a one-line status; act o
 
 8. **Confirm the spec PR.** `drive-spec confirm <spec>`. With every slice closed, it rewrites the draft's body to `Closes #<spec>`, the slices, and every deviation their PRs reported, opens the draft first when absent, and keeps it draft, with step 7's `Left from review:` list when there is one.
 
-9. **Clean up.** `drive-spec cleanup <spec>` removes the spec worktree, any slice worktree still present, and the notes directory, prunes, and prints the PR URL. It refuses while a slice is open or the spec worktree holds uncommitted or unpushed work. The spec branch stays on origin until the PR merges.
+9. **Clean up.** `drive-spec cleanup <spec>` removes the spec worktree, any slice worktree still present, and the notes directory, prunes, prints the PR URL, and marks step 10 begun in the status file. It refuses while a slice is open or the spec worktree holds uncommitted or unpushed work. The spec branch stays on origin until the PR merges.
 
 10. **Review and fix the spec PR.** Run `/review-fix-pr <pr>` on the spec PR. It runs after step 9 because it opens the PR head in a worktree of its own and refuses a head checked out elsewhere. The PR stays draft. A run whose PR already carries a `review-fix-pr done` comment newer than the spec branch's last push skips this step. Its fix pass going red halts the run: `drive-spec finish <spec> halted --why '<why>' --step review-pr --resume '/review-fix-pr <pr>'`. Done when its status comment is on the PR; then `drive-spec finish <spec> done`.
 

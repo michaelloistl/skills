@@ -21,11 +21,13 @@ Python 3, standard library only, with `gh` and `git` on the PATH. Run it from in
 - `drive-spec frontier <spec> [--running <m>,…] [--sequential] [--max N] [--json]`: what to do next, one line per slice (`build`, `continue`, `integrate`), or `wait`, or `stop: done|ceiling|held`. Read-only. Mode and ceiling default from `.claude/drive-spec.json`; the ceiling counts landings since the gate was pinned. Exit 2 when a slice carries `agent:blocked`.
 - `drive-spec start <spec> <m>`: for a slice on the frontier, restores its worktree (an existing one, the local branch, or the branch on origin) or opens it fresh from the spec branch HEAD; bootstraps a new one; labels it `agent:in-progress`; prints the filled [`IMPLEMENTER.md`](IMPLEMENTER.md) brief.
 - `drive-spec halt <spec> <m> <why>`: blocks the slice, comments on it, and finishes the run as halted.
+- `drive-spec ask <spec> <question> [--no-block] [--step]`: writes the question to the status file, `waiting` unless `--no-block`.
+- `drive-spec answered <spec> <answer>|-`: posts the operator's decision on the spec, appends it to `decisions.md` for the implementer briefs, clears the question.
 - `drive-spec finish <spec> done|halted|conflicts|ceiling|held|refused [--why] [--slice] [--step] [--resume] [--left]`: posts the status comment, refreshes the progress comment, writes the final status with `branch` and `pr_url`. With done, what review left comes from the spec PR body, or `--left`. Refuses an outcome the tracker contradicts.
 
 Exit codes: 0 done, 1 a failed call, 2 refused (a rule would break; the message names it), 3 conflict, 4 red, 5 inbox notes to act on first (`open`, `preview`, `frontier`, `integrate`, `confirm`, `cleanup`). Contracts: [`TRACKER.md`](TRACKER.md).
 
-State, all under `$GIT_COMMON_DIR/drive-spec/spec-<n>/`, removed with the notes in step 9: `gate` (the pinned gate), `run.json` (when it was pinned: the run's start), `landed.jsonl` (each landing), `left.md` (what review left), `verified/<sha>.json` (each verdict), `logs/<sha>.log`, `integrate.lock`.
+State, all under `$GIT_COMMON_DIR/drive-spec/spec-<n>/`, removed with the notes in step 9: `gate` (the pinned gate), `run.json` (when it was pinned: the run's start), `landed.jsonl` (each landing), `left.md` (what review left), `decisions.md` (the operator's answers), `verified/<sha>.json` (each verdict), `logs/<sha>.log`, `integrate.lock`.
 
 Tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/drive-spec`, from the repo root. They run the pure logic on fixtures; the script end to end with real git against a bare origin and a fake `gh` that answers through real `jq`; and the real `dispatch` on the status files the script writes, against the steps and states in [`STATUS.md`](STATUS.md).
 
@@ -36,6 +38,7 @@ Writes the run's status file so a dispatcher can watch every drive-spec on the m
 - State: `$GIT_COMMON_DIR/drive-spec/status/spec-<n>.json`, one file per spec, written only by that spec's run. It sits inside the repo's shared `.git` dir, so every worktree sees it, nothing commits it, and step 9's cleanup leaves it in place.
 - Safe without a reader: it always exits 0, and a failed write only prints a warning.
 - Needs `git` and `jq`; without `jq` it skips the write.
+- `status.sh <n> --touch` refreshes only `updated_at`: `verify`'s heartbeat.
 - `status.sh <n> --inbox` prints the dispatcher's unread notes from `spec-<n>.inbox.md` and moves them to `spec-<n>.inbox-read.md`.
 
 ```sh

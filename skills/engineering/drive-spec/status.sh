@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: status.sh <spec> [key=value ...] | status.sh <spec> --inbox
+# Usage: status.sh <spec> [key=value ...] | status.sh <spec> --inbox | status.sh <spec> --touch
 set -u
 
 spec=${1:-}
@@ -46,6 +46,17 @@ write() {
     ' >"$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
+touch_() {
+  command -v jq >/dev/null || return 1
+  local common file tmp
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  file="$common/drive-spec/status/spec-$spec.json"
+  [ -s "$file" ] || return 0
+  tmp=$(mktemp "${file%/*}/.spec-$spec.XXXXXX") || return 1
+  jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.updated_at = $now' "$file" >"$tmp" && mv -f "$tmp" "$file" ||
+    { rm -f "$tmp"; return 1; }
+}
+
 inbox() {
   local common dir reading
   common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
@@ -60,6 +71,8 @@ inbox() {
 
 if [ "${1:-}" = --inbox ]; then
   inbox || echo "status.sh: inbox for spec $spec not read" >&2
+elif [ "${1:-}" = --touch ]; then
+  touch_ || echo "status.sh: status for spec $spec not touched" >&2
 else
   write "$@" || echo "status.sh: status for spec $spec not written" >&2
 fi

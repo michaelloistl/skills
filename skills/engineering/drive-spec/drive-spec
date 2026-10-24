@@ -23,6 +23,7 @@ VERIFY_LOCK = os.environ.get("DRIVE_SPEC_VERIFY_LOCK", "/tmp/drive-spec-verify.l
 VERIFY_TIMEOUT_MINUTES = 60
 TIMED_OUT = 124
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
+HEARTBEAT_SECONDS = float(os.environ.get("DRIVE_SPEC_HEARTBEAT_SECONDS", 300))
 SPEC_MOVES = 5
 REFUSE, CONFLICT, RED, INBOX = 2, 3, 4, 5
 LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
@@ -405,7 +406,33 @@ def record(run, sha):
         return {}
 
 
-def verify_lock(head, wt):
+class Heartbeat:
+    """Keeps a running spec's status fresh while a gate runs or waits for the lock, so the dispatcher, which sees
+    only an idle session waiting on a background task, does not call it stalled. For `pr-<n>`, the spec whose
+    status names that PR."""
+
+    def __init__(self, run):
+        self.run, self.last, self.spec = run, time.monotonic(), None
+        status = run.common / "drive-spec" / "status"
+        n = run.spec
+        for f in [status / f"spec-{n}.json"] if not isinstance(n, str) else sorted(status.glob("spec-*.json")):
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("state") == "running" and (not isinstance(n, str)
+                                                   or (data.get("pr_url") or "").endswith(f"/pull/{n[3:]}")):
+                self.spec = f.stem.removeprefix("spec-")
+                break
+
+    def beat(self):
+        if self.spec and time.monotonic() - self.last >= HEARTBEAT_SECONDS:
+            self.last = time.monotonic()
+            script = Path(__file__).resolve().with_name("status.sh")
+            subprocess.run([str(script), self.spec, "--touch"], cwd=self.run.repo_dir, timeout=60)
+
+
+def verify_lock(head, wt, heartbeat):
     """The host-wide gate lock, one gate at a time; says who holds it before waiting."""
     lock = open(VERIFY_LOCK, "a+")
     try:
@@ -414,7 +441,13 @@ def verify_lock(head, wt):
         lock.seek(0)
         print(f"waiting for the verify lock, held by {lock.read().strip() or 'a gate run outside drive-spec'}",
               flush=True)
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                heartbeat.beat()
+                time.sleep(1)
     lock.seek(0)
     lock.truncate()
     lock.write(f"pid {os.getpid()} verifying {head[:12]} in {wt} since {now()}\n")
@@ -441,7 +474,7 @@ def stop_group(proc):
     proc.wait()
 
 
-def run_gate(gate, wt, out, minutes):
+def run_gate(gate, wt, out, minutes, heartbeat):
     """Run the gate in a process group of its own, stopped whole when it overruns or this script is killed."""
     proc = subprocess.Popen(["sh", "-c", gate], cwd=wt, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
 
@@ -450,12 +483,17 @@ def run_gate(gate, wt, out, minutes):
         sys.exit(128 + signum)
 
     previous = {sig: signal.signal(sig, killed) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    deadline = time.monotonic() + minutes * 60
     try:
-        return proc.wait(timeout=minutes * 60)
-    except subprocess.TimeoutExpired:
-        stop_group(proc)
-        out.write(f"\ndrive-spec: the gate ran past {minutes:g} minutes and was stopped\n")
-        return TIMED_OUT
+        while True:
+            try:
+                return proc.wait(timeout=max(0.0, min(HEARTBEAT_SECONDS, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    stop_group(proc)
+                    out.write(f"\ndrive-spec: the gate ran past {minutes:g} minutes and was stopped\n")
+                    return TIMED_OUT
+                heartbeat.beat()
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
@@ -488,11 +526,12 @@ def verify(run, wt, gate=None):
     logs = run.notes / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{head}.log"
-    lock = verify_lock(head, wt)
+    heartbeat = Heartbeat(run)
+    lock = verify_lock(head, wt, heartbeat)
     started = now()
     try:
         with open(log, "w") as out:
-            code = run_gate(gate, wt, out, minutes)
+            code = run_gate(gate, wt, out, minutes, heartbeat)
     finally:
         release(lock)
     if git(wt, "rev-parse", "HEAD") != head:
@@ -918,6 +957,8 @@ def brief(run, m, wt, base, continuing, local_only):
     local = run.config.get("localOnly") or {}
     body = re.sub(r'<If continuing: "(.*?)">', lambda x: x.group(1) if continuing else "", body)
     body = re.sub(r'<If localOnly: "(.*?)">', lambda x: x.group(1) if local_only else "", body)
+    decided = (run.notes / "decisions.md").is_file()
+    body = re.sub(r'<If decided: "(.*?)">', lambda x: x.group(1) if decided else "", body)
     for key, value in {"<path>": wt, "<m>": m, "<repo>": run.repo, "<spec>": run.spec, "<base>": f"origin/{base}",
                        "<notes>": run.notes, "<skill dir>": Path(__file__).resolve().parent,
                        "<label>": local.get("label", ""), "<proof>": local.get("proof", "")}.items():
@@ -1206,10 +1247,55 @@ def cmd_cleanup(spec):
         removed.append("notes")
     spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"])
     url = spec_pr["url"] if spec_pr else None
-    run.status(step="cleanup", state="running", summary="cleaned up: " + (", ".join(removed) or "nothing left"),
-               next="review and fix the spec PR", branch=plan["spec_branch"], **({"pr_url": url} if url else {}))
+    run.status(step="review-pr", state="running",
+               summary="cleaned up: " + (", ".join(removed) or "nothing left")
+               + (f"; reviewing and fixing PR #{spec_pr['number']}" if spec_pr else ""),
+               next="/review-fix-pr, then drive-spec finish done", branch=plan["spec_branch"],
+               **({"pr_url": url} if url else {}))
     print("removed " + (", ".join(removed) or "nothing"))
     print(url or "no open spec PR")
+    return 0
+
+
+# operator questions
+
+def one_line(text, width=160):
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def cmd_ask(spec, question, blocking, step):
+    run = Run(spec)
+    current = run.current()
+    step = step or current.get("step") or "resolve"
+    if blocking:
+        run.status(step=step, state="waiting", question=one_line(question, 1000), question_blocking="true",
+                   summary=f"waiting for the operator: {one_line(question, 100)}", next="act on the operator's answer")
+        print("asked: end the turn now; the answer arrives as the next prompt, then run `drive-spec answered`")
+    else:
+        run.status(step=step, question=one_line(question, 1000), question_blocking="false")
+        print("noted for the operator; carry on")
+    return 0
+
+
+def cmd_answered(spec, answer):
+    run = Run(spec)
+    current = run.current()
+    question = current.get("question")
+    if not question:
+        raise Failed(f"no question is open on #{spec}: ask one with `drive-spec ask`", REFUSE)
+    answer = answer.strip()
+    if not answer:
+        raise Failed("an empty answer: pass the operator's words", REFUSE)
+    gh(f"repos/{run.repo}/issues/{spec}/comments", "-f",
+       f"body=Operator decision.\n\n> {question}\n\n{answer}", "--silent")
+    run.notes.mkdir(parents=True, exist_ok=True)
+    with open(run.notes / "decisions.md", "a") as f:
+        f.write(f"- {question}\n  Answer: {one_line(answer, 1000)}\n")
+    step = current.get("step") or "resolve"
+    run.status(step=step, state="running", question="", summary=f"operator answered: {one_line(answer, 120)}",
+               next=f"carry on with {step}")
+    print(f"recorded on #{spec} and in {run.notes / 'decisions.md'}; implementers read it from their brief")
     return 0
 
 
@@ -1352,6 +1438,15 @@ def main():
     rv.add_argument("--left", help="what the last review left open, or `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
+    ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
+    ak.add_argument("spec")
+    ak.add_argument("question", help="the question, with the options and your recommendation")
+    ak.add_argument("--no-block", dest="blocking", action="store_false",
+                    help="a judgement call made on your own the operator may revisit; the run goes on")
+    ak.add_argument("--step", help="default: the step in the status file")
+    an = sub.add_parser("answered", help="record the operator's answer on the spec and for the implementers")
+    an.add_argument("spec")
+    an.add_argument("answer", help="the operator's own words, or `-` for stdin")
     fi = sub.add_parser("finish", help="post the run's status comment and final status")
     fi.add_argument("spec")
     fi.add_argument("outcome", choices=sorted(OUTCOMES))
@@ -1381,6 +1476,10 @@ def main():
             code = cmd_confirm(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "cleanup":
             code = cmd_cleanup(spec)
+        elif args.cmd == "ask":
+            code = cmd_ask(spec, args.question, args.blocking, args.step)
+        elif args.cmd == "answered":
+            code = cmd_answered(spec, sys.stdin.read() if args.answer == "-" else args.answer)
         elif args.cmd == "preview":
             code = cmd_preview(spec, args.sequential, args.max_slices, args.dry_run)
         elif args.cmd == "explored":

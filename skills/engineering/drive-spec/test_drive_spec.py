@@ -1088,7 +1088,8 @@ class Cleanup(DispatcherCase):
         self.assertEqual(self.origin_sha("agent/local-spec-10-export"),
                          self.git(self.repo, "rev-parse", "agent/local-spec-10-export"))
         r = self.row()
-        self.assertEqual((r["step"], r["state"], r["pr_url"]), ("cleanup", "running", "https://github.com/acme/app/pull/101"))
+        self.assertEqual((r["step"], r["state"], r["pr_url"]), ("review-pr", "running", "https://github.com/acme/app/pull/101"))
+        self.assertTrue(self.status_file()["summary"].endswith("; reviewing and fixing PR #101"))
 
     def test_stops_what_still_runs_in_a_worktree(self):
         self.finish_slices()
@@ -1239,6 +1240,72 @@ class Boundaries(DispatcherCase):
         self.note()
         self.assertEqual(self.run_ds("cleanup", "10").returncode, 5)
         self.assertTrue(self.spec_wt.exists())
+
+
+
+class Heartbeat(DispatcherCase):
+    def stale_status(self, **fields):
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "step=build", "state=running", "summary=landed 0/2",
+                        "next=x", *(f"{k}={v}" for k, v in fields.items())], cwd=self.repo, env=self.env)
+        path = self.repo / ".git" / "drive-spec" / "status" / "spec-10.json"
+        data = json.loads(path.read_text())
+        path.write_text(json.dumps(dict(data, updated_at="2000-01-01T00:00:00Z", session_id="the-run")))
+
+    def test_a_long_gate_keeps_the_run_fresh(self):
+        self.stale_status()
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": "sleep 1.5"}))
+        env = dict(self.env, DRIVE_SPEC_HEARTBEAT_SECONDS="0.3", CLAUDE_CODE_SESSION_ID="someone-else")
+        out = subprocess.run([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=env, capture_output=True,
+                             text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        st = self.status_file()
+        self.assertNotEqual(st["updated_at"], "2000-01-01T00:00:00Z")
+        self.assertEqual((st["session_id"], st["summary"]), ("the-run", "landed 0/2"))
+        self.assertNotEqual(self.row()["attention"], "STALL")
+
+    def test_a_pr_gate_refreshes_the_spec_that_owns_the_pr(self):
+        self.stale_status(pr_url="https://github.com/acme/app/pull/101")
+        env = dict(self.env, DRIVE_SPEC_HEARTBEAT_SECONDS="0.3")
+        out = subprocess.run([str(SCRIPT), "verify", "pr-101", str(self.wt), "--gate", "sleep 1.5"], cwd=self.repo,
+                             env=env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotEqual(self.status_file()["updated_at"], "2000-01-01T00:00:00Z")
+
+
+class Questions(DispatcherCase):
+    def test_ask_waits_and_answered_records_the_decision(self):
+        self.run_ds("gate", "10", GATE)
+        out = self.run_ds("ask", "10", "Public or sign-in?\n(a) public (b) sign-in. Recommend (a).")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        r = self.row()
+        self.assertEqual((r["attention"], r["step"]), ("ASK", "resolve"))
+        self.assertEqual(self.status_file()["question"], "Public or sign-in? (a) public (b) sign-in. Recommend (a).")
+        out = self.run_ds("answered", "10", "public")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        st = self.status_file()
+        self.assertEqual((st["state"], st["question"], st["summary"]), ("running", None, "operator answered: public"))
+        self.assertTrue(self.comments(10)[-1].startswith("Operator decision.\n\n> Public or sign-in?"))
+        self.assertTrue(self.comments(10)[-1].endswith("\n\npublic"))
+        decisions = self.repo / ".git" / "drive-spec" / "spec-10" / "decisions.md"
+        self.assertIn("Answer: public", decisions.read_text())
+        out = self.run_ds("start", "10", "11")
+        self.assertIn(f"`{decisions}` holds each answer, and it overrides the issue where they differ. Match",
+                      out.stdout)
+
+    def test_answered_needs_an_open_question(self):
+        out = self.run_ds("answered", "10", "public")
+        self.assertEqual(out.returncode, 2)
+        self.assertEqual(self.comments(10), [])
+
+    def test_no_block_goes_on(self):
+        self.run_ds("start", "10", "11")
+        self.run_ds("ask", "10", "Kept CSV as the format; revisit?", "--no-block")
+        st = self.status_file()
+        self.assertEqual((st["state"], st["step"], st["question_blocking"]), ("running", "build", False))
+
+    def test_brief_without_decisions_reads_as_before(self):
+        out = self.run_ds("start", "10", "11")
+        self.assertIn("explore only past what they cover. Match the repo's", out.stdout)
 
 
 if __name__ == "__main__":

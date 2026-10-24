@@ -9,7 +9,7 @@ Worktree: <path>. Every command runs there. Commits go on the current branch; th
 
 Issue: #<m> (`gh api repos/<repo>/issues/<m> --jq '.title, .body'`). Spec: #<spec> (`gh api repos/<repo>/issues/<spec> --jq '.title, .body'`). Earlier slices already landed on this branch; read `git log --oneline <base>..HEAD` to see them. <If continuing: "The branch already holds partial work from an earlier run; read its commits and carry on.">
 
-Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at; then the research notes `<notes>/shared.md` and `<notes>/issue-<m>.md`, and explore only past what they cover. Match the repo's conventions and vocabulary.
+Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at; then the research notes `<notes>/shared.md` and `<notes>/issue-<m>.md`, and explore only past what they cover. <If decided: "The operator settled open questions during this run: `<notes>/decisions.md` holds each answer, and it overrides the issue where they differ. ">Match the repo's conventions and vocabulary.
 
 Build the smallest coherent change that satisfies the issue, and only the issue. Test-first where a test can exist: write it, watch it fail, make it pass, one behaviour at a time. Refactor only when green.
 

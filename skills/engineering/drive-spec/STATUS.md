@@ -21,10 +21,13 @@ At the end of every step, and within step 6 at each dispatch, landing and halt. 
 | `explore` | `drive-spec explored`; conflicts: `finish conflicts` |
 | `build` | `start`, `land`, `halt`, `finish ceiling\|held` |
 | `review` | `drive-spec reviewed` |
-| `confirm`, `cleanup` | `drive-spec confirm`, `drive-spec cleanup` |
-| `review-pr` | `finish done`, or `finish halted --step review-pr` |
+| `confirm` | `drive-spec confirm` |
+| `review-pr` | `drive-spec cleanup` as it starts; `finish done`, or `finish halted --step review-pr` |
+| any, `waiting` | `drive-spec ask`; `drive-spec answered` sets it `running` again |
 
 `step` is the step's name: `resolve`, `guard`, `worktree`, `preview`, `explore`, `build`, `review`, `confirm`, `cleanup`, `review-pr`.
+
+While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes `updated_at` every 5 minutes (`status.sh <spec> --touch`), so a run idle on a background gate never reads as stalled; `pr-<n>` refreshes the running spec whose `pr_url` is that PR.
 
 | `state` | When | `next` |
 |---|---|---|
@@ -38,15 +41,21 @@ At the end of every step, and within step 6 at each dispatch, landing and halt. 
 
 ## Questions
 
-When the run needs the operator's decision to go on, record it and end the turn:
+When the run needs the operator's decision to go on, ask it and end the turn:
 
 ```sh
-status.sh <spec> step=<step> state=waiting question="<the question, with the options and your recommendation>" question_blocking=true summary="…" next="…"
+drive-spec ask <spec> "<the question, with the options and your recommendation>"
 ```
 
-The question is read on a phone with no other context: name the issue, the choice, and what each answer leads to. The answer arrives as the next prompt; clear it with `question=` and `state=running` before acting on it.
+It writes `state=waiting` with the question, blocking, at the current step. The question is read on a phone with no other context: name the issue, the choice, and what each answer leads to. The answer arrives as the next prompt; record it before acting on it:
 
-A judgement call the run made on its own and the operator may want to revisit is a non-blocking question: `question_blocking=false`, `state=running`, and the run goes on.
+```sh
+drive-spec answered <spec> "<the operator's words>"
+```
+
+It posts the decision to the spec as a comment, appends it to `decisions.md` in the notes directory, where every later implementer brief points, clears the question, and sets `state=running`.
+
+A judgement call the run made on its own and the operator may want to revisit is a non-blocking question: `drive-spec ask <spec> "<…>" --no-block`, and the run goes on.
 
 ## Inbox
 
