@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from pathlib import Path
 
@@ -220,6 +221,17 @@ elif parts[:1] == ["issues"] and parts[2:] == ["comments"] and method == "POST":
     st["comments"].append({"id": 900 + len(st["comments"]), "issue": int(parts[1]), "body": fields["body"]})
 elif parts[:2] == ["issues", "comments"] and method == "PATCH":
     next(c for c in st["comments"] if c["id"] == int(parts[2]))["body"] = fields["body"]
+elif parts[:1] == ["labels"] and len(parts) == 2:
+    name = urllib.parse.unquote(parts[1])
+    if name not in st.setdefault("labels", []):
+        die("HTTP 404 label")
+    out = {"name": name}
+elif parts == ["labels"] and method == "POST":
+    st.setdefault("labels", []).append(fields["name"])
+elif parts[:1] == ["issues"] and parts[2:] == ["labels"] and method == "POST":
+    if fields["labels[]"] not in st.get("labels", []):
+        die("HTTP 422 label missing")
+    st["issues"][parts[1]]["labels"].append(fields["labels[]"])
 elif parts[:1] == ["issues"] and parts[2:3] == ["labels"] and method == "DELETE":
     labels = st["issues"][parts[1]]["labels"]
     name = urllib.parse.unquote(parts[3])
@@ -269,7 +281,7 @@ class Cli(unittest.TestCase):
     """The script end to end: real git against a bare origin, a fake `gh` holding the tracker."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.origin = self.tmp / "origin.git"
         self.repo = self.tmp / "repo"
         self.counter = self.tmp / "gate-runs"
@@ -337,6 +349,23 @@ class Cli(unittest.TestCase):
 
     def origin_sha(self, ref):
         return self.git(self.tmp, "--git-dir", str(self.origin), "rev-parse", ref)
+
+    def comments(self, n):
+        return [c["body"] for c in self.gh_state()["comments"] if c["issue"] == n]
+
+    def status_file(self):
+        return json.loads((self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").read_text())
+
+    def edit_state(self, fn):
+        self.state = self.gh_state()
+        fn(self.state)
+        self.save()
+
+    def land_11(self):
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = self.run_ds("land", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
 
     def advance_spec(self, name, text):
         """Another slice lands on the spec branch."""
@@ -564,6 +593,215 @@ class Land(Cli):
 
     def test_not_a_slice_refused(self):
         self.assertEqual(self.run_ds("land", "10", "99").returncode, 2)
+
+
+def slices(*specs):
+    """Plan slices from (number, state, blockers, labels) tuples, already in build order."""
+    return {"slices": [{"number": n, "title": f"Slice {n}", "state": st, "blockers": list(b), "labels": list(l),
+                        "branch": f"agent/issue-{n}-x" if st in ("in-flight", "open-pr") else None,
+                        "pr": 40 + n if st == "open-pr" else None} for n, st, b, l in specs]}
+
+
+def picked(f):
+    return [(p["number"], p["action"]) for p in f["picks"]]
+
+
+class Pick(unittest.TestCase):
+    def test_parallel_takes_the_whole_frontier_with_actions(self):
+        f = ds.pick(slices((11, "closed", [], []), (12, "todo", [11], []), (13, "in-flight", [11], []),
+                           (14, "open-pr", [], []), (15, "todo", [12], [])))
+        self.assertEqual(picked(f), [(12, "build"), (13, "continue"), (14, "integrate")])
+        self.assertIsNone(f["stop"])
+
+    def test_sequential_takes_the_lowest_and_waits_while_one_runs(self):
+        plan = slices((12, "todo", [], []), (11, "todo", [], []))
+        self.assertEqual(picked(ds.pick(plan, parallel=False)), [(11, "build")])
+        f = ds.pick(plan, running=[11], parallel=False)
+        self.assertEqual((picked(f), f["running"], f["stop"]), ([], [11], None))
+        self.assertIn("wait:", ds.render_picks(f))
+
+    def test_running_slices_are_not_picked_again(self):
+        f = ds.pick(slices((11, "todo", [], []), (12, "todo", [], [])), running=[11, 99])
+        self.assertEqual((picked(f), f["running"]), ([(12, "build")], [11]))
+
+    def test_local_only_slices_never_build_beside_each_other(self):
+        plan = slices((11, "todo", [], ["needs:desktop"]), (12, "todo", [], ["needs:desktop"]), (13, "todo", [], []))
+        self.assertEqual(picked(ds.pick(plan, local_label="needs:desktop")), [(11, "build"), (13, "build")])
+        f = ds.pick(plan, running=[11], local_label="needs:desktop")
+        self.assertEqual(picked(f), [(13, "build")])
+
+    def test_ceiling_limits_picks_then_stops(self):
+        plan = slices((11, "todo", [], []), (12, "todo", [], []), (13, "todo", [], []))
+        self.assertEqual(picked(ds.pick(plan, max_slices=3, landed=1)), [(11, "build"), (12, "build")])
+        self.assertEqual(picked(ds.pick(plan, running=[11], max_slices=2, landed=1)), [])
+        f = ds.pick(plan, max_slices=2, landed=2)
+        self.assertEqual(f["stop"], "ceiling")
+        self.assertIn("stop: ceiling, 2 landed this run", ds.render_picks(f))
+
+    def test_only_held_and_what_they_block_stops(self):
+        f = ds.pick(slices((11, "closed", [], []), (12, "held", [11], []), (13, "todo", [12], [])))
+        self.assertEqual((f["stop"], f["held"]), ("held", [12]))
+        self.assertIn("stop: held, only held slices and those they block remain: #12", ds.render_picks(f))
+
+    def test_done_and_blocked(self):
+        self.assertEqual(ds.pick(slices((11, "closed", [], [])))["stop"], "done")
+        f = ds.pick(slices((11, "todo", [], ["agent:blocked"])))
+        self.assertEqual((f["stop"], f["blocked"]), ("blocked", [11]))
+
+
+class Brief(unittest.TestCase):
+    def run_(self, config):
+        return types.SimpleNamespace(config=config, repo="acme/app", spec=10, notes=Path("/n"))
+
+    def test_fills_every_placeholder(self):
+        b = ds.brief(self.run_({"localOnly": {"label": "needs:desktop", "proof": "docs/proof.md"}}),
+                     12, Path("/w/issue-12"), "main", True, True)
+        self.assertNotRegex(b, r"<[a-z][a-z ]*>|<If ")
+        for part in ["Worktree: /w/issue-12.", "gh api repos/acme/app/issues/12", "Spec: #10",
+                     "git log --oneline origin/main..HEAD", "/n/issue-12.md", "drive-spec verify 10 /w/issue-12",
+                     "carry on.", "carries `needs:desktop`", "`docs/proof.md`"]:
+            self.assertIn(part, b)
+
+    def test_drops_conditions_that_do_not_hold(self):
+        b = ds.brief(self.run_({}), 12, Path("/w/issue-12"), "main", False, False)
+        self.assertNotIn("carry on", b)
+        self.assertNotIn("prove it", b)
+        self.assertNotRegex(b, r"<[a-z][a-z ]*>|<If ")
+
+
+class Frontier(Cli):
+    def test_text(self):
+        out = self.run_ds("frontier", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "build #11 Create the serializer\n")
+
+    def test_inbox_comes_first(self):
+        status = self.repo / ".git" / "drive-spec" / "status"
+        status.mkdir(parents=True)
+        (status / "spec-10.inbox.md").write_text("## main advanced: #5\nOverlaps your branch: none\n")
+        out = self.run_ds("frontier", "10")
+        self.assertEqual(out.returncode, 5)
+        self.assertIn("## main advanced: #5", out.stdout)
+        self.assertEqual(self.run_ds("frontier", "10").returncode, 0)
+
+    def test_integrate_checks_the_inbox_too(self):
+        status = self.repo / ".git" / "drive-spec" / "status"
+        status.mkdir(parents=True)
+        (status / "spec-10.inbox.md").write_text("## main advanced: #5\n")
+        self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 5)
+        self.assertEqual(self.gh_state()["pulls"], [])
+
+    def test_blocked_slice_refuses(self):
+        self.edit_state(lambda st: st["issues"]["11"]["labels"].append("agent:blocked"))
+        out = self.run_ds("frontier", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("#11 carries agent:blocked", out.stderr)
+
+    def test_ceiling_counts_landings_since_the_gate_was_pinned(self):
+        out = self.run_ds("frontier", "10", "--max", "1")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("pin the gate", out.stderr)
+        self.run_ds("gate", "10", GATE)
+        self.land_11()
+        self.assertEqual(self.run_ds("frontier", "10", "--max", "1").stdout, "stop: ceiling, 1 landed this run\n")
+        self.run_ds("gate", "10", GATE)
+        self.assertEqual(self.run_ds("frontier", "10", "--max", "1").stdout, "build #12 Wire the route\n")
+
+
+class Start(Cli):
+    def test_fresh_slice_from_the_spec_head(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(
+            json.dumps({"verify": GATE, "bootstrap": 'echo boot >> "$COUNTER.boot"'}))
+        self.land_11()
+        out = self.run_ds("start", "10", "12")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        wt = self.repo / ".claude" / "worktrees" / "issue-12"
+        self.assertTrue(out.stdout.startswith(f"worktree {wt} on agent/issue-12-wire-the-route\n"))
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), self.origin_sha("agent/local-spec-10-export"))
+        self.assertTrue((wt / "a.txt").exists())
+        self.assertTrue(Path(f"{self.counter}.boot").exists())
+        self.assertIn(f"drive-spec verify 10 {wt}", out.stdout)
+        self.assertNotIn("carry on", out.stdout)
+        self.assertIn("agent:in-progress", self.gh_state()["issues"]["12"]["labels"])
+        self.assertEqual(self.status_file()["next"], "implementer builds #12")
+
+    def test_not_on_the_frontier_refused(self):
+        out = self.run_ds("start", "10", "12")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("blocked by #11", out.stderr)
+
+    def test_existing_worktree_continues(self):
+        out = self.run_ds("start", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("carry on", out.stdout)
+        self.assertEqual(self.gh_state()["issues"]["11"]["labels"], ["agent:in-progress"])
+
+    def test_local_branch_without_worktree_keeps_its_commits(self):
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        self.git(self.repo, "worktree", "remove", str(self.wt))
+        out = self.run_ds("start", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), head)
+
+    def test_branch_on_origin_is_restored(self):
+        self.git(self.wt, "push", "-q", "origin", "agent/issue-11-serializer")
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        self.git(self.repo, "worktree", "remove", str(self.wt))
+        self.git(self.repo, "branch", "-D", "agent/issue-11-serializer")
+        out = self.run_ds("start", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), head)
+
+
+class Finish(Cli):
+    def test_halt(self):
+        out = self.run_ds("halt", "10", "11", "the", "export", "test", "fails.")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gh_state()["issues"]["11"]["labels"], ["agent:blocked"])
+        self.assertEqual(self.comments(11), [f"drive-spec halted here: the export test fails. Worktree kept at "
+                                             f"{self.wt}. Resume with `/drive-spec 10` after fixing."])
+        self.assertEqual(self.comments(10)[0], "drive-spec halted on #11: the export test fails.\n`/drive-spec 10`")
+        st = self.status_file()
+        self.assertEqual((st["state"], st["step"], st["next"]), ("halted", "build", "/drive-spec 10"))
+
+    def test_done_needs_every_slice_closed(self):
+        out = self.run_ds("finish", "10", "done")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("#11, #12 still open", out.stderr)
+        self.assertEqual(self.comments(10), [])
+
+    def test_done(self):
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        out = self.run_ds("finish", "10", "done")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("drive-spec done: all 2 slices landed, review clean. Spec PR #101.", self.comments(10))
+        st = self.status_file()
+        self.assertEqual((st["state"], st["step"], st["next"]), ("done", "review-pr", "none"))
+
+    def test_conflicts_post_the_list(self):
+        self.assertEqual(self.run_ds("finish", "10", "conflicts").returncode, 2)
+        notes = self.repo / ".git" / "drive-spec" / "spec-10"
+        notes.mkdir(parents=True)
+        (notes / "conflicts.md").write_text("- #11 says CSV; #12 says JSON\n")
+        self.assertEqual(self.run_ds("finish", "10", "conflicts").returncode, 0)
+        self.assertEqual(self.comments(10)[0], "drive-spec halted before building: the spec and its slices "
+                                               "disagree.\n`/drive-spec 10`\n\n- #11 says CSV; #12 says JSON")
+        self.assertEqual(self.status_file()["step"], "explore")
+
+    def test_held_and_review_halt(self):
+        self.assertEqual(self.run_ds("finish", "10", "held").returncode, 2)
+        out = self.run_ds("finish", "10", "halted", "--why", "fix pass red", "--step", "review-pr",
+                          "--resume", "/review-fix-pr 101")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.comments(10)[0], "drive-spec halted: fix pass red.\n`/review-fix-pr 101`")
+
+    def test_refused(self):
+        self.assertEqual(self.run_ds("finish", "10", "refused").returncode, 2)
+        self.edit_state(lambda st: st["issues"]["10"].update(body="## Parent\n\n#1\n"))
+        self.assertEqual(self.run_ds("finish", "10", "refused").returncode, 0)
+        self.assertTrue(self.comments(10)[0].startswith("drive-spec refused #10: #10 has a ## Parent of its own"))
+        self.assertEqual(self.status_file()["step"], "guard")
 
 
 if __name__ == "__main__":

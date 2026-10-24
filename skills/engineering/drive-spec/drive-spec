@@ -21,7 +21,8 @@ PR_FIELDS = ".[] | {number, head: .head.ref, url: .html_url, merged_at}"
 VERIFY_LOCK = "/tmp/drive-spec-verify.lock"
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 SPEC_MOVES = 5
-REFUSE, CONFLICT, RED = 2, 3, 4
+REFUSE, CONFLICT, RED, INBOX = 2, 3, 4, 5
+LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
 
 
 class Failed(Exception):
@@ -236,6 +237,10 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def stamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
 class Run:
     """Where a spec's run lives: repo, worktree root, notes, config."""
 
@@ -308,6 +313,44 @@ def cmd_plan(spec, as_json):
     return REFUSE if plan["refuse"] else 0
 
 
+def progress_summary(plan):
+    landed = sum(x["state"] == "closed" for x in plan["slices"])
+    building = [f"#{x['number']}" for x in plan["slices"]
+                if x["state"] != "closed" and "agent:in-progress" in x["labels"]]
+    return f"landed {landed}/{len(plan['slices'])}" + (f"; building {', '.join(building)}" if building else "")
+
+
+def inbox(run):
+    """Print and archive the dispatcher's unread notes. True when there were any: act on them first."""
+    script = Path(__file__).resolve().with_name("status.sh")
+    notes = subprocess.run([str(script), str(run.spec), "--inbox"], cwd=run.repo_dir, capture_output=True,
+                           text=True, timeout=60).stdout
+    if not notes.strip():
+        return False
+    print(notes.rstrip())
+    print(f"inbox: act on these notes at this boundary (STATUS.md, Inbox), then run this command again")
+    return True
+
+
+def ensure_label(run, name):
+    try:
+        gh(f"repos/{run.repo}/labels/{name.replace(':', '%3A')}", "--silent")
+    except Failed:
+        gh(f"repos/{run.repo}/labels", "-f", f"name={name}", "-f", f"color={LABEL_COLORS[name]}", "--silent")
+
+
+def add_label(run, m, name):
+    ensure_label(run, name)
+    gh(f"repos/{run.repo}/issues/{m}/labels", "-f", f"labels[]={name}", "--silent")
+
+
+def remove_label(run, m, name):
+    try:
+        gh("-X", "DELETE", f"repos/{run.repo}/issues/{m}/labels/{name.replace(':', '%3A')}", "--silent")
+    except Failed:
+        pass
+
+
 # verify
 
 def pinned_gate(run):
@@ -323,6 +366,7 @@ def cmd_gate(spec, command):
         old = pinned_gate(run)
         run.notes.mkdir(parents=True, exist_ok=True)
         (run.notes / "gate").write_text(command + "\n")
+        (run.notes / "run.json").write_text(json.dumps({"started_at": stamp(), "gate": command}))
         print(f"gate pinned: {command}" + (f" (was: {old})" if old and old != command else ""))
         return 0
     gate = pinned_gate(run) or run.config.get("verify")
@@ -428,6 +472,8 @@ def cmd_integrate(spec, m, deviations):
     except BlockingIOError:
         raise Failed("another integration into the spec branch is running: one slice at a time", REFUSE)
 
+    if inbox(run):
+        return INBOX
     spec_branch = run.spec_branch()
     git(wt, "fetch", "--quiet", "origin")
     bad = bodied_commits(wt, f"origin/{spec_branch}")
@@ -546,6 +592,7 @@ def cmd_land(spec, m):
     spec_wt = run.root / f"spec-{spec}"
     if spec_wt.is_dir():
         git(spec_wt, "pull", "--quiet", "--ff-only")
+    run.notes.mkdir(parents=True, exist_ok=True)
     if s["state"] != "closed":
         gh(f"repos/{run.repo}/issues/{m}/comments", "-f",
            f"body=Landed in #{pr['number']} on `{spec_branch}`.", "--silent")
@@ -553,10 +600,7 @@ def cmd_land(spec, m):
            "--silent")
         s["state"] = "closed"
     if "agent:in-progress" in s["labels"]:
-        try:
-            gh("-X", "DELETE", f"repos/{run.repo}/issues/{m}/labels/agent%3Ain-progress", "--silent")
-        except Failed:
-            pass
+        remove_label(run, m, "agent:in-progress")
         s["labels"].remove("agent:in-progress")
 
     wt = run.root / f"issue-{m}"
@@ -580,14 +624,279 @@ def cmd_land(spec, m):
         print(f"opened draft spec PR {spec_pr['url']}")
     post_progress(run, plan, base, spec_pr)
 
-    landed = sum(x["state"] == "closed" for x in plan["slices"])
-    building = [f"#{x['number']}" for x in plan["slices"]
-                if x["state"] != "closed" and "agent:in-progress" in x["labels"]]
-    summary = f"landed {landed}/{len(plan['slices'])}" + (f"; building {', '.join(building)}" if building else "")
+    with open(run.notes / "landed.jsonl", "a") as f:
+        f.write(json.dumps({"slice": m, "pr": pr["number"], "at": stamp()}) + "\n")
+    summary = progress_summary(plan)
     run.status(step="build", state="running", summary=summary, pr_url=spec_pr["url"],
                next="integrate the next completed slice, or pick from the frontier")
     print(f"landed #{m} via #{pr['number']}; {summary}")
     return 0
+
+
+# frontier and start
+
+def landed_this_run(run):
+    try:
+        started = json.loads((run.notes / "run.json").read_text())["started_at"]
+    except (OSError, ValueError, KeyError):
+        raise Failed("no run start: pin the gate at step 1 (`drive-spec gate <spec> '<verify>'`), "
+                     "so maxSlices counts only this run's landings", REFUSE)
+    try:
+        rows = [json.loads(line) for line in (run.notes / "landed.jsonl").read_text().splitlines() if line.strip()]
+    except OSError:
+        rows = []
+    return len({r["slice"] for r in rows if r["at"] >= started})
+
+
+def pick(plan, running=(), parallel=True, max_slices=None, landed=0, local_label=None):
+    """What to do next from the plan alone: picks with their action, or why the run stops."""
+    by = {s["number"]: s for s in plan["slices"]}
+    open_ = [s for s in plan["slices"] if s["state"] != "closed"]
+    out = {"picks": [], "running": [], "stop": None, "blocked": [], "held": [], "landed": landed}
+    if not open_:
+        out["stop"] = "done"
+        return out
+    out["blocked"] = [s["number"] for s in open_ if "agent:blocked" in s["labels"]]
+    if out["blocked"]:
+        out["stop"] = "blocked"
+        return out
+    out["running"] = running = sorted(m for m in set(running) if m in by and by[m]["state"] != "closed")
+    out["held"] = [s["number"] for s in open_ if s["state"] == "held"]
+
+    def local(s):
+        return bool(local_label) and local_label in s["labels"]
+
+    ready = sorted((s for s in open_ if s["state"] != "held" and s["number"] not in running
+                    and all(by[b]["state"] == "closed" for b in s["blockers"])), key=lambda s: s["number"])
+    room = None if max_slices is None else max(0, max_slices - landed - len(running))
+    local_busy = any(local(by[m]) for m in running)
+    if not parallel and running:
+        ready = []
+    for s in ready:
+        if room is not None and len(out["picks"]) >= room:
+            break
+        if local(s):
+            if local_busy:
+                continue
+            local_busy = True
+        action = {"todo": "build", "in-flight": "continue", "open-pr": "integrate"}[s["state"]]
+        out["picks"].append({"number": s["number"], "title": s["title"], "action": action,
+                             "branch": s["branch"], "pr": s["pr"]})
+        if not parallel:
+            break
+    if not out["picks"] and not running:
+        out["stop"] = "ceiling" if max_slices is not None and landed >= max_slices else "held"
+    return out
+
+
+def render_picks(f):
+    lines = []
+    for p in f["picks"]:
+        where = f" (PR #{p['pr']})" if p["pr"] else f" ({p['branch']})" if p["branch"] else ""
+        lines.append(f"{p['action']} #{p['number']} {p['title']}{where}")
+    lines += [f"running #{m}" for m in f["running"]]
+    if f["stop"] == "ceiling":
+        lines.append(f"stop: ceiling, {f['landed']} landed this run")
+    elif f["stop"] == "held":
+        lines.append("stop: held, only held slices and those they block remain: "
+                     + ", ".join(f"#{m}" for m in f["held"]))
+    elif f["stop"]:
+        lines.append(f"stop: {f['stop']}")
+    elif not f["picks"]:
+        lines.append("wait: for a running implementer to finish")
+    return "\n".join(lines)
+
+
+def cmd_frontier(spec, running, sequential, max_slices, as_json):
+    run = Run(spec)
+    if inbox(run):
+        return INBOX
+    plan = checked_plan(run)
+    parallel = not sequential and run.config.get("parallel", True) is not False
+    if max_slices is None:
+        max_slices = run.config.get("maxSlices")
+    f = pick(plan, running, parallel, max_slices, landed_this_run(run) if max_slices is not None else 0,
+             (run.config.get("localOnly") or {}).get("label"))
+    if f["stop"] == "blocked":
+        raise Failed(", ".join(f"#{m}" for m in f["blocked"]) + " carries agent:blocked: the operator removes it "
+                     "after fixing, and only then does the run go on", REFUSE)
+    print(json.dumps(f, indent=2) if as_json else render_picks(f))
+    return 0
+
+
+def slug_of(title):
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40].rstrip("-")
+
+
+def ensure_excluded(run):
+    try:
+        rel = run.root.relative_to(run.repo_dir).as_posix() + "/"
+    except ValueError:
+        return
+    exclude = run.common / "info" / "exclude"
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    if rel not in lines:
+        exclude.parent.mkdir(exist_ok=True)
+        with open(exclude, "a") as f:
+            f.write(rel + "\n")
+
+
+def brief(run, m, wt, base, continuing, local_only):
+    text = Path(__file__).resolve().with_name("IMPLEMENTER.md").read_text()
+    body = text.split("```markdown\n", 1)[1].rsplit("\n```", 1)[0]
+    local = run.config.get("localOnly") or {}
+    body = re.sub(r'<If continuing: "(.*?)">', lambda x: x.group(1) if continuing else "", body)
+    body = re.sub(r'<If localOnly: "(.*?)">', lambda x: x.group(1) if local_only else "", body)
+    for key, value in {"<path>": wt, "<m>": m, "<repo>": run.repo, "<spec>": run.spec, "<base>": f"origin/{base}",
+                       "<notes>": run.notes, "<skill dir>": Path(__file__).resolve().parent,
+                       "<label>": local.get("label", ""), "<proof>": local.get("proof", "")}.items():
+        body = body.replace(key, str(value))
+    body = re.sub(r" +\n", "\n", body).strip()
+    left = re.findall(r"<(?:If [A-Za-z]+:[^>]*|[a-z][a-z ]*)>", body)
+    if left:
+        raise Failed(f"IMPLEMENTER.md has placeholders start does not fill: {', '.join(left)}")
+    return body
+
+
+def cmd_start(spec, m):
+    run = Run(spec)
+    plan = checked_plan(run)
+    by = {s["number"]: s for s in plan["slices"]}
+    s = by.get(m)
+    if not s:
+        raise Failed(f"#{m} is not a slice of #{spec}", REFUSE)
+    if s["state"] == "closed":
+        raise Failed(f"#{m} is closed", REFUSE)
+    if s["state"] == "held":
+        raise Failed(f"#{m} is held: only a local session builds it", REFUSE)
+    if "agent:blocked" in s["labels"]:
+        raise Failed(f"#{m} carries agent:blocked: the operator removes it after fixing", REFUSE)
+    waiting = [f"#{b}" for b in s["blockers"] if by[b]["state"] != "closed"]
+    if waiting:
+        raise Failed(f"#{m} is not on the frontier: blocked by {', '.join(waiting)}", REFUSE)
+
+    ensure_excluded(run)
+    wt = run.root / f"issue-{m}"
+    prefix = f"agent/issue-{m}-"
+    created = False
+    if wt.is_dir():
+        branch = git(wt, "branch", "--show-current")
+        if not branch.startswith(prefix):
+            raise Failed(f"{wt} is on {branch or 'a detached HEAD'}, not {prefix}*", REFUSE)
+    else:
+        git(run.repo_dir, "fetch", "--quiet", "--prune", "origin")
+        local = git(run.repo_dir, "branch", "--list", f"{prefix}*", "--format=%(refname:short)").split()
+        remote = run.heads(f"{prefix}*")
+        if local:
+            branch = local[0]
+            git(run.repo_dir, "worktree", "add", "-q", str(wt), branch)
+        elif remote:
+            branch = remote[0]
+            git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, f"origin/{branch}")
+        else:
+            branch = prefix + slug_of(s["title"])
+            spec_wt = run.root / f"spec-{spec}"
+            if spec_wt.is_dir():
+                git(spec_wt, "pull", "--quiet", "--ff-only")
+                start = git(spec_wt, "rev-parse", "HEAD")
+            else:
+                start = f"origin/{plan['spec_branch']}"
+            git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, start)
+        created = True
+    bootstrap = run.config.get("bootstrap")
+    if created and bootstrap:
+        code = subprocess.run(["sh", "-c", bootstrap], cwd=wt).returncode
+        if code != 0:
+            raise Failed(f"bootstrap exited {code} in {wt}")
+    if "agent:in-progress" not in s["labels"]:
+        add_label(run, m, "agent:in-progress")
+        s["labels"].append("agent:in-progress")
+    run.status(step="build", state="running", summary=progress_summary(plan),
+               next=f"integrate #{m}" if s["state"] == "open-pr" else f"implementer builds #{m}")
+    print(f"worktree {wt} on {branch}")
+    if s["state"] == "open-pr":
+        print(f"#{m} already has PR #{s['pr']}: drive-spec integrate {spec} {m}")
+        return 0
+    base = run.base()
+    continuing = git(wt, "rev-list", "--count", f"origin/{plan['spec_branch']}..HEAD") != "0"
+    local_label = (run.config.get("localOnly") or {}).get("label")
+    print("brief:\n")
+    print(brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"]))
+    return 0
+
+
+# halt and finish
+
+OUTCOMES = {"done": ("done", "review-pr"), "halted": ("halted", "build"), "conflicts": ("halted", "explore"),
+            "ceiling": ("paused", "build"), "held": ("paused", "build"), "refused": ("halted", "guard")}
+
+
+def finish(run, outcome, why=None, slice_=None, step=None, resume=None):
+    spec = run.spec
+    plan = make_plan(run)
+    resume = resume or f"/drive-spec {spec}"
+    extra = ""
+    if outcome == "refused":
+        if not plan["refuse"]:
+            raise Failed(f"`drive-spec plan {spec}` does not refuse the spec", REFUSE)
+        first = f"drive-spec refused #{spec}: {plan['refuse']}."
+    else:
+        if plan["refuse"]:
+            raise Failed(f"the plan refuses #{spec}: finish it as `refused`", REFUSE)
+        slices = plan["slices"]
+        landed = sum(s["state"] == "closed" for s in slices)
+        if outcome == "done":
+            open_ = [f"#{s['number']}" for s in slices if s["state"] != "closed"]
+            if open_:
+                raise Failed(f"not done: {', '.join(open_)} still open", REFUSE)
+            spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"]) if plan["spec_branch"] else None
+            if not spec_pr:
+                raise Failed("not done: no open spec PR", REFUSE)
+            first = f"drive-spec done: all {len(slices)} slices landed, review clean. Spec PR #{spec_pr['number']}."
+        elif outcome == "halted":
+            if not why:
+                raise Failed("a halt needs --why", REFUSE)
+            first = f"drive-spec halted on #{slice_}: {why}." if slice_ else f"drive-spec halted: {why}."
+        elif outcome == "conflicts":
+            try:
+                extra = (run.notes / "conflicts.md").read_text().strip()
+            except FileNotFoundError:
+                extra = ""
+            if not extra:
+                raise Failed(f"no conflicts recorded in {run.notes / 'conflicts.md'}", REFUSE)
+            first = "drive-spec halted before building: the spec and its slices disagree."
+        elif outcome == "ceiling":
+            first = f"drive-spec paused at maxSlices: {landed} of {len(slices)} slices landed."
+        elif outcome == "held":
+            held = [f"#{s['number']}" for s in slices if s["state"] == "held"]
+            if not held:
+                raise Failed("no held slices", REFUSE)
+            first = f"drive-spec paused: only held slices remain ({', '.join(held)}). Resume in a local session."
+    body = first + ("" if outcome == "done" else f"\n`{resume}`") + (f"\n\n{extra}" if extra else "")
+    gh(f"repos/{run.repo}/issues/{spec}/comments", "-f", f"body={body}", "--silent")
+    if outcome != "refused" and plan["spec_branch"]:
+        base = run.base()
+        post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
+    state, default_step = OUTCOMES[outcome]
+    run.status(step=step or default_step, state=state, summary=first,
+               next="none" if outcome == "done" else resume, question="")
+    print(body)
+    return 0
+
+
+def cmd_finish(spec, outcome, why, slice_, step, resume):
+    return finish(Run(spec), outcome, why, slice_, step, resume)
+
+
+def cmd_halt(spec, m, why):
+    run = Run(spec)
+    add_label(run, m, "agent:blocked")
+    remove_label(run, m, "agent:in-progress")
+    wt = run.root / f"issue-{m}"
+    kept = f" Worktree kept at {wt}." if wt.is_dir() else ""
+    gh(f"repos/{run.repo}/issues/{m}/comments", "--silent",
+       "-f", f"body=drive-spec halted here: {why}.{kept} Resume with `/drive-spec {spec}` after fixing.")
+    return finish(run, "halted", why, m)
 
 
 def main():
@@ -611,6 +920,26 @@ def main():
     la.add_argument("slice")
     pr = sub.add_parser("progress", help="refresh the progress comment on the spec")
     pr.add_argument("spec")
+    fr = sub.add_parser("frontier", help="the next slices to build, continue or integrate, or why the run stops")
+    fr.add_argument("spec")
+    fr.add_argument("--running", default="", help="slices whose implementer is running now, comma-separated")
+    fr.add_argument("--sequential", action="store_true")
+    fr.add_argument("--max", type=int, dest="max_slices", help="maxSlices; default from .claude/drive-spec.json")
+    fr.add_argument("--json", action="store_true")
+    st = sub.add_parser("start", help="open a frontier slice's worktree, label it, print the implementer brief")
+    st.add_argument("spec")
+    st.add_argument("slice")
+    h = sub.add_parser("halt", help="halt the run on a red slice: label, comment, status comment, status")
+    h.add_argument("spec")
+    h.add_argument("slice")
+    h.add_argument("why", nargs="+")
+    fi = sub.add_parser("finish", help="post the run's status comment and final status")
+    fi.add_argument("spec")
+    fi.add_argument("outcome", choices=sorted(OUTCOMES))
+    fi.add_argument("--why")
+    fi.add_argument("--slice", type=lambda v: int(v.lstrip("#")))
+    fi.add_argument("--step")
+    fi.add_argument("--resume", help="resume command; default /drive-spec <spec>")
     args = p.parse_args()
     spec = int(args.spec.lstrip("#"))
     try:
@@ -626,6 +955,16 @@ def main():
             code = cmd_land(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "progress":
             code = cmd_progress(spec)
+        elif args.cmd == "frontier":
+            running = [int(x.strip().lstrip("#")) for x in args.running.split(",") if x.strip()]
+            code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
+        elif args.cmd == "start":
+            code = cmd_start(spec, int(args.slice.lstrip("#")))
+        elif args.cmd == "halt":
+            code = cmd_halt(spec, int(args.slice.lstrip("#")), " ".join(args.why).rstrip("."))
+        elif args.cmd == "finish":
+            code = cmd_finish(spec, args.outcome, args.why and args.why.rstrip("."), args.slice, args.step,
+                              args.resume)
     except Failed as e:
         print(f"drive-spec: {e}", file=sys.stderr)
         code = e.code

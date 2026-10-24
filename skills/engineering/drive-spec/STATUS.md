@@ -38,7 +38,7 @@ A judgement call the run made on its own and the operator may want to revisit is
 
 ## Inbox
 
-The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step: before each step, and in step 6 before picking from the frontier and before integrating each slice.
+The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step: before each step, and in step 6 before picking from the frontier and before integrating each slice. `drive-spec frontier` and `drive-spec integrate` read it themselves: with notes waiting, they print them and exit 5, and run again once the notes are handled.
 
 ```sh
 <skill dir>/status.sh <spec> --inbox

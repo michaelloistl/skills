@@ -1,6 +1,6 @@
 # Implementer brief
 
-Fill the placeholders and hand this to an implementer subagent. Point, never paste: the subagent reads the issue and the spec itself.
+`drive-spec start` fills the placeholders and prints this, ready to hand to an implementer subagent unchanged. Point, never paste: the subagent reads the issue and the spec itself. A placeholder `start` does not fill fails it, so a new one goes into its `brief()` too.
 
 ```markdown
 You are implementing one tracer-bullet of a spec as a single vertical slice.

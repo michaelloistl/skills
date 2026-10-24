@@ -24,23 +24,7 @@ REST reports state in lowercase: `open`, `closed`. The issues endpoints also ret
 
 ## Labels
 
-Created on first use, never assumed. The colon is URL-encoded in paths:
-
-```sh
-gh api "repos/$repo/labels/agent%3Ain-progress" --silent 2>/dev/null \
-  || gh api "repos/$repo/labels" -f name=agent:in-progress -f color=0E8A16 --silent
-gh api "repos/$repo/labels/agent%3Ablocked" --silent 2>/dev/null \
-  || gh api "repos/$repo/labels" -f name=agent:blocked -f color=B60205 --silent
-```
-
-Add and remove:
-
-```sh
-gh api "repos/$repo/issues/<m>/labels" -f 'labels[]=agent:in-progress' --silent
-gh api -X DELETE "repos/$repo/issues/<m>/labels/agent%3Ain-progress" --silent
-```
-
-`agent:in-progress` goes on when the implementer is dispatched; `drive-spec land` takes it off when the issue closes. `agent:blocked` goes on with a comment when a slice halts the run, and the operator removes it after fixing.
+Created on first use, never assumed. `agent:in-progress` (green) goes on in `drive-spec start` and comes off in `drive-spec land` or `drive-spec halt`. `agent:blocked` (red) goes on in `drive-spec halt`; the operator removes it after fixing, and until then `frontier` and `start` refuse to go on.
 
 ## Progress comment
 
@@ -64,19 +48,16 @@ Every slice in build order; closed slices ticked; `← building` on open slices 
 
 ## Status comment
 
-A fresh comment on the spec issue as the run's last action, never an edit: edits notify no one, and this comment is how the operator learns the run is over. The first line is the outcome; every outcome but done adds the resume command on a second line.
+A fresh comment on the spec issue as the run's last action, never an edit: edits notify no one, and this comment is how the operator learns the run is over. `drive-spec finish <spec> <outcome>` posts it, refreshes the progress comment, and writes the final status; `drive-spec halt` finishes as `halted`. The first line is the outcome; every outcome but done adds the resume command (default `/drive-spec <spec>`, else `--resume`) on a second line.
 
-```sh
-gh api "repos/$repo/issues/<spec>/comments" --silent -f body="$body"
-```
-
-| Outcome | First line |
-|---|---|
-| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` |
-| halted | `drive-spec halted on #<m>: <one line why>.` |
-| conflicts | `drive-spec halted before building: the spec and its slices disagree.` followed by the list from `conflicts.md` |
-| ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` |
-| held | `drive-spec paused: only held slices remain (#<m>, …). Resume in a local session.` |
+| Outcome | First line | Refused when |
+|---|---|---|
+| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` | a slice is open, or no spec PR is |
+| halted | `drive-spec halted on #<m>: <why>.`, or without a slice `drive-spec halted: <why>.` | no `--why` |
+| conflicts | `drive-spec halted before building: the spec and its slices disagree.`, then the list from `conflicts.md` | `conflicts.md` is empty |
+| ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` | |
+| held | `drive-spec paused: only held slices remain (#<m>, …). Resume in a local session.` | no slice is held |
+| refused | `drive-spec refused #<spec>: <the plan's refuse line>.` | the plan does not refuse |
 
 ## Integration and landing
 
@@ -103,9 +84,4 @@ gh api -X PATCH "repos/$repo/pulls/<pr>" -f body="$body" --silent
 
 ## Halting
 
-```sh
-gh api "repos/$repo/issues/<m>/labels" -f 'labels[]=agent:blocked' --silent
-gh api -X DELETE "repos/$repo/issues/<m>/labels/agent%3Ain-progress" --silent
-gh api "repos/$repo/issues/<m>/comments" --silent \
-  -f body="drive-spec halted here: <one line why>. Worktree kept at <path>. Resume with \`/drive-spec <spec>\` after fixing."
-```
+`drive-spec halt <spec> <m> <why>`: labels the slice `agent:blocked`, removes `agent:in-progress`, comments `drive-spec halted here: <why>. Worktree kept at <path>. Resume with \`/drive-spec <spec>\` after fixing.` on it, then finishes the run as `halted`.
