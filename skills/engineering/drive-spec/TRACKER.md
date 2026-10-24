@@ -27,12 +27,9 @@ A candidate is a tracer-bullet when the first `#N` in its `## Parent` section is
 
 ## Blockers
 
-The union of two sources, read for every slice:
+The `#<m>` refs in each slice's `## Blocked by` section, already in hand from discovery.
 
-- `## Blocked by` refs in the body.
-- Native dependencies: `gh api "repos/$repo/issues/<m>/dependencies/blocked_by" --jq '.[].number'`.
-
-For ordering, keep only blockers that are themselves slices of this spec; a blocker outside the spec is printed in the preview and otherwise ignored. A blocker that is still open gates the slice regardless of its source.
+For ordering, keep only blockers that are themselves slices of this spec; a blocker outside the spec is printed in the preview and otherwise ignored. A blocker that is still open gates the slice.
 
 Topological order: repeatedly take the open or closed slice with every blocker already taken, lowest number first. Anything left over is a cycle: refuse, naming the slices in it.
 
@@ -106,6 +103,7 @@ gh api "repos/$repo/issues/<spec>/comments" --silent -f body="$body"
 |---|---|
 | done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` |
 | halted | `drive-spec halted on #<m>: <one line why>.` |
+| conflicts | `drive-spec halted before building: the spec and its slices disagree.` followed by the list from `conflicts.md` |
 | ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` |
 | held | `drive-spec paused: only held slices remain (#<m>, …). Resume in a local session.` |
 
@@ -114,7 +112,9 @@ gh api "repos/$repo/issues/<spec>/comments" --silent -f body="$body"
 ```sh
 git push -u origin agent/issue-<m>-<slug>
 gh api "repos/$repo/pulls" -f base=agent/local-spec-<n>-<slug> -f head=agent/issue-<m>-<slug> \
-  -f title="<issue title>" -f body="Slice of #<spec>. Ref #<m>." --jq .number
+  -f title="<issue title>" -f body="Slice of #<spec>. Ref #<m>.
+
+<the implementer's Deviations list>" --jq .number
 ```
 
 `Ref`, never `Closes`: merging into a non-default branch would not auto-close, and the run closes the issue itself only after the merge is confirmed.
@@ -128,7 +128,7 @@ For the slice at the head of the queue:
 1. Push the slice and create its PR when absent.
 2. Fetch origin in the slice worktree and record the current `origin/agent/local-spec-<n>-<slug>` SHA.
 3. Merge that SHA into the slice branch. A conflicted merge goes to a merger subagent in the slice worktree; it resolves every conflict and commits the merge.
-4. Run the verify gate unconditionally on the resulting HEAD, including when the merge was clean or already up to date. Red halts the run with the worktree intact.
+4. Run the verify gate on the resulting HEAD, including when the merge was clean. Skip it only when HEAD is still the SHA the implementer reported green: that exact tree is already verified. Red halts the run with the worktree intact.
 5. Push the slice branch. Fetch origin again; when the spec branch SHA differs from the recorded SHA, return to step 2.
 6. Merge the PR only after GitHub reports it mergeable, then confirm `merged_at` is non-null. `mergeable` reads `null` while GitHub computes it: wait a few seconds and read again. A queued or blocked merge is not landed.
 
@@ -153,7 +153,7 @@ Pull the spec worktree and finish the slice's land and cleanup steps before taki
 
 ## Spec PR
 
-Draft, `spec branch → base`, opened when the first slice lands; an open one already there is left as is. The body lists every slice in topological order, including those not yet built.
+Draft, `spec branch → base`, opened when the first slice lands; an open one already there is left as is. The body lists every slice in topological order, including those not yet built. It says `Ref #<spec>` while any slice is open, so merging the draft early cannot close the spec; step 8 changes it to `Closes #<spec>`.
 
 ```sh
 owner=${repo%/*}
@@ -161,7 +161,7 @@ gh api "repos/$repo/pulls?state=open&base=<base>&head=$owner:agent/local-spec-<n
   --jq '.[] | {number, url: .html_url}'
 gh api "repos/$repo/pulls" -F draft=true -f base=<base> -f head=agent/local-spec-<n>-<slug> \
   -f title="<spec title>" -f body="$(cat <<'EOF'
-Closes #<spec>
+Ref #<spec>
 
 Slices, in build order:
 - #12 Create the serializer

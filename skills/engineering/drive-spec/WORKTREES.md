@@ -24,7 +24,13 @@ Research notes for spec `<n>` live in `$common/drive-spec/spec-<n>/`: inside the
 | spec | `agent/local-spec-<n>-<slug>` | `<root>/spec-<n>` |
 | slice | `agent/issue-<m>-<slug>` | `<root>/issue-<m>` |
 
-Slug: the issue title lowercased, runs of non-alphanumerics collapsed to `-`, trimmed, at most 40 characters. A branch already on origin keeps whatever slug it has; look it up with `git ls-remote --heads origin 'agent/local-spec-<n>-*'` rather than recomputing.
+Slug: compute it, never type it.
+
+```sh
+slug=$(gh api "repos/$repo/issues/<issue>" --jq .title | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-40 | sed -E 's/-+$//')
+```
+
+A branch already on origin keeps whatever slug it has; look it up with `git ls-remote --heads origin 'agent/local-spec-<n>-*'` rather than recomputing.
 
 ## Create
 
@@ -67,10 +73,11 @@ After a slice lands:
 ```sh
 git worktree remove --force "$root/issue-<m>"
 git branch -D agent/issue-<m>-<slug>
-[ "$CLAUDE_CODE_REMOTE" = true ] || git push origin --delete agent/issue-<m>-<slug>
+[ "$CLAUDE_CODE_REMOTE" = true ] || ! git ls-remote --exit-code --heads origin agent/issue-<m>-<slug> >/dev/null \
+  || git push origin --delete agent/issue-<m>-<slug>
 ```
 
-A cloud session's GitHub proxy rejects branch deletion, so there the remote branch stays; the repo's "Automatically delete head branches" setting removes it on merge.
+A repo with "Automatically delete head branches" on has already removed the remote branch at merge, so the delete runs only when it is still there. A cloud session's GitHub proxy rejects branch deletion, so there the remote branch stays until that setting removes it.
 
 At cleanup: remove the spec worktree the same way but keep the branch, local and remote, until the PR merges.
 
