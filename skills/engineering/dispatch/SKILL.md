@@ -40,9 +40,17 @@ Each line is `<spec> <TAG> <detail>`. Relay it in one line unless the table says
 
 ## The operator asks
 
-- "start <spec> …": `dispatch launch <spec> …`, and relay its line per spec: started, queued with the pressure that queued it, already running, or failed. `--force` starts despite pressure, only when the operator says so.
-- "drop <spec>" for a queued spec: `dispatch unqueue <spec>`.
-- "status": run `dispatch status` and show it.
-- "recover": Start's step 1 again.
-- "ack <spec>", or the operator has seen a PR: `dispatch ack <spec>`.
-- Anything else about a spec: answer from `dispatch status --json`. When that cannot answer it, say so and name the pane to open.
+The operator's commands. "help" prints the first two columns, one line per command, in this order.
+
+| Command | What it does | You run |
+|---|---|---|
+| `start <spec> …` | starts each spec in its own tab, or queues it when the box is under pressure | `dispatch launch <spec> …`, then relay its line per spec: started, queued and why, already running, or failed |
+| `start <spec> force` | starts despite pressure | `dispatch launch <spec> --force`; only on this explicit word |
+| `drop <spec>` | takes a spec off the queue | `dispatch unqueue <spec>` |
+| `status` | one line per spec, what needs you first | `dispatch status`, shown as it stands |
+| `pressure` | CPU, memory and test load, and whether a start would queue | `dispatch admit` |
+| `ack <spec>` | hides a finished spec's PR line | `dispatch ack <spec>`; also when the operator says they have seen the PR |
+| `recover` | proposes resume, restart or leave for each cut-off spec | Start's step 1 |
+| `help` | this list | print the first two columns |
+
+Anything else about a spec: answer from `dispatch status --json`. When that cannot answer it, say so and name the pane to open.
