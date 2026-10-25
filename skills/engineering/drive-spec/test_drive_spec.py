@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -268,7 +270,7 @@ elif parts[:1] == ["pulls"] and parts[2:] == ["merge"] and method == "PUT":
     p = next(p for p in st["pulls"] if p["number"] == int(parts[1]))
     if fields.get("sha") != sha(p["head"]):
         die("HTTP 409 head moved")
-    work = tempfile.mkdtemp()
+    work = tempfile.mkdtemp(dir=os.environ["FIX"])
     for cmd in (["clone", "-q", origin, work], ["-C", work, "checkout", "-q", p["base"]],
                 ["-C", work, "merge", "-q", "--no-ff", "-m", f"Merge pull request #{p['number']} from acme/{p['head']}",
                  f"origin/{p['head']}"], ["-C", work, "push", "-q", "origin", p["base"]]):
@@ -317,6 +319,7 @@ class Cli(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(self.reap)
         self.origin = self.tmp / "origin.git"
         self.repo = self.tmp / "repo"
         self.counter = self.tmp / "gate-runs"
@@ -351,6 +354,26 @@ class Cli(unittest.TestCase):
             },
         }
         self.save()
+
+    def reap(self):
+        (self.tmp / "go").write_text("")
+        own, under = os.getpgrp(), str(self.tmp)
+        left = [pid for pid, (_, state, cwd, cmd) in ds.process_tree().items()
+                if pid != os.getpid() and state not in "ZX" and (under in cmd or (cwd or "").startswith(under))]
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in left:
+                try:
+                    if os.getpgid(pid) == own:
+                        os.kill(pid, sig)
+                    else:
+                        os.killpg(os.getpgid(pid), sig)
+                except ProcessLookupError:
+                    pass
+            if sig == signal.SIGTERM:
+                time.sleep(0.2)
+        for pid in left:
+            assert_gone(self, pid)
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def issue(self, n, title, body, labels=()):
         return {"number": n, "title": title, "body": body, "state": "open", "labels": list(labels)}
@@ -622,6 +645,15 @@ class Verify(Cli):
         out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.001")
         self.assertEqual(out.returncode, 6)
         self.assertIn("waiting for the gate already running on", out.stdout)
+
+    def test_cleanup_stops_a_detached_gate_and_removes_its_files(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"verify": 'sleep 600 & echo $! > "$FIX/held.pid"; wait'}))
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.001").returncode, 6)
+        held = wait_for_pid(self.tmp / "held.pid")
+        self.doCleanups()
+        assert_gone(self, held)
+        self.assertFalse(self.tmp.exists())
 
     def test_pr_head_verified_outside_a_spec_run(self):
         out = self.run_ds("verify", "pr-33", str(self.wt), "--gate", "true")

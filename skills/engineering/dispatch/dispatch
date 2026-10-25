@@ -155,7 +155,7 @@ def snapshot(dirs):
     live = {r["spec"] for r in rows if r["herdr"] in ("working", "blocked") or r["session"] == "busy"}
     roots = {repo_root(d) for d in dirs}
     queued = [q for q in load_queue() if q["repo"] in roots and q["spec"] not in live]
-    verdict = admit() if queued else None
+    verdict = admit(roots) if queued else None
     for i, q in enumerate(queued):
         row = classify(q["spec"], None, None, None, acked)
         ready = i == 0 and not verdict["reasons"]
@@ -181,10 +181,12 @@ def classify(n, data, pane, session, acked):
         "age": None,
         "attention": None,
         "detail": None,
+        "acked": False,
     }
     if data:
         row.update(state=data.get("state"), step=data.get("step"), summary=data.get("summary"),
-                   pr_url=data.get("pr_url"), age=age(data.get("updated_at")))
+                   pr_url=data.get("pr_url"), age=age(data.get("updated_at")),
+                   acked=data.get("state") == "done" and acked.get(n) == data.get("updated_at"))
 
     state = row["state"]
     if herdr == "blocked":
@@ -229,6 +231,7 @@ def cmd_status(dirs, as_json):
     if as_json:
         print(json.dumps(rows, indent=2))
         return
+    rows = [r for r in rows if not (r["acked"] and r["herdr"] not in ("working", "blocked") and r["session"] != "busy")]
     needs = sorted((r for r in rows if r["attention"] in ORDER), key=lambda r: ORDER.index(r["attention"]))
     queued = [r for r in rows if r["state"] == "queued"]
     rest = [r for r in rows if r not in needs and r not in queued]
@@ -256,18 +259,27 @@ def pressure(kind, window):
     return 0.0
 
 
-def specs_in_tests():
-    """`drive-spec verify` processes, each running its gate under the host-wide verify lock or waiting for it."""
-    count = 0
-    for text in run(["ps", "-Ao", "args="]).splitlines():
-        argv = text.split()
-        if any(Path(a).name == "drive-spec" and argv[i + 1:i + 2] == ["verify"] for i, a in enumerate(argv[:2])):
-            count += 1
-    return count
+def specs_in_tests(roots):
+    """Worktrees inside one of `roots` with a `drive-spec verify` on them, running its gate under the host-wide verify
+    lock or waiting for it. Those on other paths, such as drive-spec's own test repos, are not counted."""
+    worktrees = set()
+    for text in run(["ps", "-Ao", "pid=,args="]).splitlines():
+        pid, *argv = text.split()
+        at = next((i for i, a in enumerate(argv[:2]) if Path(a).name == "drive-spec" and argv[i + 1:i + 2] == ["verify"]), None)
+        if at is None or len(argv) < at + 4:
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = ""
+        wt = Path(cwd or "/", argv[at + 3]).resolve()
+        if wt.is_dir() and any(str(wt).startswith(str(Path(r).resolve()) + "/") for r in roots):
+            worktrees.add(wt)
+    return len(worktrees)
 
 
-def admit():
-    cpu, mem, tests = pressure("cpu", "avg60"), pressure("memory", "avg10"), specs_in_tests()
+def admit(roots):
+    cpu, mem, tests = pressure("cpu", "avg60"), pressure("memory", "avg10"), specs_in_tests(roots)
     reasons = []
     if cpu > MAX_CPU:
         reasons.append(f"cpu {cpu:.0f}% > {MAX_CPU:.0f}%")
@@ -353,7 +365,7 @@ def cmd_launch(specs, dirs, force):
         if row.get("pane") and data.get("state") == "done":
             print(f"{spec} already done in {row['pane']}")
             continue
-        verdict = admit()
+        verdict = admit({repo_root(d) for d in dirs})
         if verdict["reasons"] and not force:
             enqueue(spec, root, "; ".join(verdict["reasons"]))
             print(f"{spec} queued: {'; '.join(verdict['reasons'])}")
@@ -456,8 +468,8 @@ def cmd_recover(dirs, actions):
             print(f"{n} {action} failed: {e}")
 
 
-def cmd_admit():
-    v = admit()
+def cmd_admit(dirs):
+    v = admit({repo_root(d) for d in dirs})
     print(f"cpu {v['cpu']:.1f}% (max {MAX_CPU:.0f}), memory {v['memory']:.1f}% (max {MAX_MEMORY:.0f}), "
           f"specs in tests {v['tests']} (max {MAX_TESTS - 1})")
     print("blocked: " + "; ".join(v["reasons"]) if v["reasons"] else "clear")
@@ -773,7 +785,7 @@ def main():
     elif args.cmd == "merges":
         cmd_merges(dirs)
     elif args.cmd == "admit":
-        cmd_admit()
+        cmd_admit(dirs)
     elif args.cmd == "unqueue":
         print(f"{args.spec} unqueued" if dequeue(args.spec, repo_root(dirs[0])) else f"{args.spec} was not queued")
 

@@ -6,7 +6,7 @@ A dispatcher over every drive-spec run on the machine: it watches them, starts n
 
 Python 3, standard library only. Run it from inside the repo, or pass `--repo PATH` (repeatable).
 
-- `dispatch status [--json]`: one line per spec, what needs the operator first.
+- `dispatch status [--json]`: one line per spec, what needs the operator first. A done spec acked since its last change, with no live pane or busy session, is left out; `--json` keeps it, with `"acked": true`.
 - `dispatch watch`: prints a line each time a spec starts or stops needing the operator, and nothing else. It wakes on status-file writes (inotify on Linux; on macOS, a once-a-second check of the files' mtimes) and herdr agent-state events (the herdr socket's `events.subscribe`), with a 60-second tick for stalls. Every 2 minutes it also runs `merges`.
 - `dispatch ack <spec>`: hides a done spec until its status changes. When it is `done` and its session idle, also closes its herdr tab; the session stays resumable with `claude --resume <session_id>` from its status file.
 - `dispatch answer <spec> <text>`: sends the operator's answer to a spec whose status is `waiting` on a blocking question, as a prompt into its pane that quotes the question. It refuses a spec that is not waiting, is still working, or has no pane, so an answer never lands mid-step.
@@ -26,7 +26,7 @@ A launch queues when any of these holds; each limit has an env override.
 |---|---|---|
 | `/proc/pressure/cpu` `some avg60` | > 40 | `DISPATCH_MAX_CPU` |
 | `/proc/pressure/memory` `some avg10` | > 5 | `DISPATCH_MAX_MEMORY` |
-| `drive-spec verify` processes (specs in their verify gate, running or waiting for the host-wide lock) | ≥ 2 | `DISPATCH_MAX_TESTS` |
+| Worktrees inside a watched repo with a `drive-spec verify` on them (specs in their verify gate, running or waiting for the host-wide lock); those elsewhere, such as drive-spec's test repos under `/tmp`, do not count | ≥ 2 | `DISPATCH_MAX_TESTS` |
 
 ## State
 
