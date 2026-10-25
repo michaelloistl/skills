@@ -304,7 +304,8 @@ CACHE_SKEW_SECONDS = 300
 
 def spec_issues(run):
     """Every issue whose body names the spec. The first call lists them all; later calls ask only for issues updated
-    since the last one (minus a margin for clock skew) and fold them into a cache in the notes directory. The list
+    since the last one (minus a margin for clock skew) and fold them into a cache in the notes directory, kept only
+    while a run is on (`gate` has pinned its start), so a plan read outside a run leaves no notes behind. The list
     endpoint's `since` is exact, unlike search, so an issue written seconds ago is still found."""
     cache = run.notes / "issues.json"
     try:
@@ -320,7 +321,8 @@ def spec_issues(run):
             known[i["number"]] = i
         else:
             known.pop(i["number"], None)
-    run.notes.mkdir(parents=True, exist_ok=True)
+    if not (run.notes / "run.json").is_file():
+        return list(known.values())
     tmp = cache.with_name(f".issues.{os.getpid()}.tmp")
     tmp.write_text(json.dumps({"fetched_at": datetime.fromtimestamp(begun, timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"), "issues": known}))

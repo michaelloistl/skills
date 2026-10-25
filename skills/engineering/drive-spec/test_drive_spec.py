@@ -461,6 +461,7 @@ class IssueCache(Cli):
         return [c for c in self.gh_state()["calls"] if "/issues?state=all" in c]
 
     def test_only_issues_updated_since_the_last_call_are_fetched(self):
+        self.run_ds("gate", "10", GATE)
         self.run_ds("plan", "10")
         self.edit_state(lambda st: st["issues"].update({"13": self.issue(13, "Add the button", "## Parent\n\n#10\n")}))
         out = self.run_ds("plan", "10")
@@ -469,7 +470,14 @@ class IssueCache(Cli):
         self.assertNotIn("since=", first)
         self.assertIn("since=", second)
 
+    def test_a_plan_outside_a_run_leaves_no_notes(self):
+        self.run_ds("plan", "10")
+        self.run_ds("plan", "10")
+        self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10").exists())
+        self.assertNotIn("since=", self.lists()[1])
+
     def test_an_issue_edited_away_from_the_spec_leaves_the_plan(self):
+        self.run_ds("gate", "10", GATE)
         self.run_ds("plan", "10")
         self.edit_state(lambda st: st["issues"]["12"].update(body="## Parent\n\n#99\n"))
         self.assertNotIn("#12", self.run_ds("plan", "10").stdout)
