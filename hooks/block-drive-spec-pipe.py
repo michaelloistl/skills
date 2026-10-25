@@ -11,6 +11,8 @@ COMMANDS = ("plan|gate|verify|integrate|land|progress|frontier|start|halt|open|p
             "|cleanup|finish|ask|answered")
 
 cmd = json.load(sys.stdin).get("tool_input", {}).get("command") or ""
+# A heredoc's body is text fed to a command, not shell: drop it, keeping the line that opens it.
+cmd = re.sub(r"(<<-?\s*(['\"]?)(\w+)\2[^\n]*\n).*?\n\s*\3[ \t]*(?=\n|$)", r"\1", cmd, flags=re.S)
 names = re.findall(r"\b([A-Za-z_]\w*)=[\"']?[^\s;\"']*drive-spec[\"']?(?=[\s;]|$)", cmd)
 callee = r"\S*drive-spec" + "".join(rf"|\$\{{?{n}\}}?" for n in names)
 

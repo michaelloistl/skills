@@ -10,19 +10,20 @@ One JSON file per spec, read by a dispatcher that watches every run on the machi
 
 ## When
 
-At the end of every step, and within step 6 at each dispatch, landing and halt. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
+At every step boundary, and within step 6 at each dispatch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
 
-| Step | Written by |
+| Step in progress | Written by |
 |---|---|
-| `resolve` | `drive-spec gate <spec> '<verify>' --base <base>` |
-| `guard` | `drive-spec plan <spec>`, only once `gate` has written `resolve`, so a plan read outside a run writes nothing; refused: `finish refused` |
-| `worktree` | `drive-spec open` |
-| `preview` | `drive-spec preview`; `paused` with `--dry-run` |
-| `explore` | `drive-spec explored`; conflicts: `finish conflicts` |
-| `build` | `start`, `land`, `halt`, `finish ceiling\|held` |
-| `review` | `drive-spec reviewed` |
-| `confirm` | `drive-spec confirm` |
-| `review-pr` | `drive-spec cleanup` as it starts; `finish done`, or `finish halted --step review-pr` |
+| `resolve` | nothing before `gate`; only `drive-spec ask` at step 1 |
+| `guard` | `drive-spec gate <spec> '<verify>' --base <base>`; refused: `finish refused` |
+| `worktree` | `drive-spec plan <spec>`, only once `gate` has written `guard`, so a plan read outside a run writes nothing |
+| `preview` | `drive-spec open` |
+| `explore` | `drive-spec preview` (`paused` at `preview` with `--dry-run`); conflicts: `finish conflicts` |
+| `build` | `explored`, `start`, `land`, `halt`, `finish ceiling\|held` |
+| `review` | `land` of the last slice, or `frontier` as it stops on `done` while the status still reads `build` |
+| `confirm` | `drive-spec reviewed` |
+| `cleanup` | `drive-spec confirm` |
+| `review-pr` | `drive-spec cleanup`; `finish done`, or `finish halted --step review-pr` |
 | any, `waiting` | `drive-spec ask`; `drive-spec answered` sets it `running` again |
 
 `step` is the step's name: `resolve`, `guard`, `worktree`, `preview`, `explore`, `build`, `review`, `confirm`, `cleanup`, `review-pr`.

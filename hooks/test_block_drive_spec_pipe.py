@@ -34,6 +34,7 @@ class BlockDriveSpecPipe(unittest.TestCase):
             "git log | tail",
             "python3 - <<'PY'\ns = 'run `drive-spec verify` and quote it'\nPY\nrg -n \"a|b\" x",
             'git commit -m "Run drive-spec open bare, not | tail"',
+            "python3 - <<'PY'\nedit('STATUS.md', '| `review` | `drive-spec frontier` as it stops |', 'x')\nPY",
         ):
             self.assertFalse(denied(command), command)
 

@@ -985,6 +985,18 @@ class Dispatcher(DispatcherCase):
         self.env["CLAUDE_CONFIG_DIR"] = str(self.tmp / "claude-default")
         self.assertEqual(self.row()["session"], "busy")
 
+    def test_review_reads_as_begun_once_the_frontier_stops_on_done(self):
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        self.land_11()
+        r = self.row()
+        self.assertEqual((r["step"], r["summary"]), ("review", "landed 2/2; reviewing the spec branch"))
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "step=build"], cwd=self.repo, env=self.env)
+        self.assertEqual(self.run_ds("frontier", "10").stdout, "stop: done\n")
+        self.assertEqual(self.status_file()["step"], "review")
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "summary=review round 2"], cwd=self.repo, env=self.env)
+        self.run_ds("frontier", "10")
+        self.assertEqual(self.status_file()["summary"], "review round 2")
+
     def test_launch_resumes_an_idle_pane_with_the_runs_next_command(self):
         prompts = self.tmp / "prompts"
         (self.tmp / "bin" / "herdr").write_text(
@@ -1033,7 +1045,7 @@ class Open(DispatcherCase):
         self.assertEqual(out.stdout, f"worktree {wt} on agent/local-spec-30-import-reports (cut from origin/main)\n")
         self.assertEqual(self.origin_sha("agent/local-spec-30-import-reports"), self.origin_sha("main"))
         st = json.loads((self.repo / ".git" / "drive-spec" / "status" / "spec-30.json").read_text())
-        self.assertEqual((st["step"], st["branch"], st["base"]), ("worktree", "agent/local-spec-30-import-reports", "main"))
+        self.assertEqual((st["step"], st["branch"], st["base"]), ("preview", "agent/local-spec-30-import-reports", "main"))
 
     def test_resume_takes_origin(self):
         self.remove_spec_worktree()
@@ -1042,7 +1054,7 @@ class Open(DispatcherCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("(resumed)", out.stdout)
         self.assertEqual(self.git(self.spec_wt, "rev-parse", "HEAD"), self.origin_sha("agent/local-spec-10-export"))
-        self.assertEqual(self.row()["step"], "worktree")
+        self.assertEqual(self.row()["step"], "preview")
 
     def test_resume_keeps_unpushed_local_commits(self):
         head = self.commit(self.spec_wt, "merged-base.txt", "m\n", "Merge main")
@@ -1098,7 +1110,7 @@ class Confirm(DispatcherCase):
                                           "- export runs inline, no job\n\nLeft from review:\n- rename ExportJob")
         self.assertTrue(spec_pr["draft"])
         r = self.row()
-        self.assertEqual((r["step"], r["pr_url"]), ("confirm", "https://github.com/acme/app/pull/101"))
+        self.assertEqual((r["step"], r["pr_url"]), ("cleanup", "https://github.com/acme/app/pull/101"))
 
     def test_no_deviations_and_opens_a_missing_spec_pr(self):
         self.edit_state(lambda st: [st["issues"][n].update(state="closed") for n in ("11", "12")])
@@ -1175,19 +1187,20 @@ class Boundaries(DispatcherCase):
                         "question=old?"], cwd=self.repo, env=self.env)
         self.assertEqual(self.run_ds("gate", "10", GATE).returncode, 0)
         st = self.status_file()
-        self.assertEqual((st["step"], st["state"], st["base"], st["question"]), ("resolve", "running", "main", None))
+        self.assertEqual((st["step"], st["state"], st["base"], st["question"]), ("guard", "running", "main", None))
         self.run_ds("gate", "10", GATE, "--base", "release")
         self.assertEqual(self.status_file()["base"], "release")
-        self.assertEqual(self.row()["step"], "resolve")
+        self.assertEqual(self.row()["step"], "guard")
 
     def test_plan_writes_guard_once(self):
         self.run_ds("plan", "10")
         self.assertFalse((self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").exists())
         self.run_ds("gate", "10", GATE)
         self.run_ds("plan", "10", "--json")
-        self.assertEqual(self.status_file()["step"], "resolve")
+        self.assertEqual(self.status_file()["step"], "guard")
         self.run_ds("plan", "10")
-        self.assertEqual((self.row()["step"], self.status_file()["summary"]), ("guard", "plan: landed 0/2; building #11"))
+        self.assertEqual((self.row()["step"], self.status_file()["summary"]),
+                         ("worktree", "plan: landed 0/2; building #11; opening the spec worktree"))
         self.run_ds("start", "10", "11")
         self.run_ds("plan", "10")
         self.assertEqual(self.status_file()["step"], "build")
@@ -1197,7 +1210,7 @@ class Boundaries(DispatcherCase):
         out = self.run_ds("open", "10")
         self.assertEqual(out.returncode, 5)
         self.assertIn("## main advanced: #5", out.stdout)
-        self.assertEqual(self.status_file()["step"], "worktree")
+        self.assertEqual(self.status_file()["step"], "preview")
         self.assertEqual(self.run_ds("open", "10").returncode, 0)
 
     def test_preview(self):
@@ -1207,7 +1220,7 @@ class Boundaries(DispatcherCase):
                                               f"{self.repo / '.claude' / 'worktrees'}\nmode: sequential\n"
                                               f"ceiling: none\n\nspec #10 Export reports\n"), out.stdout)
         self.assertTrue(self.comments(10)[0].startswith("<!-- implement-spec -->"))
-        self.assertEqual((self.row()["step"], self.row()["state"]), ("preview", "running"))
+        self.assertEqual((self.row()["step"], self.row()["state"]), ("explore", "running"))
 
     def test_dry_run_pauses_at_preview(self):
         self.run_ds("preview", "10", "--dry-run")
@@ -1233,7 +1246,7 @@ class Boundaries(DispatcherCase):
         (self.notes() / "conflicts.md").write_text("")
         out = self.run_ds("explored", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual((self.row()["step"], self.status_file()["next"]), ("explore", "build the frontier"))
+        self.assertEqual((self.row()["step"], self.status_file()["next"]), ("build", "drive-spec frontier"))
 
     def test_explored_halts_on_conflicts(self):
         self.run_ds("gate", "10", GATE)
@@ -1257,7 +1270,7 @@ class Boundaries(DispatcherCase):
         out = self.run_ds("reviewed", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         r = self.row()
-        self.assertEqual((r["step"], r["pr_url"]), ("review", "https://github.com/acme/app/pull/101"))
+        self.assertEqual((r["step"], r["pr_url"]), ("confirm", "https://github.com/acme/app/pull/101"))
         self.assertTrue(self.status_file()["summary"].startswith("review clean at "))
 
     def test_review_leftovers_carry_to_confirm_and_done(self):
@@ -1318,7 +1331,7 @@ class Questions(DispatcherCase):
         out = self.run_ds("ask", "10", "Public or sign-in?\n(a) public (b) sign-in. Recommend (a).")
         self.assertEqual(out.returncode, 0, out.stderr)
         r = self.row()
-        self.assertEqual((r["attention"], r["step"]), ("ASK", "resolve"))
+        self.assertEqual((r["attention"], r["step"]), ("ASK", "guard"))
         self.assertEqual(self.status_file()["question"], "Public or sign-in? (a) public (b) sign-in. Recommend (a).")
         out = self.run_ds("answered", "10", "public")
         self.assertEqual(out.returncode, 0, out.stderr)

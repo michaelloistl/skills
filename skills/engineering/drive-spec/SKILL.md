@@ -21,7 +21,7 @@ Reference, read when a step points at it:
 - [`IMPLEMENTER.md`](IMPLEMENTER.md) — the brief handed to each implementer subagent.
 - [`STATUS.md`](STATUS.md) — the status file, its states, how to ask the operator a question, and the inbox.
 
-Every step ends in a `drive-spec` command that writes its status per STATUS.md; the step names it. Its exit code is the verdict, so run each command bare, with nothing piped after it. Commands that read the dispatcher's inbox (STATUS.md, Inbox) exit 5 while notes wait: act on them, then run the command again. A decision only the operator can make goes through `drive-spec ask` and `drive-spec answered` (STATUS.md, Questions).
+Every step ends in a `drive-spec` command that marks the next step begun in the status file per STATUS.md; the step names it. Its exit code is the verdict, so run each command bare, with nothing piped after it. Commands that read the dispatcher's inbox (STATUS.md, Inbox) exit 5 while notes wait: act on them, then run the command again. A decision only the operator can make goes through `drive-spec ask` and `drive-spec answered` (STATUS.md, Questions).
 
 Communicate with subagents through context pointers: issue numbers, worktree paths, research notes, the `drive-spec verify` command. Everything else they read themselves.
 
@@ -33,7 +33,7 @@ An interim notification from a background subagent gets a one-line status; act o
 
    `localOnly` marks slices only the developer's machine can prove, such as tests that need a desktop app: `label` names them, and `proof` is a file in the repo saying how to prove one beyond the verify gate. In a cloud session these slices are **held**: never built, and anything they block waits. Locally they build one at a time, and their implementer also follows `proof`.
 
-2. **Guard the spec.** Run `drive-spec plan <spec>`, the script beside this file. It discovers the tracer-bullets and their blockers, orders them, and gives each slice's state: `closed`, `open-pr`, `in-flight`, `todo` or `held`. Exit 2 refuses the spec, with the reason on its `refuse:` line: run `drive-spec finish <spec> refused`, and stop. Done when the plan is printed: printed without `--json` in step 2, it also writes the step's status. Whenever a later step needs slice states again, run `drive-spec plan <spec> --json` rather than re-deriving them.
+2. **Guard the spec.** Run `drive-spec plan <spec>`, the script beside this file. It discovers the tracer-bullets and their blockers, orders them, and gives each slice's state: `closed`, `open-pr`, `in-flight`, `todo` or `held`. Exit 2 refuses the spec, with the reason on its `refuse:` line: run `drive-spec finish <spec> refused`, and stop. Done when the plan is printed: printed without `--json` in step 2, it also marks step 3 begun. Whenever a later step needs slice states again, run `drive-spec plan <spec> --json` rather than re-deriving them.
 
 3. **Open the spec worktree.** Branch `agent/local-spec-<n>-<slug>` — the `local-` segment is load-bearing: a repo whose CI advances specs off merges into `agent/spec-*` would otherwise dispatch the next slice itself on every merge here and build it twice. `drive-spec open <spec> --base <base>` reuses the worktree, resumes the branch from origin, or cuts it from `origin/<base>` and pushes it, bootstraps a new worktree, and writes `branch` and `base` to the status file. Done when it prints the worktree: it is then on the spec branch at origin's HEAD.
 

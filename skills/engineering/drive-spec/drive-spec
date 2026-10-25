@@ -327,9 +327,9 @@ def cmd_plan(spec, as_json):
     print(json.dumps(plan, indent=2) if as_json else render(plan))
     if plan["refuse"]:
         return REFUSE
-    if not as_json and run.current().get("step") in ("resolve", "guard"):
-        run.status(step="guard", state="running", summary=f"plan: {progress_summary(plan)}",
-                   next="open the spec worktree")
+    if not as_json and run.current().get("step") == "guard":
+        run.status(step="worktree", state="running", summary=f"plan: {progress_summary(plan)}; opening the spec "
+                   "worktree", next="drive-spec open")
     return 0
 
 
@@ -388,8 +388,8 @@ def cmd_gate(spec, command, base):
         (run.notes / "gate").write_text(command + "\n")
         (run.notes / "run.json").write_text(json.dumps({"started_at": stamp(), "gate": command}))
         base = base or run.base(fresh=True)
-        run.status(step="resolve", state="running", summary=f"resolved: base {base}, gate pinned",
-                   next="guard the spec", base=base, question="")
+        run.status(step="guard", state="running", summary=f"resolved: base {base}, gate pinned",
+                   next="drive-spec plan", base=base, question="")
         print(f"gate pinned: {command}" + (f" (was: {old})" if old and old != command else ""))
         return 0
     gate = pinned_gate(run) or run.config.get("verify")
@@ -839,8 +839,12 @@ def cmd_land(spec, m):
     with open(run.notes / "landed.jsonl", "a") as f:
         f.write(json.dumps({"slice": m, "pr": pr["number"], "at": stamp()}) + "\n")
     summary = progress_summary(plan)
-    run.status(step="build", state="running", summary=summary, pr_url=spec_pr["url"], branch=spec_branch,
-               next="integrate the next completed slice, or pick from the frontier")
+    if all(x["state"] == "closed" for x in plan["slices"]):
+        run.status(step="review", state="running", summary=f"{summary}; reviewing the spec branch",
+                   pr_url=spec_pr["url"], branch=spec_branch, next="drive-spec reviewed once a review raises nothing new")
+    else:
+        run.status(step="build", state="running", summary=summary, pr_url=spec_pr["url"], branch=spec_branch,
+                   next="integrate the next completed slice, or pick from the frontier")
     print(f"landed #{m} via #{pr['number']}; {summary}")
     return 0
 
@@ -930,6 +934,10 @@ def cmd_frontier(spec, running, sequential, max_slices, as_json):
     if f["stop"] == "blocked":
         raise Failed(", ".join(f"#{m}" for m in f["blocked"]) + " carries agent:blocked: the operator removes it "
                      "after fixing, and only then does the run go on", REFUSE)
+    if f["stop"] == "done" and run.current().get("step") == "build":
+        # The last slice closed outside `land` (closed by hand, or on a resume): mark review begun here.
+        run.status(step="review", state="running", summary=f"{progress_summary(plan)}; reviewing the spec branch",
+                   next="drive-spec reviewed once a review raises nothing new")
     print(json.dumps(f, indent=2) if as_json else render_picks(f))
     return 0
 
@@ -1084,7 +1092,7 @@ def cmd_open(spec, base):
         code = subprocess.run(["sh", "-c", bootstrap], cwd=wt).returncode
         if code != 0:
             raise Failed(f"bootstrap exited {code} in {wt}")
-    run.status(step="worktree", state="running", summary=f"spec worktree {how}: {branch}", next="preview",
+    run.status(step="preview", state="running", summary=f"spec worktree {how}: {branch}", next="drive-spec preview",
                branch=branch, base=base)
     print(f"worktree {wt} on {branch} ({how})")
     return INBOX if inbox(run) else 0
@@ -1107,7 +1115,9 @@ def cmd_preview(spec, sequential, max_slices, dry_run):
     if dry_run:
         run.status(step="preview", state="paused", summary=f"dry run: {summary}", next=f"/drive-spec {spec}")
     else:
-        run.status(step="preview", state="running", summary=summary, next="explore the open slices")
+        open_ = sum(x["state"] != "closed" for x in plan["slices"])
+        run.status(step="explore", state="running", summary=f"{summary}; exploring {open_} open slice(s)",
+                   next="drive-spec explored once the notes and conflicts.md are written")
     return 0
 
 
@@ -1135,8 +1145,8 @@ def cmd_explored(spec):
         finish(run, "conflicts")
         return CONFLICT
     open_ = sum(x["state"] != "closed" for x in plan["slices"])
-    run.status(step="explore", state="running", summary=f"explored {open_} open slice(s), no conflicts; "
-               f"{progress_summary(plan)}", next="build the frontier", branch=plan["spec_branch"])
+    run.status(step="build", state="running", summary=f"explored {open_} open slice(s), no conflicts; "
+               f"{progress_summary(plan)}", next="drive-spec frontier", branch=plan["spec_branch"])
     print(f"explored: notes for {open_} open slice(s), no conflicts")
     return 0
 
@@ -1166,7 +1176,7 @@ def cmd_reviewed(spec, left):
         kept.unlink(missing_ok=True)
     spec_pr = spec_pr_of(run, run.base(), branch)
     summary = "review left findings open" if kept.exists() else "review clean"
-    run.status(step="review", state="running", summary=f"{summary} at {head[:12]}", next="confirm the spec PR",
+    run.status(step="confirm", state="running", summary=f"{summary} at {head[:12]}", next="drive-spec confirm",
                branch=branch, **({"pr_url": spec_pr["url"]} if spec_pr else {}))
     print(f"{summary} at {head[:12]}")
     return 0
@@ -1214,7 +1224,7 @@ def cmd_confirm(spec, left):
     gh("-X", "PATCH", f"repos/{run.repo}/pulls/{spec_pr['number']}", "-f", f"body={body}", "--silent")
     post_progress(run, plan, base, spec_pr)
     summary = f"spec PR #{spec_pr['number']} closes #{spec}; {len(found)} slice(s) with deviations"
-    run.status(step="confirm", state="running", summary=summary, next="clean up", pr_url=spec_pr["url"],
+    run.status(step="cleanup", state="running", summary=summary, next="drive-spec cleanup", pr_url=spec_pr["url"],
                branch=plan["spec_branch"])
     print(f"{summary}: {spec_pr['url']}")
     return 0
