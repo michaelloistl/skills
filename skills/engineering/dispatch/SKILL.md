@@ -44,7 +44,7 @@ The operator's commands. "help" prints the first two columns, one line per comma
 
 | Command | What it does | You run |
 |---|---|---|
-| `start <spec> …` | starts each spec in its own tab, or queues it when the box is under pressure | `dispatch launch <spec> …`, then relay its line per spec: started, queued and why, already running, or failed |
+| `start <spec> …` | starts each spec in its own tab, or queues it when the box is under pressure | `dispatch launch <spec> …`, then relay its line per spec: started, resumed in its idle pane, queued and why, already running, or failed |
 | `start <spec> force` | starts despite pressure | `dispatch launch <spec> --force`; only on this explicit word |
 | `answer <spec> <text>` | sends your answer to a spec waiting on its question | `dispatch answer <spec> <text>`, with the operator's words exactly as written; relay its line. A refusal (not waiting, still working, no pane) is relayed as is, and the answer is sent only when the operator asks again |
 | `drop <spec>` | takes a spec off the queue | `dispatch unqueue <spec>` |

@@ -152,7 +152,7 @@ def snapshot(dirs):
     for n in sorted(set(files) | set(pane_of) | set(session_of), key=lambda x: int(x) if x.isdigit() else 0):
         rows.append(classify(n, files.get(n), pane_of.get(n), session_of.get(n), acked))
 
-    live = {r["spec"] for r in rows if r["pane"] or r["session"]}
+    live = {r["spec"] for r in rows if r["herdr"] in ("working", "blocked") or r["session"] == "busy"}
     roots = {repo_root(d) for d in dirs}
     queued = [q for q in load_queue() if q["repo"] in roots and q["spec"] not in live]
     verdict = admit() if queued else None
@@ -340,10 +340,18 @@ def start(spec, root, session=None):
 def cmd_launch(specs, dirs, force):
     root = repo_root(dirs[0])
     rows = {r["spec"]: r for r in snapshot(dirs[:1])}
+    files = read_status_files(dirs[:1])
     for spec in specs:
-        row = rows.get(spec, {})
-        if row.get("pane") or row.get("session"):
+        row, data = rows.get(spec, {}), files.get(spec, {})
+        active = row.get("herdr") in ("working", "blocked") or row.get("session") == "busy"
+        if active or (row.get("session") and not row.get("pane")):
             print(f"{spec} already running in {row.get('pane') or 'a Claude session outside herdr'}")
+            continue
+        if row.get("pane") and row.get("attention") == "ASK":
+            print(f"{spec} waiting on its question in {row['pane']}: send the answer with dispatch answer")
+            continue
+        if row.get("pane") and data.get("state") == "done":
+            print(f"{spec} already done in {row['pane']}")
             continue
         verdict = admit()
         if verdict["reasons"] and not force:
@@ -351,6 +359,15 @@ def cmd_launch(specs, dirs, force):
             print(f"{spec} queued: {'; '.join(verdict['reasons'])}")
             continue
         try:
+            if row.get("pane"):
+                # Its session sits idle in its own pane, after a halt or pause: resume it there, with the
+                # command the run left in `next`, rather than a second session in a new tab.
+                nxt = data.get("next") or ""
+                prompt = nxt if data.get("state") in ("halted", "paused") and nxt.startswith("/") else f"/drive-spec {spec}"
+                herdr_json("agent", "prompt", row["pane"], prompt)
+                was_queued = dequeue(spec, root)
+                print(f"{spec} resumed in {row['pane']} with {prompt}{' from the queue' if was_queued else ''}")
+                continue
             tab_id, pane = start(spec, root)
         except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
             print(f"{spec} failed to start: {e}")

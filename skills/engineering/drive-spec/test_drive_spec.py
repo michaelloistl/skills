@@ -985,6 +985,33 @@ class Dispatcher(DispatcherCase):
         self.env["CLAUDE_CONFIG_DIR"] = str(self.tmp / "claude-default")
         self.assertEqual(self.row()["session"], "busy")
 
+    def test_launch_resumes_an_idle_pane_with_the_runs_next_command(self):
+        prompts = self.tmp / "prompts"
+        (self.tmp / "bin" / "herdr").write_text(
+            '#!/bin/sh\nif [ "$1 $2" = "agent list" ]; then\n'
+            f'echo \'{{"result": {{"agents": [{{"pane_id": "p1", "agent_status": "{{STATUS}}"}}]}}}}\'\n'
+            f'else echo "$@" >> {prompts}; echo "{{}}"; fi\n')
+        herdr = self.tmp / "bin" / "herdr"
+        template = herdr.read_text()
+        env = dict(self.env, HERDR_PANE_ID="p1", XDG_STATE_HOME=str(self.tmp / "state"), DISPATCH_MAX_TESTS="99",
+                   DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101")
+
+        def launch(status):
+            herdr.write_text(template.replace("{STATUS}", status))
+            prompts.unlink(missing_ok=True)
+            out = subprocess.run([str(DISPATCH), "--repo", str(self.repo), "launch", "10"], capture_output=True,
+                                 text=True, env=env)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return out.stdout.strip(), prompts.read_text().strip() if prompts.exists() else None
+
+        self.env["HERDR_PANE_ID"] = "p1"
+        self.run_ds("finish", "10", "halted", "--why", "fix pass red", "--step", "review-pr",
+                    "--resume", "/review-fix-pr 101")
+        self.assertEqual(launch("working"), ("10 already running in p1", None))
+        self.assertEqual(launch("done"), ("10 resumed in p1 with /review-fix-pr 101", "agent prompt p1 /review-fix-pr 101"))
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "state=running", "step=build"], cwd=self.repo, env=env)
+        self.assertEqual(launch("idle"), ("10 resumed in p1 with /drive-spec 10", "agent prompt p1 /drive-spec 10"))
+
     def test_refusal_halts_at_guard(self):
         self.edit_state(lambda st: st["issues"]["10"].update(body="## Parent\n\n#1\n"))
         self.run_ds("finish", "10", "refused")
