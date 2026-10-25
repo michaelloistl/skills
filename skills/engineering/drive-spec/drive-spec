@@ -3,6 +3,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,7 @@ TIMED_OUT = 124
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 HEARTBEAT_SECONDS = float(os.environ.get("DRIVE_SPEC_HEARTBEAT_SECONDS", 300))
 SPEC_MOVES = 5
-REFUSE, CONFLICT, RED, INBOX = 2, 3, 4, 5
+REFUSE, CONFLICT, RED, INBOX, PENDING = 2, 3, 4, 5, 6
 LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
 
 
@@ -298,13 +299,39 @@ class Run:
                        cwd=self.repo_dir, timeout=60)
 
 
+CACHE_SKEW_SECONDS = 300
+
+
+def spec_issues(run):
+    """Every issue whose body names the spec. The first call lists them all; later calls ask only for issues updated
+    since the last one (minus a margin for clock skew) and fold them into a cache in the notes directory. The list
+    endpoint's `since` is exact, unlike search, so an issue written seconds ago is still found."""
+    cache = run.notes / "issues.json"
+    try:
+        data = json.loads(cache.read_text())
+        known, since = {int(k): v for k, v in data["issues"].items()}, data["fetched_at"]
+    except (OSError, ValueError, KeyError):
+        known, since = {}, None
+    begun = datetime.now(timezone.utc).timestamp() - CACHE_SKEW_SECONDS
+    query = f"repos/{run.repo}/issues?state=all&per_page=100" + (f"&since={since}" if since else "")
+    for i in json_lines(gh("--paginate", query,
+                           "--jq", ".[] | {number,title,body,state,pull_request,labels: [.labels[].name]}")):
+        if f"#{run.spec}" in (i.get("body") or ""):
+            known[i["number"]] = i
+        else:
+            known.pop(i["number"], None)
+    run.notes.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_name(f".issues.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"fetched_at": datetime.fromtimestamp(begun, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"), "issues": known}))
+    os.replace(tmp, cache)
+    return list(known.values())
+
+
 def fetch(run):
     spec, repo = run.spec, run.repo
     spec_issue = json.loads(gh(f"repos/{repo}/issues/{spec}", "--jq", "{number,title,body,state,pull_request}"))
-    issues = [i for i in json_lines(gh(
-        "--paginate", f"repos/{repo}/issues?state=all&per_page=100",
-        "--jq", ".[] | {number,title,body,state,pull_request,labels: [.labels[].name]}"))
-        if f"#{spec}" in (i.get("body") or "")]
+    issues = spec_issues(run)
     heads = run.heads()
     try:
         sub_issues = [i["number"] for i in json_lines(gh(
@@ -474,9 +501,10 @@ def stop_group(proc):
     proc.wait()
 
 
-def run_gate(gate, wt, out, minutes, heartbeat):
+def run_gate(gate, wt, out, minutes, heartbeat, started=lambda pgid: None):
     """Run the gate in a process group of its own, stopped whole when it overruns or this script is killed."""
     proc = subprocess.Popen(["sh", "-c", gate], cwd=wt, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    started(proc.pid)
 
     def killed(signum, _frame):
         stop_group(proc)
@@ -503,14 +531,188 @@ def run_gate_of(run):
     return pinned_gate(run) or run.config.get("verify")
 
 
+def tree_of(run, sha):
+    try:
+        return git(run.repo_dir, "rev-parse", f"{sha}^{{tree}}")
+    except Failed:
+        return None
+
+
 def green(run, sha, gate):
-    """A green verdict on this commit from this gate: one from any other gate decides nothing."""
+    """A green verdict from this gate on this commit, or on another with the very same tree (a merge commit
+    GitHub made from a verified head): one from any other gate decides nothing."""
     rec = record(run, sha)
-    return rec.get("exit") == 0 and rec.get("gate") == gate
+    if rec.get("exit") == 0 and rec.get("gate") == gate:
+        return True
+    tree = tree_of(run, sha)
+    try:
+        same = json.loads((run.notes / "verified" / f"tree-{tree}.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(tree) and same.get("exit") == 0 and same.get("gate") == gate
 
 
-def verify(run, wt, gate=None):
-    """Run the gate on the worktree's HEAD and record the verdict against that commit. True when green."""
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] not in "ZX"
+    except (OSError, IndexError):
+        return True
+
+
+def claim_file(run, sha):
+    return run.notes / "running" / f"{sha}.json"
+
+
+def runner(run, sha):
+    """The live gate run on this commit, as its claim records it, or None. A dead runner's claim is cleared."""
+    f = claim_file(run, sha)
+    try:
+        info = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+    if alive(info["pid"]):
+        return info
+    f.unlink(missing_ok=True)
+    return None
+
+
+def runners(run, wt=None):
+    """Every live gate run of this spec, or of those inside `wt`."""
+    d = run.notes / "running"
+    found = [r for f in sorted(d.glob("*.json")) if (r := runner(run, f.stem))] if d.is_dir() else []
+    if wt is not None:
+        wt = os.path.realpath(wt)
+        found = [r for r in found if r["wt"] == wt or r["wt"].startswith(wt + "/")]
+    return found
+
+
+def write_claim(run, sha, info, exclusive):
+    """Write the claim whole, so a reader never sees half of one; `exclusive` fails when a claim is already there."""
+    f = claim_file(run, sha)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f".{sha}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(info))
+    try:
+        if exclusive:
+            os.link(tmp, f)
+        else:
+            os.replace(tmp, f)
+            return True
+    except FileExistsError:
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+    return True
+
+
+def claim(run, sha, wt, gate):
+    """Become the one run of the gate on this commit. False when a live run already holds it."""
+    info = {"pid": os.getpid(), "pgid": None, "sha": sha, "wt": os.path.realpath(wt), "gate": gate,
+            "started_at": now()}
+    for _ in range(2):
+        if write_claim(run, sha, info, exclusive=True):
+            return True
+        if runner(run, sha):
+            return False
+    return False
+
+
+def run_claimed(run, wt, head, gate):
+    """Run the gate on a claimed commit and record its verdict; the claim goes when this does."""
+    try:
+        heartbeat = Heartbeat(run)
+        minutes = run.config.get("verifyTimeoutMinutes") or VERIFY_TIMEOUT_MINUTES
+        logs = run.notes / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log = logs / f"{head}.log"
+        lock = verify_lock(head, wt, heartbeat)
+        try:
+            if green(run, head, gate):
+                return
+            info = runner(run, head) or {}
+
+            def started(pgid):
+                write_claim(run, head, dict(info, pgid=pgid), exclusive=False)
+
+            begun = now()
+            with open(log, "w") as out:
+                code = run_gate(gate, wt, out, minutes, heartbeat, started)
+        finally:
+            release(lock)
+        if git(wt, "rev-parse", "HEAD") != head:
+            raise Failed(f"HEAD moved while the gate ran on {head[:12]}: nothing recorded")
+        (run.notes / "verified").mkdir(exist_ok=True)
+        verdict = json.dumps({"sha": head, "tree": tree_of(run, head), "gate": gate, "exit": code,
+                              "started_at": begun, "finished_at": now(), "log": str(log), "minutes": minutes})
+        (run.notes / "verified" / f"{head}.json").write_text(verdict)
+        if code == 0:
+            (run.notes / "verified" / f"tree-{tree_of(run, head)}.json").write_text(verdict)
+    finally:
+        claim_file(run, head).unlink(missing_ok=True)
+
+
+def report(rec):
+    """Print a verdict the way every caller reads it. True when green."""
+    head = rec["sha"]
+    if rec["exit"] == 0:
+        print(f"green {head[:12]}")
+        return True
+    log = Path(rec["log"])
+    try:
+        print("".join(log.read_text().splitlines(keepends=True)[-40:]), end="")
+    except OSError:
+        pass
+    minutes = rec.get("minutes") or VERIFY_TIMEOUT_MINUTES
+    print(f"red {head[:12]}: " + (f"timed out after {minutes:g} minutes" if rec["exit"] == TIMED_OUT
+                                  else f"exit {rec['exit']}") + f"; log {log}")
+    return False
+
+
+def attach(run, head, deadline, worker=None, heartbeat=None):
+    """Wait for the run on this commit to end. Its record, or None when the deadline comes first."""
+    heartbeat = heartbeat or Heartbeat(run)
+    while True:
+        if not runner(run, head) and not (worker and worker.poll() is None):
+            return record(run, head) or {"sha": head, "missing": True}
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        heartbeat.beat()
+        time.sleep(max(POLL_SECONDS, 0.05) if POLL_SECONDS else 0.05)
+
+
+def settle(run, wt, deadline, keep=None):
+    """Wait out every gate still running inside `wt` (but the one on `keep`). False when the deadline comes first."""
+    for r in runners(run, wt):
+        if r["sha"] == keep:
+            continue
+        print(f"waiting for the gate already running on {r['sha'][:12]} in this worktree", flush=True)
+        if attach(run, r["sha"], deadline) is None:
+            return False
+    return True
+
+
+def pending(head, wait):
+    print(f"running {head[:12]}: the gate is still running after {wait:g} minutes; run this same command again "
+          "to keep waiting")
+
+
+def spawn_worker(run, wt, gate):
+    cmd = [str(Path(__file__).resolve()), "verify", str(run.spec), str(wt), "--worker"]
+    if isinstance(run.spec, str):
+        cmd += ["--gate", gate]
+    return subprocess.Popen(cmd, cwd=run.repo_dir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def verify(run, wt, gate=None, wait=None):
+    """Run the gate on the worktree's HEAD, or attach to the run already on it, and report the verdict.
+    True when green, False when red, None when `wait` minutes passed first: the gate runs on, detached."""
     wt = Path(wt).resolve()
     if dirty(wt):
         raise Failed(f"{wt} has uncommitted changes: commit them first, the verdict is recorded against a commit",
@@ -522,36 +724,41 @@ def verify(run, wt, gate=None):
     if green(run, head, gate):
         print(f"green {head[:12]} (already verified)")
         return True
-    minutes = run.config.get("verifyTimeoutMinutes") or VERIFY_TIMEOUT_MINUTES
-    logs = run.notes / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    log = logs / f"{head}.log"
-    heartbeat = Heartbeat(run)
-    lock = verify_lock(head, wt, heartbeat)
-    started = now()
-    try:
-        with open(log, "w") as out:
-            code = run_gate(gate, wt, out, minutes, heartbeat)
-    finally:
-        release(lock)
-    if git(wt, "rev-parse", "HEAD") != head:
-        raise Failed(f"HEAD moved while the gate ran on {head[:12]}: nothing recorded")
-    (run.notes / "verified").mkdir(exist_ok=True)
-    (run.notes / "verified" / f"{head}.json").write_text(json.dumps(
-        {"sha": head, "gate": gate, "exit": code, "started_at": started, "finished_at": now(), "log": str(log)}))
-    if code == 0:
-        print(f"green {head[:12]}")
-        return True
-    print("".join(log.read_text().splitlines(keepends=True)[-40:]), end="")
-    print(f"red {head[:12]}: " + (f"timed out after {minutes:g} minutes" if code == TIMED_OUT else f"exit {code}")
-          + f"; log {log}")
-    return False
+    deadline = None if wait is None else time.monotonic() + wait * 60
+    if not settle(run, wt, deadline, keep=head):
+        pending(head, wait)
+        return None
+    worker = None
+    held = runner(run, head)
+    if held:
+        print(f"attached to the gate already running on {head[:12]} (pid {held['pid']})", flush=True)
+    elif wait is None:
+        if claim(run, head, wt, gate):
+            run_claimed(run, wt, head, gate)
+    else:
+        worker = spawn_worker(run, wt, gate)
+    rec = attach(run, head, deadline, worker)
+    if rec is None:
+        pending(head, wait)
+        return None
+    if rec.get("missing") or rec.get("gate") != gate:
+        raise Failed(f"the gate run on {head[:12]} ended without a verdict; log {run.notes / 'logs' / f'{head}.log'}")
+    return report(rec)
 
 
-def cmd_verify(spec, wt, gate):
+def cmd_verify(spec, wt, gate, wait, worker):
     if gate and not isinstance(spec, str):
         raise Failed("--gate goes with pr-<n> only: a spec's verdicts come from its pinned gate", REFUSE)
-    return 0 if verify(Run(spec), wt, gate) else RED
+    run = Run(spec)
+    if worker:
+        wt = Path(wt).resolve()
+        head = git(wt, "rev-parse", "HEAD")
+        gate = gate or run_gate_of(run)
+        if claim(run, head, wt, gate):
+            run_claimed(run, wt, head, gate)
+        return 0
+    result = verify(run, wt, gate, wait)
+    return PENDING if result is None else 0 if result else RED
 
 
 def process_tree(cwds=True):
@@ -589,38 +796,38 @@ def process_tree(cwds=True):
     return procs
 
 
-def stop_processes_in(wt):
-    """Stop what still runs inside a worktree about to be removed: a gate or shell left there would run on in a
-    deleted directory and could hold the verify lock for good. Spares this script and its ancestors."""
+def stop_gates_in(run, wt):
+    """Stop the gate runs recorded inside a worktree about to be removed: one left there would run on in a deleted
+    directory and could hold the verify lock for good. Anything else still running there is named, not stopped."""
     wt = os.path.realpath(wt)
+    for r in runners(run, wt):
+        print(f"stopped the gate on {r['sha'][:12]} in {Path(wt).name} (pid {r['pid']})")
+        for kill in (lambda: os.kill(r["pid"], signal.SIGTERM), lambda: r["pgid"] and os.killpg(r["pgid"], signal.SIGTERM)):
+            try:
+                kill()
+            except ProcessLookupError:
+                pass
+        deadline = time.time() + 10
+        while alive(r["pid"]) and time.time() < deadline:
+            time.sleep(0.1)
+        for kill in (lambda: os.kill(r["pid"], signal.SIGKILL), lambda: r["pgid"] and os.killpg(r["pgid"], signal.SIGKILL)):
+            try:
+                kill()
+            except ProcessLookupError:
+                pass
+        claim_file(run, r["sha"]).unlink(missing_ok=True)
     procs = process_tree()
     spared, pid = set(), os.getpid()
     while pid in procs and pid not in spared:
         spared.add(pid)
         pid = procs[pid][0]
-    inside = [pid for pid, (_, state, cwd, _) in procs.items()
-              if pid not in spared and state not in "ZX" and cwd and (cwd == wt or cwd.startswith(wt + "/"))]
-    for pid in inside:
-        print(f"stopped pid {pid} in {Path(wt).name}: {procs[pid][3][:100] or '?'}")
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.time() + 10
-    while inside and time.time() < deadline:
-        live = process_tree(cwds=False)
-        inside = [pid for pid in inside if pid in live and live[pid][1] not in "ZX"]
-        if inside:
-            time.sleep(0.2)
-    for pid in inside:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    for pid, (_, state, cwd, cmd) in sorted(procs.items()):
+        if pid not in spared and state not in "ZX" and cwd and (cwd == wt or cwd.startswith(wt + "/")):
+            print(f"still running in {Path(wt).name}, not stopped: pid {pid} {cmd[:100] or '?'}")
 
 
 def remove_worktree(run, wt):
-    stop_processes_in(wt)
+    stop_gates_in(run, wt)
     git(run.repo_dir, "worktree", "remove", "--force", str(wt))
 
 
@@ -662,8 +869,9 @@ def merge_pr(run, pr, head):
     return True
 
 
-def cmd_integrate(spec, m, deviations):
+def cmd_integrate(spec, m, deviations, wait=None):
     run = Run(spec)
+    deadline = None if wait is None else time.monotonic() + wait * 60
     wt, branch = slice_worktree(run, m)
     if Path(git(wt, "rev-parse", "--absolute-git-dir"), "MERGE_HEAD").exists():
         raise Failed(f"a merge is in progress in {wt}: commit or abort it first", REFUSE)
@@ -702,6 +910,9 @@ def cmd_integrate(spec, m, deviations):
         print(f"opened #{pr}")
 
     for _ in range(SPEC_MOVES):
+        if not settle(run, wt, deadline):
+            print(f"#{m}: a gate still runs in {wt}; run `drive-spec integrate {spec} {m}` again to keep waiting")
+            return PENDING
         git(wt, "fetch", "--quiet", "origin")
         target = git(wt, "rev-parse", f"origin/{spec_branch}")
         try:
@@ -715,7 +926,12 @@ def cmd_integrate(spec, m, deviations):
             print(f"next: a merger subagent runs `git merge {target}` in {wt}, resolves every conflict and "
                   f"commits; then `drive-spec integrate {spec} {m}` again")
             return CONFLICT
-        if not verify(run, wt):
+        left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
+        verdict = verify(run, wt, wait=left)
+        if verdict is None:
+            print(f"#{m}: run `drive-spec integrate {spec} {m}` again to keep waiting; it picks up where this stopped")
+            return PENDING
+        if not verdict:
             print(f"#{m} is red on the spec branch: halt the run; worktree kept at {wt}")
             return RED
         head = git(wt, "rev-parse", "HEAD")
@@ -959,23 +1175,65 @@ def ensure_excluded(run):
             f.write(rel + "\n")
 
 
-def brief(run, m, wt, base, continuing, local_only):
-    text = Path(__file__).resolve().with_name("IMPLEMENTER.md").read_text()
+def bootstrap(run, wt):
+    """Bootstrap a worktree until it has succeeded once with this command: a marker in the worktree's own git dir
+    records it, so a worktree whose bootstrap failed is bootstrapped again on the next try. Output goes to a log."""
+    command = run.config.get("bootstrap")
+    if not command:
+        return
+    marker = Path(git(wt, "rev-parse", "--absolute-git-dir")) / "drive-spec-bootstrap"
+    digest = hashlib.sha256(command.encode()).hexdigest()
+    try:
+        if marker.read_text().strip() == digest:
+            return
+    except OSError:
+        pass
+    logs = run.notes / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"bootstrap-{Path(wt).name}.log"
+    with open(log, "w") as out:
+        code = subprocess.run(["sh", "-c", command], cwd=wt, stdin=subprocess.DEVNULL, stdout=out,
+                              stderr=subprocess.STDOUT).returncode
+    if code != 0:
+        print("".join(log.read_text().splitlines(keepends=True)[-40:]), end="")
+        raise Failed(f"bootstrap exited {code} in {wt}; log {log}. Fix the cause, then run this command again: "
+                     "it bootstraps again until one succeeds")
+    marker.write_text(digest + "\n")
+    print(f"bootstrapped {Path(wt).name}; log {log}")
+
+
+def fill(name, values, conditions=None):
+    """A brief from its template file: the markdown block, `<If x: "...">` kept when `x` holds, placeholders filled.
+    A placeholder left unfilled fails the command, so a new one goes into its caller too."""
+    text = Path(__file__).resolve().with_name(name).read_text()
     body = text.split("```markdown\n", 1)[1].rsplit("\n```", 1)[0]
-    local = run.config.get("localOnly") or {}
-    body = re.sub(r'<If continuing: "(.*?)">', lambda x: x.group(1) if continuing else "", body)
-    body = re.sub(r'<If localOnly: "(.*?)">', lambda x: x.group(1) if local_only else "", body)
-    decided = (run.notes / "decisions.md").is_file()
-    body = re.sub(r'<If decided: "(.*?)">', lambda x: x.group(1) if decided else "", body)
-    for key, value in {"<path>": wt, "<m>": m, "<repo>": run.repo, "<spec>": run.spec, "<base>": f"origin/{base}",
-                       "<notes>": run.notes, "<skill dir>": Path(__file__).resolve().parent,
-                       "<label>": local.get("label", ""), "<proof>": local.get("proof", "")}.items():
-        body = body.replace(key, str(value))
+    for key, keep in (conditions or {}).items():
+        body = re.sub(rf'<If {key}: "(.*?)">', lambda x: x.group(1) if keep else "", body)
+    for key, value in values.items():
+        body = body.replace(f"<{key}>", str(value))
     body = re.sub(r" +\n", "\n", body).strip()
     left = re.findall(r"<(?:If [A-Za-z]+:[^>]*|[a-z][a-z ]*)>", body)
     if left:
-        raise Failed(f"IMPLEMENTER.md has placeholders start does not fill: {', '.join(left)}")
+        raise Failed(f"{name} has placeholders the script does not fill: {', '.join(left)}")
     return body
+
+
+def brief(run, m, wt, base, continuing, local_only):
+    local = run.config.get("localOnly") or {}
+    return fill("IMPLEMENTER.md", {
+        "path": wt, "m": m, "repo": run.repo, "spec": run.spec, "base": f"origin/{base}", "notes": run.notes,
+        "skill dir": Path(__file__).resolve().parent, "label": local.get("label", ""),
+        "proof": local.get("proof", "")}, {
+        "continuing": continuing, "localOnly": local_only, "decided": (run.notes / "decisions.md").is_file(),
+        "covered": bool(owned_requirements(run, m))})
+
+
+def write_brief(run, name, text):
+    run.notes.mkdir(parents=True, exist_ok=True)
+    path = run.notes / name
+    path.write_text(text + "\n")
+    print(f"brief: {path}")
+    return path
 
 
 def cmd_start(spec, m):
@@ -998,7 +1256,6 @@ def cmd_start(spec, m):
     ensure_excluded(run)
     wt = run.root / f"issue-{m}"
     prefix = f"agent/issue-{m}-"
-    created = False
     if wt.is_dir():
         branch = git(wt, "branch", "--show-current")
         if not branch.startswith(prefix):
@@ -1022,12 +1279,7 @@ def cmd_start(spec, m):
             else:
                 start = f"origin/{plan['spec_branch']}"
             git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, start)
-        created = True
-    bootstrap = run.config.get("bootstrap")
-    if created and bootstrap:
-        code = subprocess.run(["sh", "-c", bootstrap], cwd=wt).returncode
-        if code != 0:
-            raise Failed(f"bootstrap exited {code} in {wt}")
+    bootstrap(run, wt)
     if "agent:in-progress" not in s["labels"]:
         add_label(run, m, "agent:in-progress")
         s["labels"].append("agent:in-progress")
@@ -1040,8 +1292,9 @@ def cmd_start(spec, m):
     base = run.base()
     continuing = git(wt, "rev-list", "--count", f"origin/{plan['spec_branch']}..HEAD") != "0"
     local_label = (run.config.get("localOnly") or {}).get("label")
-    print("brief:\n")
-    print(brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"]))
+    path = write_brief(run, f"brief-{m}.md",
+                       brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"]))
+    print(f"next: an implementer subagent with the prompt `Read {path} and follow it.`")
     return 0
 
 
@@ -1060,7 +1313,6 @@ def cmd_open(spec, base):
     remote = run.heads(f"{prefix}*")
     if len(remote) > 1:
         raise Failed(f"several spec branches on origin: {', '.join(remote)}", REFUSE)
-    created = False
     if wt.is_dir():
         branch = git(wt, "branch", "--show-current")
         if not branch.startswith(prefix):
@@ -1077,21 +1329,17 @@ def cmd_open(spec, base):
         else:
             git(run.repo_dir, "worktree", "add", "-q", str(wt), "-B", branch, f"origin/{branch}")
         git(wt, "branch", "--quiet", "--set-upstream-to", f"origin/{branch}")
-        created, how = True, "resumed"
+        how = "resumed"
     else:
         local = git(run.repo_dir, "branch", "--list", f"{prefix}*", "--format=%(refname:short)").split()
         branch = local[0] if local else prefix + slug_of(plan["title"])
         git(run.repo_dir, "worktree", "add", "-q", str(wt), *([branch] if local else ["-b", branch, f"origin/{base}"]))
-        created, how = True, "cut from " + ("the local branch" if local else f"origin/{base}")
+        how = "cut from " + ("the local branch" if local else f"origin/{base}")
     if not remote or git(wt, "rev-list", "--count", f"origin/{branch}..HEAD") != "0":
         git(wt, "push", "--quiet", "-u", "origin", branch)
     if git(wt, "rev-parse", "HEAD") != git(wt, "rev-parse", f"origin/{branch}"):
         raise Failed(f"{wt} is not at origin/{branch}: it has diverged; settle it by hand", REFUSE)
-    bootstrap = run.config.get("bootstrap")
-    if created and bootstrap:
-        code = subprocess.run(["sh", "-c", bootstrap], cwd=wt).returncode
-        if code != 0:
-            raise Failed(f"bootstrap exited {code} in {wt}")
+    bootstrap(run, wt)
     run.status(step="preview", state="running", summary=f"spec worktree {how}: {branch}", next="drive-spec preview",
                branch=branch, base=base)
     print(f"worktree {wt} on {branch} ({how})")
@@ -1128,26 +1376,269 @@ def run_started(run):
         raise Failed("no run start: pin the gate at step 1 (`drive-spec gate <spec> '<verify>'`)", REFUSE)
 
 
+COVERAGE_LINE = re.compile(r"^\s*[-*]\s+(.*?)\s*(?:→|->)\s*(.+?)\s*$")
+QUESTION_LINE = re.compile(r"^\s*[-*]\s+(Q\d+):\s*(.+?)\s*$")
+
+
+def coverage(run):
+    """coverage.md as (requirement, target) pairs, and the lines that fit no form."""
+    try:
+        lines = (run.notes / "coverage.md").read_text().splitlines()
+    except OSError:
+        return [], []
+    pairs, bad = [], []
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = COVERAGE_LINE.match(line)
+        target = m.group(2) if m else ""
+        if m and (re.fullmatch(r"(#\d+)(\s*,\s*#\d+)*", target) or target.lower() == "unmapped"
+                  or target.lower().startswith("out of scope:")):
+            pairs.append((m.group(1), target))
+        else:
+            bad.append(line.strip())
+    return pairs, bad
+
+
+def owned_requirements(run, m):
+    return [req for req, target in coverage(run)[0] if f"#{m}" in re.findall(r"#\d+", target)]
+
+
+def questions(run):
+    try:
+        lines = (run.notes / "questions.md").read_text().splitlines()
+    except OSError:
+        return []
+    return [(m.group(1), m.group(2)) for m in map(QUESTION_LINE.match, lines) if m]
+
+
+def answered_refs(run):
+    try:
+        text = (run.notes / "decisions.md").read_text()
+    except OSError:
+        return set()
+    return {ref.strip() for group in re.findall(r"^- \[([^\]]+)\]", text, re.M) for ref in group.split(",")}
+
+
+def cmd_explore(spec):
+    run = Run(spec)
+    plan = checked_plan(run)
+    open_ = [x["number"] for x in plan["slices"] if x["state"] != "closed"]
+    todo = [m for m in open_ if not (run.notes / f"issue-{m}.md").is_file()]
+    wt = run.root / f"spec-{spec}"
+    if not wt.is_dir():
+        raise Failed(f"no spec worktree at {wt}: `drive-spec open {spec}`", REFUSE)
+    path = write_brief(run, "brief-explore.md", fill("EXPLORER.md", {
+        "path": wt, "repo": run.repo, "spec": spec, "notes": run.notes,
+        "open": ", ".join(f"#{m}" for m in open_) or "none",
+        "todo": ", ".join(f"issue-{m}.md" for m in todo) or "every slice already has one; refresh none"}))
+    print(f"next: a general-purpose subagent with the prompt `Read {path} and follow it.`; then "
+          f"`drive-spec explored {spec}`")
+    return 0
+
+
 def cmd_explored(spec):
     run = Run(spec)
     plan = checked_plan(run)
     started = run_started(run)
     missing = [f"issue-{x['number']}.md" for x in plan["slices"]
                if x["state"] != "closed" and not (run.notes / f"issue-{x['number']}.md").is_file()]
-    conflicts = run.notes / "conflicts.md"
-    if not conflicts.is_file():
-        missing.append("conflicts.md")
+    fresh = ["conflicts.md", "coverage.md", "questions.md"]
+    missing += [name for name in fresh if not (run.notes / name).is_file()]
     if missing:
         raise Failed(f"explore is not done: no {', '.join(missing)} in {run.notes}", REFUSE)
-    if datetime.fromtimestamp(conflicts.stat().st_mtime, timezone.utc) < started:
-        raise Failed(f"{conflicts} predates this run: check the open slices again and write it fresh", REFUSE)
-    if conflicts.read_text().strip():
+    stale = [name for name in fresh
+             if datetime.fromtimestamp((run.notes / name).stat().st_mtime, timezone.utc) < started]
+    if stale:
+        raise Failed(f"{', '.join(stale)} in {run.notes} predate this run: check the spec and the open slices "
+                     "again and write them fresh", REFUSE)
+    if (run.notes / "conflicts.md").read_text().strip():
         finish(run, "conflicts")
         return CONFLICT
+    pairs, bad = coverage(run)
+    if bad:
+        raise Failed("coverage.md lines fit no form (`- <requirement> → #<m>`, `→ unmapped`, "
+                     "`→ out of scope: <the spec's words>`): " + "; ".join(bad), REFUSE)
+    if not pairs:
+        raise Failed("coverage.md maps no requirement: every requirement in the spec gets a line", REFUSE)
+    slices = {f"#{x['number']}" for x in plan["slices"]}
+    strays = sorted({ref for _, target in pairs for ref in re.findall(r"#\d+", target)} - slices)
+    if strays:
+        raise Failed(f"coverage.md names {', '.join(strays)}, not slices of #{spec}", REFUSE)
+    unmapped = [req for req, target in pairs if target.lower() == "unmapped"]
+    if unmapped:
+        raise Failed("spec requirements no slice owns: " + "; ".join(unmapped) + ". Ask the operator which slice "
+                     "owns each, or whether it is out of scope (`drive-spec ask`), then record the answer in "
+                     "coverage.md and run this again", REFUSE)
+    asked = answered_refs(run)
+    waiting = [(ref, q) for ref, q in questions(run) if ref not in asked]
+    if waiting:
+        raise Failed("the spec leaves these to the operator, and they are unanswered: "
+                     + "; ".join(f"{ref}: {q}" for ref, q in waiting)
+                     + f". Ask them before any build: `drive-spec ask {spec} '<question>' --ref "
+                     + ",".join(ref for ref, _ in waiting) + "`", REFUSE)
     open_ = sum(x["state"] != "closed" for x in plan["slices"])
     run.status(step="build", state="running", summary=f"explored {open_} open slice(s), no conflicts; "
                f"{progress_summary(plan)}", next="drive-spec frontier", branch=plan["spec_branch"])
     print(f"explored: notes for {open_} open slice(s), no conflicts")
+    return 0
+
+
+REVIEW_ROUNDS = 3
+SOURCE = re.compile(r"spec #\d+|#\d+|decisions\.md|coverage\.md")
+
+
+def review_rounds(run):
+    d = run.notes / "review"
+    return sorted(int(m.group(1)) for f in d.glob("round-*.brief.md")
+                  if (m := re.fullmatch(r"round-(\d+)\.brief\.md", f.name))) if d.is_dir() else []
+
+
+def round_file(run, k, kind):
+    return run.notes / "review" / f"round-{k}.{kind}"
+
+
+def read_round(run, k, wt):
+    """A round's findings, held to the form REVIEWER.md sets. Refuses one that does not fit, naming each fault."""
+    head = json.loads(round_file(run, k, "meta.json").read_text())["head"]
+    f = round_file(run, k, "json")
+    try:
+        data = json.loads(f.read_text())
+    except ValueError as e:
+        raise Failed(f"{f} is not JSON ({e}): send the round's reviewer back to rewrite it", REFUSE)
+    faults = []
+    if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
+        raise Failed(f"{f} has no findings list: send the round's reviewer back to rewrite it", REFUSE)
+    if data.get("head") != head:
+        faults.append(f"head is {data.get('head')}, the round reviewed {head}")
+    for n, x in enumerate(data["findings"], 1):
+        if not isinstance(x, dict) or x.get("kind") not in ("rule", "judgement"):
+            faults.append(f"finding {n}: kind is neither rule nor judgement")
+            continue
+        if not str(x.get("finding") or "").strip():
+            faults.append(f"finding {n}: no finding text")
+        if x.get("path") and not (Path(wt) / x["path"]).exists():
+            faults.append(f"finding {n}: no file {x['path']}")
+        if x["kind"] == "rule":
+            source = str(x.get("rule") or "").split(":", 1)
+            if len(source) < 2 or not source[1].strip():
+                faults.append(f"finding {n}: a rule finding quotes no rule (`SOURCE: THE RULE`)")
+            elif not (SOURCE.fullmatch(source[0].strip()) or (Path(wt) / source[0].strip()).is_file()):
+                faults.append(f"finding {n}: {source[0].strip()} is no file, spec, slice or decisions.md")
+    if faults:
+        raise Failed(f"{f} does not fit REVIEWER.md: " + "; ".join(faults)
+                     + ". Send the round's reviewer back to fix it", REFUSE)
+    return data
+
+
+def where(x):
+    return f"`{x['path']}:{x['line']}`" if x.get("path") and x.get("line") else f"`{x['path']}`" if x.get("path") \
+        else "(missing)"
+
+
+def judgement_calls(run, wt):
+    seen, out = set(), []
+    for k in review_rounds(run):
+        if round_file(run, k, "json").is_file():
+            for x in read_round(run, k, wt)["findings"]:
+                key = (x.get("path"), " ".join(x["finding"].split()).lower())
+                if x["kind"] == "judgement" and key not in seen:
+                    seen.add(key)
+                    out.append(f"- {where(x)}: {' '.join(x['finding'].split())}")
+    return out
+
+
+def spec_head(run, plan, push):
+    """The spec worktree's HEAD, clean, level with origin and green; with `push`, a green HEAD ahead is pushed."""
+    spec = run.spec
+    wt = run.root / f"spec-{spec}"
+    if not wt.is_dir():
+        raise Failed(f"no spec worktree at {wt}: `drive-spec open {spec}`", REFUSE)
+    if dirty(wt):
+        raise Failed(f"{wt} has uncommitted changes: commit the fixes, then verify", REFUSE)
+    branch = plan["spec_branch"]
+    git(wt, "fetch", "--quiet", "origin")
+    head, remote = git(wt, "rev-parse", "HEAD"), git(wt, "rev-parse", f"origin/{branch}")
+    gate = run_gate_of(run)
+    verify_cmd = f"`drive-spec verify {spec} {wt} --wait-minutes 9`"
+    if head != remote:
+        if git(wt, "rev-list", "--count", f"HEAD..origin/{branch}") != "0":
+            if git(wt, "rev-list", "--count", f"origin/{branch}..HEAD") != "0":
+                raise Failed(f"{wt} and origin/{branch} have diverged: settle it by hand", REFUSE)
+            git(wt, "pull", "--quiet", "--ff-only")
+            head = remote
+        elif not push:
+            raise Failed(f"{wt} is not at origin/{branch}: push the fixes", REFUSE)
+        elif not green(run, head, gate):
+            raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
+        else:
+            git(wt, "push", "--quiet", "origin", branch)
+            print(f"pushed {head[:12]} to {branch}")
+    if not green(run, head, gate):
+        raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
+    return wt, head
+
+
+def cmd_review(spec):
+    run = Run(spec)
+    plan = checked_plan(run)
+    open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
+    if open_:
+        raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
+    wt, head = spec_head(run, plan, push=True)
+    ks = review_rounds(run)
+    k = ks[-1] if ks else 0
+    decided = (run.notes / "decisions.md").is_file()
+    if k:
+        result = round_file(run, k, "json")
+        if not result.is_file():
+            print(f"round {k} waits for its reviewer: a subagent with the prompt "
+                  f"`Read {round_file(run, k, 'brief.md')} and follow it.`; then `drive-spec review {spec}` again")
+            return 0
+        data = read_round(run, k, wt)
+        rules = [x for x in data["findings"] if x["kind"] == "rule"]
+        calls = len(data["findings"]) - len(rules)
+        if data["head"] == head and not rules:
+            run.status(step="review", state="running", summary=f"review clean at round {k}, {calls} judgement "
+                       f"call(s) this round", next=f"drive-spec reviewed {spec}", branch=plan["spec_branch"])
+            print(f"review clean at round {k}: next `drive-spec reviewed {spec}`")
+            return 0
+        if data["head"] == head:
+            fix = round_file(run, k, "fix.md")
+            if not fix.is_file():
+                findings = "\n".join(f"{n}. {where(x)}: {' '.join(x['finding'].split())}\n   Rule: {x['rule']}"
+                                     for n, x in enumerate(rules, 1))
+                fix.write_text(fill("REVIEW-FIXER.md", {
+                    "path": wt, "spec": spec, "repo": run.repo, "notes": run.notes, "k": k, "findings": findings,
+                    "skill dir": Path(__file__).resolve().parent}, {"decided": decided}) + "\n")
+            run.status(step="review", state="running", summary=f"review round {k}: {len(rules)} rule finding(s), "
+                       "fixing", next=f"drive-spec review {spec} once the fixes are green", branch=plan["spec_branch"])
+            print(f"round {k} raised {len(rules)} rule finding(s) and {calls} judgement call(s)")
+            print(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`; then "
+                  f"`drive-spec review {spec}` again")
+            return 0
+        cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
+        answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
+        if k >= cap and rules and not answered:
+            raise Failed(f"{k} review rounds and round {k} still raised rule findings: ask the operator whether to "
+                         f"go on (`drive-spec ask {spec} ...`); once answered, `drive-spec review {spec}` starts "
+                         "another round", REFUSE)
+    k += 1
+    (run.notes / "review").mkdir(parents=True, exist_ok=True)
+    round_file(run, k, "meta.json").write_text(json.dumps({"head": head, "at": stamp()}))
+    earlier = [str(round_file(run, j, "json")) for j in range(1, k)]
+    slices = ", ".join(f"#{x['number']}" for x in plan["slices"])
+    brief_path = round_file(run, k, "brief.md")
+    brief_path.write_text(fill("REVIEWER.md", {
+        "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
+        "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
+        "out": round_file(run, k, "json")}, {
+        "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier)}) + "\n")
+    run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
+               next=f"drive-spec review {spec} once the reviewer writes its findings", branch=plan["spec_branch"])
+    print(f"brief: {brief_path}")
+    print(f"next: a reviewer subagent with the prompt `Read {brief_path} and follow it.`; then "
+          f"`drive-spec review {spec}` again")
     return 0
 
 
@@ -1157,28 +1648,26 @@ def cmd_reviewed(spec, left):
     open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
     if open_:
         raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
-    wt = run.root / f"spec-{spec}"
-    if not wt.is_dir():
-        raise Failed(f"no spec worktree at {wt}: `drive-spec open {spec}`", REFUSE)
-    if dirty(wt):
-        raise Failed(f"{wt} has uncommitted changes: commit the fixes, verify, push", REFUSE)
     branch = plan["spec_branch"]
-    git(wt, "fetch", "--quiet", "origin")
-    head = git(wt, "rev-parse", "HEAD")
-    if head != git(wt, "rev-parse", f"origin/{branch}"):
-        raise Failed(f"{wt} is not at origin/{branch}: push the fixes, or pull what landed", REFUSE)
-    if not green(run, head, run_gate_of(run)):
-        raise Failed(f"{head[:12]} is not verified green: `drive-spec verify {spec} {wt}`", REFUSE)
+    wt, head = spec_head(run, plan, push=False)
+    ks = review_rounds(run)
+    if not ks or not round_file(run, ks[-1], "json").is_file():
+        raise Failed(f"no finished review round: `drive-spec review {spec}`", REFUSE)
+    last = read_round(run, ks[-1], wt)
+    if last["head"] != head or any(x["kind"] == "rule" for x in last["findings"]):
+        raise Failed(f"round {ks[-1]} is not a clean review of {head[:12]}: `drive-spec review {spec}`", REFUSE)
     kept = run.notes / "left.md"
-    if left and left.strip():
-        kept.write_text(left.strip() + "\n")
+    lines = judgement_calls(run, wt) + ([left.strip()] if left and left.strip() else [])
+    if lines:
+        kept.write_text("\n".join(lines) + "\n")
     else:
         kept.unlink(missing_ok=True)
     spec_pr = spec_pr_of(run, run.base(), branch)
-    summary = "review left findings open" if kept.exists() else "review clean"
-    run.status(step="confirm", state="running", summary=f"{summary} at {head[:12]}", next="drive-spec confirm",
+    summary = (f"review left {len(lines)} finding(s) open" if lines else "review clean") + \
+        f" after {len(ks)} round(s) at {head[:12]}"
+    run.status(step="confirm", state="running", summary=summary, next="drive-spec confirm",
                branch=branch, **({"pr_url": spec_pr["url"]} if spec_pr else {}))
-    print(f"{summary} at {head[:12]}")
+    print(summary)
     return 0
 
 
@@ -1274,9 +1763,19 @@ def one_line(text, width=160):
     return text if len(text) <= width else text[:width - 1] + "…"
 
 
-def cmd_ask(spec, question, blocking, step):
+def cmd_ask(spec, question, blocking, step, ref=None):
     run = Run(spec)
     current = run.current()
+    pending_ref = run.notes / "question-ref"
+    if ref:
+        known = {r for r, _ in questions(run)}
+        unknown = [r for r in ref.split(",") if r.strip() not in known]
+        if unknown:
+            raise Failed(f"{', '.join(unknown)} is not in questions.md", REFUSE)
+        run.notes.mkdir(parents=True, exist_ok=True)
+        pending_ref.write_text(ref + "\n")
+    else:
+        pending_ref.unlink(missing_ok=True)
     step = step or current.get("step") or "resolve"
     if blocking:
         run.status(step=step, state="waiting", question=one_line(question, 1000), question_blocking="true",
@@ -1300,12 +1799,61 @@ def cmd_answered(spec, answer):
     gh(f"repos/{run.repo}/issues/{spec}/comments", "-f",
        f"body=Operator decision.\n\n> {question}\n\n{answer}", "--silent")
     run.notes.mkdir(parents=True, exist_ok=True)
+    try:
+        ref = (run.notes / "question-ref").read_text().strip()
+    except OSError:
+        ref = ""
     with open(run.notes / "decisions.md", "a") as f:
-        f.write(f"- {question}\n  Answer: {one_line(answer, 1000)}\n")
+        f.write(f"- {f'[{ref}] ' if ref else ''}{question}\n  Answer: {one_line(answer, 1000)}\n")
+    (run.notes / "question-ref").unlink(missing_ok=True)
     step = current.get("step") or "resolve"
     run.status(step=step, state="running", question="", summary=f"operator answered: {one_line(answer, 120)}",
                next=f"carry on with {step}")
     print(f"recorded on #{spec} and in {run.notes / 'decisions.md'}; implementers read it from their brief")
+    return 0
+
+
+# resume
+
+STEP_COMMANDS = {
+    "guard": "drive-spec plan {spec}",
+    "worktree": "drive-spec open {spec}",
+    "preview": "drive-spec preview {spec}",
+    "build": "drive-spec frontier {spec}",
+    "review": "drive-spec review {spec}",
+    "confirm": "drive-spec confirm {spec}",
+    "cleanup": "drive-spec cleanup {spec}",
+}
+
+
+def next_step(run, status):
+    """The command that carries a run on from its status file alone."""
+    spec, step, state = run.spec, status.get("step"), status.get("state")
+    if not status or not (run.notes / "run.json").is_file() and step not in ("review-pr", None):
+        return "resolve", f"step 1: resolve the run, then `drive-spec gate {spec} '<verify>' --base <base>`"
+    if state == "done":
+        return step, "none: the run is done"
+    if state == "waiting":
+        return step, (f"the operator's answer to: {status.get('question')}; then "
+                      f"`drive-spec answered {spec} '<their words>'`")
+    if state in ("halted", "paused"):
+        return step, f"{status.get('next')} (the run is {state}: {status.get('summary')})"
+    if step == "explore":
+        brief = run.notes / "brief-explore.md"
+        return step, (f"`drive-spec explored {spec}` once the explorer has written its notes" if brief.is_file()
+                      else f"`drive-spec explore {spec}`")
+    if step == "review-pr":
+        pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
+        return step, f"`/review-fix-pr {pr}`, then `drive-spec finish {spec} done`"
+    if step in STEP_COMMANDS:
+        return step, f"`{STEP_COMMANDS[step].format(spec=spec)}`"
+    return step or "resolve", f"`drive-spec gate {spec} '<verify>' --base <base>`"
+
+
+def cmd_next(spec):
+    run = Run(spec)
+    step, command = next_step(run, run.current())
+    print(f"step: {step}\nnext: {command}")
     return 0
 
 
@@ -1408,10 +1956,15 @@ def main():
     v.add_argument("spec", help="the spec, or pr-<n> to verify a PR head outside a spec run")
     v.add_argument("worktree")
     v.add_argument("--gate", help="the gate to run; default the pinned gate, then `verify` in the config")
+    v.add_argument("--wait-minutes", type=float, dest="wait",
+                   help="return after this long, exit 6, while the gate runs on detached; run again to keep waiting")
+    v.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     i = sub.add_parser("integrate", help="merge the spec branch into a slice, verify, push, merge its PR")
     i.add_argument("spec")
     i.add_argument("slice")
     i.add_argument("--deviations", help="the implementer's Deviations list, `none`, or `-` for stdin")
+    i.add_argument("--wait-minutes", type=float, dest="wait",
+                   help="return after this long, exit 6, while a gate runs on; run again to pick up where it stopped")
     la = sub.add_parser("land", help="close a merged slice, remove its worktree and branch, open the spec PR")
     la.add_argument("spec")
     la.add_argument("slice")
@@ -1443,9 +1996,13 @@ def main():
     pv.add_argument("--dry-run", action="store_true")
     ex = sub.add_parser("explored", help="end of explore: notes for every open slice; exit 3 halts on conflicts")
     ex.add_argument("spec")
-    rv = sub.add_parser("reviewed", help="end of review: the spec branch is pushed and green; keep what is left")
+    nx = sub.add_parser("next", help="the command that carries the run on, from its status file")
+    nx.add_argument("spec")
+    rw = sub.add_parser("review", help="step 7: the next review round's brief, its fixer's brief, or clean")
+    rw.add_argument("spec")
+    rv = sub.add_parser("reviewed", help="end of review: a clean last round on the pushed, green spec branch")
     rv.add_argument("spec")
-    rv.add_argument("--left", help="the judgement calls every review round left open, or `-` for stdin")
+    rv.add_argument("--left", help="more for the left list, beyond the rounds' judgement calls; `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
     ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
@@ -1454,6 +2011,9 @@ def main():
     ak.add_argument("--no-block", dest="blocking", action="store_false",
                     help="a judgement call made on your own the operator may revisit; the run goes on")
     ak.add_argument("--step", help="default: the step in the status file")
+    ak.add_argument("--ref", help="the questions.md ids this question settles, comma-separated: Q1,Q2")
+    xp = sub.add_parser("explore", help="write the explorer brief for step 5")
+    xp.add_argument("spec")
     an = sub.add_parser("answered", help="record the operator's answer on the spec and for the implementers")
     an.add_argument("spec")
     an.add_argument("answer", help="the operator's own words, or `-` for stdin")
@@ -1473,9 +2033,9 @@ def main():
         elif args.cmd == "gate":
             code = cmd_gate(spec, args.command, args.base)
         elif args.cmd == "verify":
-            code = cmd_verify(spec, args.worktree, args.gate)
+            code = cmd_verify(spec, args.worktree, args.gate, args.wait, args.worker)
         elif args.cmd == "integrate":
-            code = cmd_integrate(spec, int(args.slice.lstrip("#")), args.deviations)
+            code = cmd_integrate(spec, int(args.slice.lstrip("#")), args.deviations, args.wait)
         elif args.cmd == "land":
             code = cmd_land(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "progress":
@@ -1487,13 +2047,19 @@ def main():
         elif args.cmd == "cleanup":
             code = cmd_cleanup(spec)
         elif args.cmd == "ask":
-            code = cmd_ask(spec, args.question, args.blocking, args.step)
+            code = cmd_ask(spec, args.question, args.blocking, args.step, args.ref)
+        elif args.cmd == "explore":
+            code = cmd_explore(spec)
         elif args.cmd == "answered":
             code = cmd_answered(spec, sys.stdin.read() if args.answer == "-" else args.answer)
         elif args.cmd == "preview":
             code = cmd_preview(spec, args.sequential, args.max_slices, args.dry_run)
         elif args.cmd == "explored":
             code = cmd_explored(spec)
+        elif args.cmd == "next":
+            code = cmd_next(spec)
+        elif args.cmd == "review":
+            code = cmd_review(spec)
         elif args.cmd == "reviewed":
             code = cmd_reviewed(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "frontier":

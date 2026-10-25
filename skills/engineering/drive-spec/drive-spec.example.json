@@ -3,6 +3,7 @@
   "bootstrap": "yarn install --frozen-lockfile",
   "verify": "yarn typecheck && yarn test",
   "verifyTimeoutMinutes": 60,
+  "reviewRounds": 3,
   "parallel": false,
   "maxSlices": 5,
   "worktreeRoot": ".claude/worktrees",

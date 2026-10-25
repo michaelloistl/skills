@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # PreToolUse/Bash guard: block piping a drive-spec command's output (`drive-spec open … | tail`). Its exit code is
-# the verdict (2 refused, 3 conflict, 4 red, 5 inbox notes), and a pipe hands the shell the last stage's exit
+# the verdict (2 refused, 3 conflict, 4 red, 5 inbox notes, 6 still running), and a pipe hands the shell the last stage's exit
 # instead, so a refusal reads as success and the next command runs on. Piping into it (`… | drive-spec integrate`)
 # stays allowed: that is its stdin.
 import json
 import re
 import sys
 
-COMMANDS = ("plan|gate|verify|integrate|land|progress|frontier|start|halt|open|preview|explored|reviewed|confirm"
-            "|cleanup|finish|ask|answered")
+COMMANDS = ("plan|gate|verify|integrate|land|progress|frontier|start|halt|open|preview|explore|explored|review"
+            "|reviewed|confirm|cleanup|finish|ask|answered|next")
 
 cmd = json.load(sys.stdin).get("tool_input", {}).get("command") or ""
 # A heredoc's body is text fed to a command, not shell: drop it, keeping the line that opens it.

@@ -20,7 +20,7 @@ At every step boundary, and within step 6 at each dispatch, landing and halt. `s
 | `preview` | `drive-spec open` |
 | `explore` | `drive-spec preview` (`paused` at `preview` with `--dry-run`); conflicts: `finish conflicts` |
 | `build` | `explored`, `start`, `land`, `halt`, `finish ceiling\|held` |
-| `review` | `land` of the last slice, or `frontier` as it stops on `done` while the status still reads `build` |
+| `review` | `land` of the last slice, or `frontier` as it stops on `done` while the status still reads `build`; then `drive-spec review` at each round, fix and clean |
 | `confirm` | `drive-spec reviewed` |
 | `cleanup` | `drive-spec confirm` |
 | `review-pr` | `drive-spec cleanup`; `finish done`, or `finish halted --step review-pr` |

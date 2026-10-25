@@ -39,11 +39,11 @@ A branch already on origin keeps whatever slug it has; look it up with `git ls-r
 - **Spec**: an existing worktree on the spec branch is reused and fast-forwarded; else the branch on origin is resumed (a local branch already ahead of it is kept, never reset); else it is cut from `origin/<base>` and pushed at once, which is what lets another session, or a later resume, see the spec is underway.
 - **Slice**: an existing worktree is reused; else the local branch, else the branch on origin (with or without an open PR); else a fresh branch from the spec worktree's HEAD after `pull --ff-only`. A crashed run's unpushed commits are never reset away.
 - A path that already exists is reused when it is on the expected branch, and refused otherwise. A branch checked out in a worktree the run did not create belongs to another session: git refuses to check it out twice, and the command stops naming the path.
-- Bootstrap runs only in a worktree the command just created.
+- Bootstrap runs per Bootstrap below, whether the worktree is new or reused.
 
 ## Bootstrap
 
-Run `bootstrap` from the config in every new worktree, from that worktree's directory. A non-zero exit fails the run before any agent starts. Absent config means no bootstrap step.
+Run `bootstrap` from the config in every worktree `open` or `start` touches, from that worktree's directory, until one succeeds: a marker in the worktree's own git dir, holding the command's hash, records the success, so a failed or changed bootstrap runs again on the next call. Output goes to `logs/bootstrap-<worktree>.log`; a non-zero exit prints its tail and fails the command before any agent starts. Absent config means no bootstrap step.
 
 ## Remove
 

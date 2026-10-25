@@ -206,15 +206,21 @@ def issue(n):
     return dict(i, labels=[{"name": l} for l in i["labels"]])
 
 
+def touch(n):
+    st["issues"][str(n)]["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 out = None
 if method == "GET" and parts == []:
     out = {"default_branch": "main"}
 elif parts == ["issues"] and method == "GET":
-    out = [issue(n) for n in st["issues"]]
+    out = [issue(n) for n in st["issues"]
+           if "since" not in q or st["issues"][n].get("updated_at", "2000-01-01T00:00:00Z") >= q["since"]]
 elif len(parts) == 2 and parts[0] == "issues" and method == "GET":
     out = issue(parts[1])
 elif len(parts) == 2 and parts[0] == "issues" and method == "PATCH":
     st["issues"][parts[1]].update(state=fields["state"])
+    touch(parts[1])
 elif parts[:1] == ["issues"] and parts[2:] == ["sub_issues"]:
     out = [{"number": n} for n in st.get("sub_issues", [])]
 elif parts[:1] == ["issues"] and parts[2:] == ["comments"] and method == "GET":
@@ -234,12 +240,14 @@ elif parts[:1] == ["issues"] and parts[2:] == ["labels"] and method == "POST":
     if fields["labels[]"] not in st.get("labels", []):
         die("HTTP 422 label missing")
     st["issues"][parts[1]]["labels"].append(fields["labels[]"])
+    touch(parts[1])
 elif parts[:1] == ["issues"] and parts[2:3] == ["labels"] and method == "DELETE":
     labels = st["issues"][parts[1]]["labels"]
     name = urllib.parse.unquote(parts[3])
     if name not in labels:
         die("HTTP 404 label")
     labels.remove(name)
+    touch(parts[1])
 elif parts == ["pulls"] and method == "GET":
     head = q.get("head", "").split(":")[-1]
     out = [pull(p) for p in st["pulls"] if (q.get("state") in (None, "all") or p["state"] == q["state"])
@@ -279,6 +287,29 @@ if out is not None and not silent:
 """
 
 GATE = 'echo run >> "$COUNTER"; test ! -f RED'
+HELD_GATE = ('echo run >> "$COUNTER"; sleep 60 & echo $! > "$FIX/held.pid"; '
+             'while [ ! -f "$FIX/go" ]; do sleep 0.05; done; kill $!; test ! -f RED')
+
+
+def wait_for_pid(f):
+    for _ in range(200):
+        if f.exists() and f.read_text().strip():
+            return int(f.read_text())
+        time.sleep(0.05)
+    raise AssertionError(f"nothing wrote {f}")
+
+
+def assert_gone(case, pid):
+    for _ in range(200):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        if state.strip().startswith("Z"):
+            return
+        time.sleep(0.05)
+    case.fail(f"pid {pid} still runs")
 
 
 class Cli(unittest.TestCase):
@@ -340,6 +371,16 @@ class Cli(unittest.TestCase):
         return self.git(cwd, "rev-parse", "HEAD")
 
     def save(self):
+        """Write the tracker, stamping every issue the test changed as updated now, as GitHub would."""
+        try:
+            before = json.loads((self.tmp / "gh.json").read_text())["issues"]
+        except (OSError, ValueError, KeyError):
+            before = {}
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for n, i in self.state["issues"].items():
+            if {k: v for k, v in i.items() if k != "updated_at"} != \
+                    {k: v for k, v in before.get(n, {}).items() if k != "updated_at"}:
+                i["updated_at"] = stamp
         (self.tmp / "gh.json").write_text(json.dumps(self.state))
 
     def gh_state(self):
@@ -413,6 +454,25 @@ class Plan(Cli):
         out = self.run_ds("plan", "10")
         self.assertEqual(out.returncode, 1)
         self.assertIn("HTTP 401", out.stderr)
+
+
+class IssueCache(Cli):
+    def lists(self):
+        return [c for c in self.gh_state()["calls"] if "/issues?state=all" in c]
+
+    def test_only_issues_updated_since_the_last_call_are_fetched(self):
+        self.run_ds("plan", "10")
+        self.edit_state(lambda st: st["issues"].update({"13": self.issue(13, "Add the button", "## Parent\n\n#10\n")}))
+        out = self.run_ds("plan", "10")
+        self.assertIn("#13", out.stdout)
+        first, second = self.lists()
+        self.assertNotIn("since=", first)
+        self.assertIn("since=", second)
+
+    def test_an_issue_edited_away_from_the_spec_leaves_the_plan(self):
+        self.run_ds("plan", "10")
+        self.edit_state(lambda st: st["issues"]["12"].update(body="## Parent\n\n#99\n"))
+        self.assertNotIn("#12", self.run_ds("plan", "10").stdout)
 
 
 class Verify(Cli):
@@ -506,6 +566,54 @@ class Verify(Cli):
         with proc.stdout:
             self.assertRegex(proc.stdout.read(), r"^green ")
         self.assertEqual(proc.wait(timeout=15), 0)
+
+    def hold(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": HELD_GATE}))
+
+    def test_bounded_wait_returns_pending_and_the_gate_runs_on(self):
+        self.hold()
+        out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.001")
+        self.assertEqual(out.returncode, 6, out.stderr)
+        self.assertRegex(out.stdout, r"^running [0-9a-f]{12}: the gate is still running")
+        wait_for_pid(self.tmp / "held.pid")
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertRegex(out.stdout, r"green [0-9a-f]{12}")
+        self.assertEqual(self.gate_runs(), 1)
+
+    def test_a_second_run_on_the_same_commit_attaches(self):
+        self.hold()
+        first = subprocess.Popen([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=self.env,
+                                 stdout=subprocess.PIPE, text=True)
+        wait_for_pid(self.tmp / "held.pid")
+        second = subprocess.Popen([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=self.env,
+                                  stdout=subprocess.PIPE, text=True)
+        self.assertRegex(second.stdout.readline(), r"^attached to the gate already running on [0-9a-f]{12}")
+        (self.tmp / "go").write_text("")
+        for proc in (first, second):
+            with proc.stdout:
+                self.assertRegex(proc.stdout.read(), r"green [0-9a-f]{12}\n$")
+            self.assertEqual(proc.wait(timeout=15), 0)
+        self.assertEqual(self.gate_runs(), 1)
+
+    def test_a_red_verdict_reaches_the_caller_that_attached(self):
+        self.hold()
+        self.commit(self.wt, "RED", "", "Break the gate")
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.001").returncode, 6)
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "1")
+        self.assertEqual(out.returncode, 4)
+        self.assertIn("red ", out.stdout)
+
+    def test_a_new_commit_waits_out_the_gate_on_the_old_one(self):
+        self.hold()
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.001").returncode, 6)
+        wait_for_pid(self.tmp / "held.pid")
+        self.commit(self.wt, "b.txt", "b\n", "Add b")
+        out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.001")
+        self.assertEqual(out.returncode, 6)
+        self.assertIn("waiting for the gate already running on", out.stdout)
 
     def test_pr_head_verified_outside_a_spec_run(self):
         out = self.run_ds("verify", "pr-33", str(self.wt), "--gate", "true")
@@ -606,7 +714,7 @@ class Integrate(Cli):
 
     def test_one_integration_at_a_time(self):
         notes = self.repo / ".git" / "drive-spec" / "spec-10"
-        notes.mkdir(parents=True)
+        notes.mkdir(parents=True, exist_ok=True)
         with open(notes / "integrate.lock", "w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             out = self.run_ds("integrate", "10", "11", "--deviations", "none")
@@ -616,6 +724,20 @@ class Integrate(Cli):
     def test_dirty_worktree_refused(self):
         (self.wt / "a.txt").write_text("changed")
         self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 2)
+
+
+class IntegratePending(Cli):
+    def test_resumes_where_the_bounded_wait_stopped(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": HELD_GATE}))
+        out = self.run_ds("integrate", "10", "11", "--deviations", "none", "--wait-minutes", "0.001")
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertIn("integrate 10 11` again", out.stdout)
+        wait_for_pid(self.tmp / "held.pid")
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("integrate", "10", "11", "--wait-minutes", "1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("merged #100", out.stdout)
+        self.assertEqual(self.gate_runs(), 1)
 
 
 class Land(Cli):
@@ -799,12 +921,14 @@ class Start(Cli):
         out = self.run_ds("start", "10", "12")
         self.assertEqual(out.returncode, 0, out.stderr)
         wt = self.repo / ".claude" / "worktrees" / "issue-12"
-        self.assertTrue(out.stdout.startswith(f"worktree {wt} on agent/issue-12-wire-the-route\n"))
+        self.assertIn(f"worktree {wt} on agent/issue-12-wire-the-route\n", out.stdout)
+        brief = (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-12.md").read_text()
+        self.assertIn(f"brief: {self.repo / '.git' / 'drive-spec' / 'spec-10' / 'brief-12.md'}\n", out.stdout)
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), self.origin_sha("agent/local-spec-10-export"))
         self.assertTrue((wt / "a.txt").exists())
         self.assertTrue(Path(f"{self.counter}.boot").exists())
-        self.assertIn(f"drive-spec verify 10 {wt}", out.stdout)
-        self.assertNotIn("carry on", out.stdout)
+        self.assertIn(f"drive-spec verify 10 {wt}", brief)
+        self.assertNotIn("carry on", brief)
         self.assertIn("agent:in-progress", self.gh_state()["issues"]["12"]["labels"])
         self.assertEqual(self.status_file()["next"], "implementer builds #12")
 
@@ -816,7 +940,7 @@ class Start(Cli):
     def test_existing_worktree_continues(self):
         out = self.run_ds("start", "10", "11")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("carry on", out.stdout)
+        self.assertIn("carry on", (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text())
         self.assertEqual(self.gh_state()["issues"]["11"]["labels"], ["agent:in-progress"])
 
     def test_local_branch_without_worktree_keeps_its_commits(self):
@@ -865,7 +989,7 @@ class Finish(Cli):
     def test_conflicts_post_the_list(self):
         self.assertEqual(self.run_ds("finish", "10", "conflicts").returncode, 2)
         notes = self.repo / ".git" / "drive-spec" / "spec-10"
-        notes.mkdir(parents=True)
+        notes.mkdir(parents=True, exist_ok=True)
         (notes / "conflicts.md").write_text("- #11 says CSV; #12 says JSON\n")
         self.assertEqual(self.run_ds("finish", "10", "conflicts").returncode, 0)
         self.assertEqual(self.comments(10)[0], "drive-spec halted before building: the spec and its slices "
@@ -1070,13 +1194,24 @@ class Open(DispatcherCase):
         self.assertIn("(reused)", out.stdout)
         self.assertTrue((self.spec_wt / "other.txt").exists())
 
-    def test_bootstrap_only_for_a_new_worktree(self):
-        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"bootstrap": 'echo b >> "$COUNTER.boot"'}))
+    def test_bootstrap_until_one_succeeds(self):
+        boot = Path(f"{self.counter}.boot")
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"bootstrap": 'echo b >> "$COUNTER.boot"; echo noisy output; test -f "$FIX/fixed"'}))
+        out = self.run_ds("open", "10")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("bootstrap exited 1", out.stderr)
+        self.assertIn("noisy output", out.stdout)
+        (self.tmp / "fixed").write_text("")
+        out = self.run_ds("open", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("noisy output", out.stdout)
+        self.assertIn("bootstrapped spec-10", out.stdout)
         self.run_ds("open", "10")
-        self.assertFalse(Path(f"{self.counter}.boot").exists())
+        self.assertEqual(boot.read_text(), "b\nb\n")
         self.remove_spec_worktree()
         self.run_ds("open", "10")
-        self.assertEqual(Path(f"{self.counter}.boot").read_text(), "b\n")
+        self.assertEqual(boot.read_text(), "b\nb\nb\n")
 
     def test_refusals(self):
         self.git(self.spec_wt, "checkout", "-q", "-b", "elsewhere")
@@ -1143,13 +1278,20 @@ class Cleanup(DispatcherCase):
         self.assertEqual((r["step"], r["state"], r["pr_url"]), ("review-pr", "running", "https://github.com/acme/app/pull/101"))
         self.assertTrue(self.status_file()["summary"].endswith("; reviewing and fixing PR #101"))
 
-    def test_stops_what_still_runs_in_a_worktree(self):
+    def test_stops_a_gate_still_running_in_a_worktree_and_names_the_rest(self):
         self.finish_slices()
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": HELD_GATE}))
+        self.run_ds("gate", "10", HELD_GATE)
+        self.assertEqual(self.run_ds("verify", "10", str(self.spec_wt), "--wait-minutes", "0.001").returncode, 6)
+        gate = wait_for_pid(self.tmp / "held.pid")
         left = subprocess.Popen(["sleep", "60"], cwd=self.spec_wt)
         out = self.run_ds("cleanup", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn(f"stopped pid {left.pid} in spec-10: sleep 60", out.stdout)
-        self.assertEqual(left.wait(timeout=5), -15)
+        self.assertRegex(out.stdout, r"stopped the gate on [0-9a-f]{12} in spec-10")
+        self.assertIn(f"still running in spec-10, not stopped: pid {left.pid} sleep 60", out.stdout)
+        assert_gone(self, gate)
+        left.kill()
+        left.wait()
 
     def test_refuses_with_an_open_slice(self):
         out = self.run_ds("cleanup", "10")
@@ -1238,53 +1380,186 @@ class Boundaries(DispatcherCase):
         (self.notes() / "issue-11.md").write_text("serializer\n")
         out = self.run_ds("explored", "10")
         self.assertEqual(out.returncode, 2)
-        self.assertIn("no issue-12.md, conflicts.md", out.stderr)
+        self.assertIn("no issue-12.md, conflicts.md, coverage.md, questions.md", out.stderr)
         (self.notes() / "issue-12.md").write_text("route\n")
-        (self.notes() / "conflicts.md").write_text("")
+        self.write_explore(coverage="- Export to CSV → #11\n- Route at /export → #12\n")
         os.utime(self.notes() / "conflicts.md", (0, 0))
-        self.assertIn("predates this run", self.run_ds("explored", "10").stderr)
+        self.assertIn("conflicts.md in", self.run_ds("explored", "10").stderr)
         (self.notes() / "conflicts.md").write_text("")
         out = self.run_ds("explored", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual((self.row()["step"], self.status_file()["next"]), ("build", "drive-spec frontier"))
 
+    def write_explore(self, coverage, questions="", conflicts=""):
+        for name in ("issue-11.md", "issue-12.md"):
+            if not (self.notes() / name).exists():
+                (self.notes() / name).write_text("n\n")
+        (self.notes() / "coverage.md").write_text(coverage)
+        (self.notes() / "questions.md").write_text(questions)
+        (self.notes() / "conflicts.md").write_text(conflicts)
+
+    def test_explored_refuses_an_unmapped_requirement(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export to CSV → #11\n- Stays up when the database is down → unmapped\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no slice owns: Stays up when the database is down", out.stderr)
+        self.write_explore("- Export to CSV → #11\n- Stays up when the database is down -> #12\n"
+                           "- A UI → out of scope: Showing the version anywhere new in the UI\n")
+        self.assertEqual(self.run_ds("explored", "10").returncode, 0)
+
+    def test_explored_refuses_malformed_or_foreign_coverage(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export to CSV\n")
+        self.assertIn("fit no form", self.run_ds("explored", "10").stderr)
+        self.write_explore("- Export to CSV → #99\n")
+        self.assertIn("names #99, not slices of #10", self.run_ds("explored", "10").stderr)
+
+    def test_explored_waits_for_the_operator_questions(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export → #11\n", questions="- Q1: Public or sign-in? Recommend public.\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("Q1: Public or sign-in?", out.stderr)
+        self.assertIn("--ref Q1", out.stderr)
+        self.assertEqual(self.run_ds("ask", "10", "Public?", "--ref", "Q7").returncode, 2)
+        self.assertEqual(self.run_ds("ask", "10", "Public or sign-in?", "--ref", "Q1").returncode, 0)
+        self.run_ds("answered", "10", "public")
+        self.assertIn("- [Q1] Public or sign-in?", (self.notes() / "decisions.md").read_text())
+        self.assertEqual(self.run_ds("explored", "10").returncode, 0)
+
+    def test_explore_writes_the_brief(self):
+        self.run_ds("gate", "10", GATE)
+        (self.notes() / "issue-11.md").write_text("n\n")
+        out = self.run_ds("explore", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        text = (self.notes() / "brief-explore.md").read_text()
+        self.assertIn("Open slices: #11, #12", text)
+        self.assertIn("(issue-12.md)", text)
+        self.assertIn(f"Worktree: {self.spec_wt}", text)
+
+    def test_implementer_brief_carries_the_requirements_its_slice_owns(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export to CSV → #11\n")
+        self.run_ds("start", "10", "11")
+        self.assertIn("build every requirement it maps to #11", (self.notes() / "brief-11.md").read_text())
+
     def test_explored_halts_on_conflicts(self):
         self.run_ds("gate", "10", GATE)
         for name in ("issue-11.md", "issue-12.md"):
             (self.notes() / name).write_text("n\n")
-        (self.notes() / "conflicts.md").write_text("- #11 says CSV; #12 says JSON\n")
+        self.write_explore("- Export → #11\n", conflicts="- #11 says CSV; #12 says JSON\n")
         self.assertEqual(self.run_ds("explored", "10").returncode, 3)
         self.assertTrue(self.comments(10)[0].startswith("drive-spec halted before building"))
         r = self.row()
         self.assertEqual((r["attention"], r["step"]), ("HALT", "explore"))
 
-    def test_reviewed_needs_a_pushed_green_head(self):
+    def round_(self, k, *findings):
+        meta = json.loads((self.notes() / "review" / f"round-{k}.meta.json").read_text())
+        (self.notes() / "review" / f"round-{k}.json").write_text(
+            json.dumps({"head": meta["head"], "findings": list(findings)}))
+
+    RULE = {"kind": "rule", "rule": "spec #10: Export to CSV", "path": "README", "line": 1,
+            "finding": "No CSV export."}
+    CALL = {"kind": "judgement", "path": "README", "line": 1, "finding": "Rename ExportJob."}
+
+    def test_review_rounds_run_to_clean(self):
         self.run_ds("gate", "10", GATE)
-        self.assertIn("not every slice is closed", self.run_ds("reviewed", "10").stderr)
+        self.assertIn("not every slice is closed", self.run_ds("review", "10").stderr)
         self.close_all()
-        self.commit(self.spec_wt, "fix.txt", "f\n", "Fix a review finding")
-        self.assertIn("push the fixes", self.run_ds("reviewed", "10").stderr)
-        self.git(self.spec_wt, "push", "-q", "origin", "agent/local-spec-10-export")
-        self.assertIn("not verified green", self.run_ds("reviewed", "10").stderr)
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        brief = (self.notes() / "review" / "round-1.brief.md").read_text()
+        self.assertIn("This is round 1.", brief)
+        self.assertIn(str(self.notes() / "review" / "round-1.json"), brief)
+        self.assertEqual(self.status_file()["summary"][:14], "review round 1")
+        self.assertIn("round 1 waits for its reviewer", self.run_ds("review", "10").stdout)
+        self.assertIn("no finished review round", self.run_ds("reviewed", "10").stderr)
+        self.round_(1, self.RULE, self.CALL)
+        out = self.run_ds("review", "10")
+        self.assertIn("round 1 raised 1 rule finding(s) and 1 judgement call(s)", out.stdout)
+        fix = (self.notes() / "review" / "round-1.fix.md").read_text()
+        self.assertIn("1. `README:1`: No CSV export.\n   Rule: spec #10: Export to CSV", fix)
+        self.assertNotIn("Rename ExportJob", fix)
+        self.assertIn("not a clean review", self.run_ds("reviewed", "10").stderr)
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.assertIn("not verified green", self.run_ds("review", "10").stderr)
         self.run_ds("verify", "10", str(self.spec_wt))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("pushed ", out.stdout)
+        self.assertEqual(self.origin_sha("agent/local-spec-10-export"), self.git(self.spec_wt, "rev-parse", "HEAD"))
+        self.assertIn(str(self.notes() / "review" / "round-1.json"),
+                      (self.notes() / "review" / "round-2.brief.md").read_text())
+        self.round_(2, self.CALL)
+        self.assertIn("review clean at round 2", self.run_ds("review", "10").stdout)
         out = self.run_ds("reviewed", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         r = self.row()
         self.assertEqual((r["step"], r["pr_url"]), ("confirm", "https://github.com/acme/app/pull/101"))
-        self.assertTrue(self.status_file()["summary"].startswith("review clean at "))
+        self.assertTrue(self.status_file()["summary"].startswith("review left 1 finding(s) open after 2 round(s)"))
+        self.assertEqual(self.run_ds("confirm", "10").returncode, 0)
+        self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith(
+            "\n\nLeft from review:\n- `README:1`: Rename ExportJob."))
 
-    def test_review_leftovers_carry_to_confirm_and_done(self):
+    def test_a_round_that_does_not_fit_is_sent_back(self):
         self.run_ds("gate", "10", GATE)
         self.close_all()
         self.run_ds("verify", "10", str(self.spec_wt))
-        self.run_ds("reviewed", "10", "--left", "- rename ExportJob")
-        self.assertEqual(self.run_ds("confirm", "10").returncode, 0)
-        self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith("\n\nLeft from review:\n- rename ExportJob"))
-        self.assertEqual(self.run_ds("cleanup", "10").returncode, 0)
-        out = self.run_ds("finish", "10", "done")
+        self.run_ds("review", "10")
+        self.round_(1, {"kind": "rule", "rule": "be tidy", "finding": "Untidy."},
+                    {"kind": "rule", "rule": "NOPE.md: x", "finding": "y"},
+                    {"kind": "judgement", "path": "gone.rb", "finding": "z"}, {"kind": "nit", "finding": "w"})
+        err = self.run_ds("review", "10").stderr
+        for fault in ("finding 1: a rule finding quotes no rule", "finding 2: NOPE.md is no file",
+                      "finding 3: no file gone.rb", "finding 4: kind is neither"):
+            self.assertIn(fault, err)
+
+    def test_rounds_past_the_cap_wait_for_the_operator(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 1}))
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("ask the operator whether to go on", out.stderr)
+        self.run_ds("ask", "10", "Round 1 still raised a rule finding; go on?")
+        self.run_ds("answered", "10", "go on")
+        out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.comments(10)[-1], "drive-spec done: all 2 slices landed, review left findings open. "
-                                                "Spec PR #101.\n\nLeft from review:\n- rename ExportJob")
+        self.assertTrue((self.notes() / "review" / "round-2.brief.md").exists())
+
+    def test_a_merge_commit_with_a_verified_tree_needs_no_gate(self):
+        self.run_ds("gate", "10", GATE)
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        runs = self.gate_runs()
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gate_runs(), runs)
+
+    def test_next_follows_the_status_file(self):
+        def nxt():
+            return self.run_ds("next", "10").stdout
+        self.assertIn("step 1: resolve the run", nxt())
+        self.run_ds("gate", "10", GATE)
+        self.assertEqual(nxt(), "step: guard\nnext: `drive-spec plan 10`\n")
+        self.run_ds("preview", "10")
+        self.assertIn("`drive-spec explore 10`", nxt())
+        self.run_ds("explore", "10")
+        self.assertIn("`drive-spec explored 10` once", nxt())
+        self.run_ds("ask", "10", "Public or sign-in?")
+        self.assertIn("the operator's answer to: Public or sign-in?", nxt())
+        self.run_ds("answered", "10", "public")
+        self.close_all()
+        self.assertEqual(nxt(), "step: build\nnext: `drive-spec frontier 10`\n")
+        self.run_ds("frontier", "10")
+        self.assertEqual(nxt(), "step: review\nnext: `drive-spec review 10`\n")
 
     def test_confirm_and_cleanup_read_the_inbox_first(self):
         self.close_all()
@@ -1341,9 +1616,9 @@ class Questions(DispatcherCase):
         self.assertTrue(self.comments(10)[-1].endswith("\n\npublic"))
         decisions = self.repo / ".git" / "drive-spec" / "spec-10" / "decisions.md"
         self.assertIn("Answer: public", decisions.read_text())
-        out = self.run_ds("start", "10", "11")
+        self.run_ds("start", "10", "11")
         self.assertIn(f"`{decisions}` holds each answer, and it overrides the issue where they differ. Match",
-                      out.stdout)
+                      (decisions.parent / "brief-11.md").read_text())
 
     def test_answered_needs_an_open_question(self):
         out = self.run_ds("answered", "10", "public")
@@ -1357,8 +1632,9 @@ class Questions(DispatcherCase):
         self.assertEqual((st["state"], st["step"], st["question_blocking"]), ("running", "build", False))
 
     def test_brief_without_decisions_reads_as_before(self):
-        out = self.run_ds("start", "10", "11")
-        self.assertIn("explore only past what they cover. Match the repo's", out.stdout)
+        self.run_ds("start", "10", "11")
+        self.assertIn("explore only past what they cover. Match the repo's",
+                      (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text())
 
 
 if __name__ == "__main__":
