@@ -1445,7 +1445,7 @@ def main():
     ex.add_argument("spec")
     rv = sub.add_parser("reviewed", help="end of review: the spec branch is pushed and green; keep what is left")
     rv.add_argument("spec")
-    rv.add_argument("--left", help="what the last review left open, or `-` for stdin")
+    rv.add_argument("--left", help="the judgement calls every review round left open, or `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
     ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
