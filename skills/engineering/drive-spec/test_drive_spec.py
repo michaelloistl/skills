@@ -216,13 +216,16 @@ out = None
 if method == "GET" and parts == []:
     out = {"default_branch": "main"}
 elif parts == ["issues"] and method == "GET":
-    out = [issue(n) for n in st["issues"]
-           if "since" not in q or st["issues"][n].get("updated_at", "2000-01-01T00:00:00Z") >= q["since"]]
+    lagging = st.get("list_lag", {})
+    out = [dict(lagging[n], labels=[{"name": l} for l in lagging[n]["labels"]]) if n in lagging else issue(n)
+           for n in st["issues"]
+           if n in lagging or "since" not in q or st["issues"][n].get("updated_at", "2000-01-01T00:00:00Z") >= q["since"]]
 elif len(parts) == 2 and parts[0] == "issues" and method == "GET":
     out = issue(parts[1])
 elif len(parts) == 2 and parts[0] == "issues" and method == "PATCH":
     st["issues"][parts[1]].update(state=fields["state"])
     touch(parts[1])
+    out = issue(parts[1])
 elif parts[:1] == ["issues"] and parts[2:] == ["sub_issues"]:
     out = [{"number": n} for n in st.get("sub_issues", [])]
 elif parts[:1] == ["issues"] and parts[2:] == ["comments"] and method == "GET":
@@ -504,6 +507,18 @@ class IssueCache(Cli):
         self.run_ds("plan", "10")
         self.edit_state(lambda st: st["issues"]["12"].update(body="## Parent\n\n#99\n"))
         self.assertNotIn("#12", self.run_ds("plan", "10").stdout)
+
+
+    def test_a_landed_slice_stays_closed_while_the_list_lags(self):
+        self.run_ds("gate", "10", GATE)
+        self.run_ds("plan", "10")
+        before = dict(self.gh_state()["issues"]["11"], updated_at="2001-01-01T00:00:00Z")
+        self.land_11()
+        self.edit_state(lambda st: st.update(list_lag={"11": before}))
+        out = self.run_ds("frontier", "10", "--sequential")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("#12", out.stdout)
+        self.assertNotIn("#11", out.stdout)
 
 
 class Verify(Cli):

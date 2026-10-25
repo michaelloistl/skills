@@ -302,32 +302,59 @@ class Run:
 CACHE_SKEW_SECONDS = 300
 
 
+ISSUE_JQ = "{number,title,body,state,pull_request,updated_at,labels: [.labels[].name]}"
+
+
+def fold_issues(spec, known, issues):
+    """Folds fetched issues into the cache, keeping a cached copy newer than the fetched one: the list endpoint lags
+    a write by seconds, and a slice `land` just closed must not come back open."""
+    for i in issues:
+        old = known.get(i["number"])
+        if old and (old.get("updated_at") or "") > (i.get("updated_at") or ""):
+            continue
+        if f"#{spec}" in (i.get("body") or ""):
+            known[i["number"]] = i
+        else:
+            known.pop(i["number"], None)
+
+
+def read_issue_cache(run):
+    try:
+        data = json.loads((run.notes / "issues.json").read_text())
+        return {int(k): v for k, v in data["issues"].items()}, data["fetched_at"]
+    except (OSError, ValueError, KeyError):
+        return {}, None
+
+
+def write_issue_cache(run, known, fetched_at):
+    cache = run.notes / "issues.json"
+    tmp = cache.with_name(f".issues.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"fetched_at": fetched_at, "issues": known}))
+    os.replace(tmp, cache)
+
+
 def spec_issues(run):
     """Every issue whose body names the spec. The first call lists them all; later calls ask only for issues updated
     since the last one (minus a margin for clock skew) and fold them into a cache in the notes directory, kept only
     while a run is on (`gate` has pinned its start), so a plan read outside a run leaves no notes behind. The list
     endpoint's `since` is exact, unlike search, so an issue written seconds ago is still found."""
-    cache = run.notes / "issues.json"
-    try:
-        data = json.loads(cache.read_text())
-        known, since = {int(k): v for k, v in data["issues"].items()}, data["fetched_at"]
-    except (OSError, ValueError, KeyError):
-        known, since = {}, None
+    known, since = read_issue_cache(run)
     begun = datetime.now(timezone.utc).timestamp() - CACHE_SKEW_SECONDS
     query = f"repos/{run.repo}/issues?state=all&per_page=100" + (f"&since={since}" if since else "")
-    for i in json_lines(gh("--paginate", query,
-                           "--jq", ".[] | {number,title,body,state,pull_request,labels: [.labels[].name]}")):
-        if f"#{run.spec}" in (i.get("body") or ""):
-            known[i["number"]] = i
-        else:
-            known.pop(i["number"], None)
+    fold_issues(run.spec, known, json_lines(gh("--paginate", query, "--jq", f".[] | {ISSUE_JQ}")))
     if not (run.notes / "run.json").is_file():
         return list(known.values())
-    tmp = cache.with_name(f".issues.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"fetched_at": datetime.fromtimestamp(begun, timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"), "issues": known}))
-    os.replace(tmp, cache)
+    write_issue_cache(run, known, datetime.fromtimestamp(begun, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     return list(known.values())
+
+
+def remember_issue(run, issue):
+    """Folds an issue this run just wrote into the cache, so the next plan sees the write before the list does."""
+    known, since = read_issue_cache(run)
+    if since is None or not (run.notes / "run.json").is_file():
+        return
+    fold_issues(run.spec, known, [issue])
+    write_issue_cache(run, known, since)
 
 
 def fetch(run):
@@ -1033,8 +1060,8 @@ def cmd_land(spec, m):
     if s["state"] != "closed":
         gh(f"repos/{run.repo}/issues/{m}/comments", "-f",
            f"body=Landed in #{pr['number']} on `{spec_branch}`.", "--silent")
-        gh("-X", "PATCH", f"repos/{run.repo}/issues/{m}", "-f", "state=closed", "-f", "state_reason=completed",
-           "--silent")
+        remember_issue(run, json.loads(gh("-X", "PATCH", f"repos/{run.repo}/issues/{m}", "-f", "state=closed",
+                                          "-f", "state_reason=completed", "--jq", ISSUE_JQ)))
         s["state"] = "closed"
     if "agent:in-progress" in s["labels"]:
         remove_label(run, m, "agent:in-progress")
