@@ -1583,6 +1583,15 @@ class Boundaries(DispatcherCase):
         self.assertEqual(self.git(self.spec_wt, "branch", "--show-current"), "agent/local-spec-10-export")
         self.assertEqual(self.origin_sha("agent/local-spec-10-export"), self.git(self.spec_wt, "rev-parse", "HEAD"))
 
+    def test_a_finding_quoting_angle_brackets_reaches_the_fixer(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        self.round_(1, dict(self.RULE, finding="The filename is still hours-<start>-<end>.csv."))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("hours-<start>-<end>.csv", (self.notes() / "review" / "round-1.fix.md").read_text())
+
     def test_a_round_that_does_not_fit_is_sent_back(self):
         self.run_ds("gate", "10", GATE)
         self.close_all()

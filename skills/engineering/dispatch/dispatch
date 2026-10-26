@@ -7,6 +7,7 @@ import json
 import os
 import re
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "dispatch"
 ACKED = STATE_DIR / "acked.json"
 REPORTED = STATE_DIR / "reported.json"
+WATCH_PID = STATE_DIR / "watch.pid"
 QUEUE = STATE_DIR / "queue.json"
 BASES = STATE_DIR / "bases.json"
 FETCH_SECONDS = 120
@@ -668,7 +670,35 @@ def cmd_merges(dirs):
     print(f"noted to {', '.join(noted)}" if noted else "nothing to note")
 
 
+def take_watch():
+    """Claims the watch for this process and stops any earlier one, which says it was superseded."""
+    try:
+        old = int(WATCH_PID.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        old = None
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    WATCH_PID.write_text(f"{os.getpid()}\n")
+    argv = run(["ps", "-o", "args=", "-p", str(old)]).split() if old and old != os.getpid() else []
+    if any(Path(a).name == "dispatch" for a in argv[:2]) and "watch" in argv:
+        try:
+            os.kill(old, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def on_term(*_):
+    try:
+        holder = int(WATCH_PID.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        holder = None
+    if holder not in (None, os.getpid()):
+        print("watch superseded by a newer one: leave this one stopped", flush=True)
+    sys.exit(0)
+
+
 def cmd_watch(dirs):
+    signal.signal(signal.SIGTERM, on_term)
+    take_watch()
     notify = StatusWatch(dirs)
     herdr = HerdrEvents()
     try:

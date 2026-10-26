@@ -16,7 +16,7 @@ Your instrument is `dispatch`, the script beside this file; `dispatch --help` li
 
 1. Run `dispatch recover`. Each line proposes `RESUME`, `RESTART` or `LEAVE` for a spec whose run was cut off, by a reboot or a lost session. Show the lines and ask the operator to confirm or change each; act only on the answer, with `dispatch recover --do <spec>=<action> …`, and relay its output. `resume` re-runs `/drive-spec <n>` in the spec's own session, reopened when its pane is gone; `restart` runs it in a fresh session. Nothing to recover: go on.
 2. Run `dispatch status` and show its output as it stands.
-3. Arm a Monitor on `dispatch watch` with `timeout_ms` 1800000, described as `drive-spec dispatcher`. When it expires, re-arm it at once: `watch` remembers what it already reported, so a re-arm speaks only of changes.
+3. Arm a Monitor on `dispatch watch` with `timeout_ms` 1800000, described as `drive-spec dispatcher`. When it expires, re-arm it at once and silently: `watch` remembers what it already reported, so a re-arm speaks only of changes. Starting a watch stops any earlier one, so exactly one runs.
 
 Done when every recover proposal is answered, the overview is shown, and the monitor is armed. After a reboot the operator runs `/dispatch` again: the monitor did not survive it.
 
@@ -37,6 +37,7 @@ Each line is `<spec> <TAG> <detail>`. Relay it in one line unless the table says
 | `READY` | the head of the queue can start | none yet: run `dispatch launch <spec>`, then relay its output line |
 | `ok` | a spec stopped needing the operator | stay silent, unless it answers something you relayed and the operator is waiting on it |
 | `gone from view` | the spec's file and session are both gone | stay silent |
+| `watch superseded` | a newer watch replaced this one | stay silent, and leave this monitor stopped |
 
 ## The operator asks
 

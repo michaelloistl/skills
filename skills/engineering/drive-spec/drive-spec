@@ -1238,13 +1238,12 @@ def fill(name, values, conditions=None):
     body = text.split("```markdown\n", 1)[1].rsplit("\n```", 1)[0]
     for key, keep in (conditions or {}).items():
         body = re.sub(rf'<If {key}: "(.*?)">', lambda x: x.group(1) if keep else "", body)
-    for key, value in values.items():
-        body = body.replace(f"<{key}>", str(value))
-    body = re.sub(r" +\n", "\n", body).strip()
-    left = re.findall(r"<(?:If [A-Za-z]+:[^>]*|[a-z][a-z ]*)>", body)
+    left = [x.group(0) for x in re.finditer(r"<(?:If [A-Za-z]+:[^>]*|([a-z][a-z ]*))>", body)
+            if x.group(1) is None or x.group(1) not in values]
     if left:
         raise Failed(f"{name} has placeholders the script does not fill: {', '.join(left)}")
-    return body
+    body = re.sub(r"<([a-z][a-z ]*)>", lambda x: str(values[x.group(1)]), body)
+    return re.sub(r" +\n", "\n", body).strip()
 
 
 def brief(run, m, wt, base, continuing, local_only):
