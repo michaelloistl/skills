@@ -31,16 +31,16 @@ repo=$(git remote get-url origin | sed -E 's#(\.git)?/*$##' | awk -F'[/:]' '{pri
 
 4. **Work out setup.** Everything a scenario needs before its first step: migrations, env vars, feature flags, the user or role to log in as, and the records that must exist. Give each missing record as a paste-ready snippet (`bin/rails runner` / console, or the repo's equivalent), built from the actual models and factories. Done when a fresh dev database could run every scenario. With `--plan-only`, print the plan in the format below, with the checkout as `git worktree add .claude/worktrees/qa-<pr> <sha>`, and stop.
 
-5. **Start the app.** `git worktree add --detach <root>/qa-<pr> <sha under test>`, where `<root>` is `worktreeRoot` from `.claude/drive-spec.json`, else `.claude/worktrees`; reuse it when it already sits at that SHA. Run `bootstrap` from that config there, when set. Start the server with the repo's start command from `CLAUDE.md` or `AGENTS.md` (`/dev-up` for a Rails app), on a free port, as a process group of its own, with its output in `<qa>/server.log`, where `<qa>` is `$(git rev-parse --git-common-dir)/qa-pr/<pr>`. Run the setup snippets. Done when the app answers on its URL. An app that will not start leaves every scenario not verified: go to step 7 and say why.
+5. **Start the app.** `git worktree add --detach <root>/qa-<pr> <sha under test>`, where `<root>` is `worktreeRoot` from `.claude/drive-spec.json`, else `.claude/worktrees`; reuse it when it already sits at that SHA. Run `bootstrap` from that config there, when set. Start the server with the repo's start command from `CLAUDE.md` or `AGENTS.md` (`/dev-up` for a Rails app), on a free port, as a process group of its own, with its output in `<qa>/server.log`, where `<qa>` is `$(git rev-parse --git-common-dir)/qa-pr/<pr>`. macOS has no `setsid`: `perl -e 'setpgrp(0,0); exec @ARGV' <start command> > <qa>/server.log 2>&1 &`, and later `kill -- -<pid>`. Run the setup snippets. Done when the app answers on its URL. An app that will not start leaves every scenario not verified: go to step 7 and say why.
 
-6. **Run every scenario.** Drive a real browser: the session's browser tool when it has one, else headless Chromium through Playwright (`npx -y playwright install chromium` once, then a script per scenario under `<qa>`). Per scenario, do its steps, then read the page and compare it against **Expect**, and read the lines `server.log` gained during it. Its outcome is one of:
+6. **Run every scenario.** Drive a real browser: the session's browser tool when it has one, else headless Chromium through Playwright (`npx -y playwright install chromium` once, then a script per scenario under `<qa>`, after `ln -sf <worktree>/node_modules <qa>/node_modules` so the scripts resolve `playwright`). When `qaHelpers` in `.claude/drive-spec.json` names a module, import it from the worktree by absolute path for login and the repo's widgets, and extend it there when a widget it lacks costs you a debugging round. Each script prints every scenario's `Saw:` line: the copy, counts, URLs and filenames it read off the page. Per scenario, do its steps, then read the page and compare it against **Expect**, and read the lines `server.log` gained during it. Its outcome is one of:
    - **passed**: you saw the Expect on screen, and the log shows no error the scenario raised;
    - **failed**: what you saw differs, or the log shows an error: record both, verbatim;
    - **not verified**: you could not run it (an external service, data you could not create, a step no browser can take): record why, and how the operator can check it.
 
    Save a screenshot of each scenario's last state as `<qa>/<k>.png`. Passed means observed: a scenario you did not watch pass is not verified. Done when every scenario has an outcome and its evidence.
 
-7. **Post and clean up.** Post the report below as one comment: `gh api repos/$repo/issues/<pr>/comments -f body=… --silent`. Then stop the server's process group, and remove the worktree with `git worktree remove --force` and `git worktree prune` when step 5 created it. `<qa>` stays, with the screenshots and the log. Print the PR URL and the counts. Done when the comment is on the PR and the server is down.
+7. **Post and clean up.** Write each scenario's `Saw:` from the line its script printed, every figure unedited. Post the report below as one comment: `gh api repos/$repo/issues/<pr>/comments -f body=… --silent`. Then stop the server's process group, and remove the worktree with `git worktree remove --force` and `git worktree prune` when step 5 created it. `<qa>` stays, with the screenshots and the log. Print the PR URL and the counts. Done when the comment is on the PR and the server is down.
 
 ## Plan format
 
@@ -55,7 +55,7 @@ repo=$(git remote get-url origin | sed -E 's#(\.git)?/*$##' | awk -F'[/:]' '{pri
 - Checkout: <command>
 - Server: `/dev-up` (or the repo's start command)
 - Data: <snippets>
-- Log in as: <user / role>
+- Log in as: <user / role> (`qaLogin` in `.claude/drive-spec.json`, when set, is a command that prints one as `email<TAB>password`)
 
 ## Scenarios
 ### 1. <behaviour, in user terms>
