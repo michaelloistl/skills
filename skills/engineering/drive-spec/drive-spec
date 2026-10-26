@@ -1405,12 +1405,27 @@ def run_started(run):
         raise Failed("no run start: pin the gate at step 1 (`drive-spec gate <spec> '<verify>'`)", REFUSE)
 
 
-COVERAGE_LINE = re.compile(r"^\s*[-*]\s+(.*?)\s*(?:→|->)\s*(.+?)\s*$")
+COVERAGE_ITEM = re.compile(r"^\s*[-*]\s+(.*)$")
+COVERAGE_ARROW = re.compile(r"\s*(?:→|->)\s*")
+COVERAGE_SLICES = re.compile(r"(#\d+(?:\s*,\s*#\d+)*)(?:\s+\(.*\))?")
+COVERAGE_KEYWORD = re.compile(r"(unmapped|every slice)(?:\s+\(.*\))?", re.I)
 QUESTION_LINE = re.compile(r"^\s*[-*]\s+(Q\d+):\s*(.+?)\s*$")
 
 
+def coverage_target(text):
+    """A coverage line's target in its canonical form, its trailing `(note)` dropped; None when it fits no form."""
+    if m := COVERAGE_SLICES.fullmatch(text):
+        return ", ".join(re.findall(r"#\d+", m.group(1)))
+    if m := COVERAGE_KEYWORD.fullmatch(text):
+        return m.group(1).lower()
+    if text.lower().startswith("out of scope:"):
+        return text
+    return None
+
+
 def coverage(run):
-    """coverage.md as (requirement, target) pairs, and the lines that fit no form."""
+    """coverage.md as (requirement, target) pairs, and the lines that fit no form.
+    The line splits at the rightmost arrow whose target fits a form, so a requirement may hold an arrow itself."""
     try:
         lines = (run.notes / "coverage.md").read_text().splitlines()
     except OSError:
@@ -1419,18 +1434,21 @@ def coverage(run):
     for line in lines:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        m = COVERAGE_LINE.match(line)
-        target = m.group(2) if m else ""
-        if m and (re.fullmatch(r"(#\d+)(\s*,\s*#\d+)*", target) or target.lower() == "unmapped"
-                  or target.lower().startswith("out of scope:")):
-            pairs.append((m.group(1), target))
+        item = COVERAGE_ITEM.match(line)
+        arrows = list(COVERAGE_ARROW.finditer(item.group(1))) if item else []
+        for arrow in reversed(arrows):
+            requirement, target = item.group(1)[:arrow.start()].strip(), item.group(1)[arrow.end():].strip()
+            if requirement and (target := coverage_target(target)) is not None:
+                pairs.append((requirement, target))
+                break
         else:
             bad.append(line.strip())
     return pairs, bad
 
 
 def owned_requirements(run, m):
-    return [req for req, target in coverage(run)[0] if f"#{m}" in re.findall(r"#\d+", target)]
+    return [req for req, target in coverage(run)[0]
+            if target == "every slice" or f"#{m}" in re.findall(r"#\d+", target)]
 
 
 def questions(run):
@@ -1486,12 +1504,14 @@ def cmd_explored(spec):
         return CONFLICT
     pairs, bad = coverage(run)
     if bad:
-        raise Failed("coverage.md lines fit no form (`- <requirement> → #<m>`, `→ unmapped`, "
-                     "`→ out of scope: <the spec's words>`): " + "; ".join(bad), REFUSE)
+        raise Failed("coverage.md lines fit no form (`- <requirement> → #<m>`, `→ every slice`, `→ unmapped`, "
+                     "`→ out of scope: <the spec's words>`, each but the last with an optional trailing "
+                     "`(note)`): " + "; ".join(bad), REFUSE)
     if not pairs:
         raise Failed("coverage.md maps no requirement: every requirement in the spec gets a line", REFUSE)
     slices = {f"#{x['number']}" for x in plan["slices"]}
-    strays = sorted({ref for _, target in pairs for ref in re.findall(r"#\d+", target)} - slices)
+    strays = sorted({ref for _, target in pairs if target.startswith("#")
+                     for ref in re.findall(r"#\d+", target)} - slices)
     if strays:
         raise Failed(f"coverage.md names {', '.join(strays)}, not slices of #{spec}", REFUSE)
     unmapped = [req for req, target in pairs if target.lower() == "unmapped"]
@@ -1586,6 +1606,17 @@ def spec_head(run, plan, push):
     if dirty(wt):
         raise Failed(f"{wt} has uncommitted changes: commit the fixes, then verify", REFUSE)
     branch = plan["spec_branch"]
+    on = git(wt, "branch", "--show-current")
+    if on != branch:
+        behind = subprocess.run(["git", "-C", str(wt), "merge-base", "--is-ancestor", branch, "HEAD"],
+                                capture_output=True).returncode == 0
+        if on or not behind:
+            raise Failed(f"{wt} is on {on or 'a detached HEAD'}, not {branch}: check out {branch} with the fixes "
+                         "on it", REFUSE)
+        detached = git(wt, "rev-parse", "HEAD")
+        git(wt, "switch", "--quiet", branch)
+        git(wt, "merge", "--ff-only", "--quiet", detached)
+        print(f"reattached {branch} at {detached[:12]}")
     git(wt, "fetch", "--quiet", "origin")
     head, remote = git(wt, "rev-parse", "HEAD"), git(wt, "rev-parse", f"origin/{branch}")
     gate = run_gate_of(run)
@@ -1601,7 +1632,10 @@ def spec_head(run, plan, push):
         elif not green(run, head, gate):
             raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
         else:
-            git(wt, "push", "--quiet", "origin", branch)
+            git(wt, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
+            git(wt, "fetch", "--quiet", "origin")
+            if git(wt, "rev-parse", f"origin/{branch}") != head:
+                raise Failed(f"pushed {head[:12]} to {branch}, but origin/{branch} is not there: push by hand")
             print(f"pushed {head[:12]} to {branch}")
     if not green(run, head, gate):
         raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
@@ -1807,11 +1841,11 @@ def cmd_ask(spec, question, blocking, step, ref=None):
         pending_ref.unlink(missing_ok=True)
     step = step or current.get("step") or "resolve"
     if blocking:
-        run.status(step=step, state="waiting", question=one_line(question, 1000), question_blocking="true",
+        run.status(step=step, state="waiting", question=" ".join(question.split()), question_blocking="true",
                    summary=f"waiting for the operator: {one_line(question, 100)}", next="act on the operator's answer")
         print("asked: end the turn now; the answer arrives as the next prompt, then run `drive-spec answered`")
     else:
-        run.status(step=step, question=one_line(question, 1000), question_blocking="false")
+        run.status(step=step, question=" ".join(question.split()), question_blocking="false")
         print("noted for the operator; carry on")
     return 0
 
@@ -1833,7 +1867,7 @@ def cmd_answered(spec, answer):
     except OSError:
         ref = ""
     with open(run.notes / "decisions.md", "a") as f:
-        f.write(f"- {f'[{ref}] ' if ref else ''}{question}\n  Answer: {one_line(answer, 1000)}\n")
+        f.write(f"- {f'[{ref}] ' if ref else ''}{question}\n  Answer: {" ".join(answer.split())}\n")
     (run.notes / "question-ref").unlink(missing_ok=True)
     step = current.get("step") or "resolve"
     run.status(step=step, state="running", question="", summary=f"operator answered: {one_line(answer, 120)}",

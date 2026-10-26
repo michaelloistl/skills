@@ -1470,6 +1470,17 @@ class Boundaries(DispatcherCase):
         self.write_explore("- Export to CSV → #99\n")
         self.assertIn("names #99, not slices of #10", self.run_ds("explored", "10").stderr)
 
+    def test_explored_reads_notes_inner_arrows_and_every_slice(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export to CSV → #11 (the slice keeps the existing count)\n"
+                           "- Download: blob → object URL → #12\n"
+                           "- No schema change → every slice\n"
+                           "- Replying on #3010 → out of scope: \"Replying on acme/app#3010.\"\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.run_ds("start", "10", "11")
+        self.assertIn("build every requirement it maps to #11", (self.notes() / "brief-11.md").read_text())
+
     def test_explored_waits_for_the_operator_questions(self):
         self.run_ds("gate", "10", GATE)
         self.write_explore("- Export → #11\n", questions="- Q1: Public or sign-in? Recommend public.\n")
@@ -1556,6 +1567,21 @@ class Boundaries(DispatcherCase):
         self.assertEqual(self.run_ds("confirm", "10").returncode, 0)
         self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith(
             "\n\nLeft from review:\n- `README:1`: Rename ExportJob."))
+
+    def test_review_reattaches_a_detached_spec_branch_before_pushing(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE)
+        self.run_ds("review", "10")
+        self.git(self.spec_wt, "checkout", "-q", "--detach")
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("reattached agent/local-spec-10-export", out.stdout)
+        self.assertEqual(self.git(self.spec_wt, "branch", "--show-current"), "agent/local-spec-10-export")
+        self.assertEqual(self.origin_sha("agent/local-spec-10-export"), self.git(self.spec_wt, "rev-parse", "HEAD"))
 
     def test_a_round_that_does_not_fit_is_sent_back(self):
         self.run_ds("gate", "10", GATE)
@@ -1671,6 +1697,9 @@ class Questions(DispatcherCase):
         self.assertTrue(self.comments(10)[-1].endswith("\n\npublic"))
         decisions = self.repo / ".git" / "drive-spec" / "spec-10" / "decisions.md"
         self.assertIn("Answer: public", decisions.read_text())
+        long = "Q1 " + "word " * 400 + "Rec: (a)."
+        self.run_ds("ask", "10", long)
+        self.assertTrue(self.status_file()["question"].endswith("Rec: (a)."))
         self.run_ds("start", "10", "11")
         self.assertIn(f"`{decisions}` holds each answer, and it overrides the issue where they differ. Match",
                       (decisions.parent / "brief-11.md").read_text())

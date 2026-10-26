@@ -17,7 +17,7 @@ While working, run the narrowest check that covers each change: the typecheck, t
 
 Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer.
 
-Build each acceptance criterion as written.<If covered: " `<notes>/coverage.md` maps the spec's requirements to slices: build every requirement it maps to #<m> as part of this issue, as if it were a criterion."> When one cannot be met as written, or you build it differently, that is a deviation: a changelog line or ADR does not record it.
+Build each acceptance criterion as written.<If covered: " `<notes>/coverage.md` maps the spec's requirements to slices: build every requirement it maps to #<m>, and every one it maps to `every slice`, as part of this issue, as if it were a criterion."> When one cannot be met as written, or you build it differently, that is a deviation: a changelog line or ADR does not record it.
 
 Report back in one paragraph: what you built, the commit SHAs, and the verdict line `drive-spec verify` printed, quoted verbatim, such as `green 3a5b17c9eb8c` or `red 3a5b17c9eb8c: exit 1; log …`. Then a `Deviations:` list, one line per acceptance criterion you did not build as written and why, or `Deviations: none`. Red means the verify gate is failing and why; report it as red rather than committing around it.
 ```

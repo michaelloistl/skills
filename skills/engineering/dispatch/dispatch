@@ -625,6 +625,8 @@ def check_merges(dirs):
                         alerts.append(f"{n} OVERLAP {base} {what.split(' ')[0]} touches files the draft PR changes: "
                                       f"{', '.join(overlap[:5])}{' …' if len(overlap) > 5 else ''}")
                     continue
+                if overlap == []:
+                    continue
                 note(d, n, base, sha, what, changed, overlap)
                 noted.append(n)
     save_json(BASES, known)
