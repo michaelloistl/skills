@@ -532,7 +532,8 @@ def stop_group(proc):
 
 def run_gate(gate, wt, out, minutes, heartbeat, started=lambda pgid: None):
     """Run the gate in a process group of its own, stopped whole when it overruns or this script is killed."""
-    proc = subprocess.Popen(["sh", "-c", gate], cwd=wt, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    proc = subprocess.Popen(["sh", "-c", gate], cwd=wt, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                            env=dict(os.environ, DRIVE_SPEC_VERIFY_LOCK=VERIFY_LOCK))
     started(proc.pid)
 
     def killed(signum, _frame):
@@ -660,7 +661,7 @@ def run_claimed(run, wt, head, gate):
         logs = run.notes / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         log = logs / f"{head}.log"
-        lock = verify_lock(head, wt, heartbeat)
+        lock = None if load_config(Path(wt)).get("gateLocks") else verify_lock(head, wt, heartbeat)
         try:
             if green(run, head, gate):
                 return
@@ -673,7 +674,8 @@ def run_claimed(run, wt, head, gate):
             with open(log, "w") as out:
                 code = run_gate(gate, wt, out, minutes, heartbeat, started)
         finally:
-            release(lock)
+            if lock:
+                release(lock)
         if git(wt, "rev-parse", "HEAD") != head:
             raise Failed(f"HEAD moved while the gate ran on {head[:12]}: nothing recorded")
         (run.notes / "verified").mkdir(exist_ok=True)

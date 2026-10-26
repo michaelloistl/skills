@@ -26,7 +26,6 @@ A launch queues when any of these holds; each limit has an env override.
 |---|---|---|
 | `/proc/pressure/cpu` `some avg60` | > 40 | `DISPATCH_MAX_CPU` |
 | `/proc/pressure/memory` `some avg10` | > 5 | `DISPATCH_MAX_MEMORY` |
-| Worktrees inside a watched repo with a `drive-spec verify` on them (specs in their verify gate, running or waiting for the host-wide lock); those elsewhere, such as drive-spec's test repos under `/tmp`, do not count | ≥ 2 | `DISPATCH_MAX_TESTS` |
 
 ## State
 

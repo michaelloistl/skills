@@ -25,7 +25,6 @@ FETCH_SECONDS = 120
 MERGED_PR = re.compile(r"Merge pull request #(\d+) from \S+?/(\S+)")
 MAX_CPU = float(os.environ.get("DISPATCH_MAX_CPU", 40))
 MAX_MEMORY = float(os.environ.get("DISPATCH_MAX_MEMORY", 5))
-MAX_TESTS = int(os.environ.get("DISPATCH_MAX_TESTS", 2))
 STALL_SECONDS = 15 * 60
 TICK_SECONDS = 60
 POLL_SECONDS = 1.0
@@ -157,7 +156,7 @@ def snapshot(dirs):
     live = {r["spec"] for r in rows if r["herdr"] in ("working", "blocked") or r["session"] == "busy"}
     roots = {repo_root(d) for d in dirs}
     queued = [q for q in load_queue() if q["repo"] in roots and q["spec"] not in live]
-    verdict = admit(roots) if queued else None
+    verdict = admit() if queued else None
     for i, q in enumerate(queued):
         row = classify(q["spec"], None, None, None, acked)
         ready = i == 0 and not verdict["reasons"]
@@ -261,35 +260,14 @@ def pressure(kind, window):
     return 0.0
 
 
-def specs_in_tests(roots):
-    """Worktrees inside one of `roots` with a `drive-spec verify` on them, running its gate under the host-wide verify
-    lock or waiting for it. Those on other paths, such as drive-spec's own test repos, are not counted."""
-    worktrees = set()
-    for text in run(["ps", "-Ao", "pid=,args="]).splitlines():
-        pid, *argv = text.split()
-        at = next((i for i, a in enumerate(argv[:2]) if Path(a).name == "drive-spec" and argv[i + 1:i + 2] == ["verify"]), None)
-        if at is None or len(argv) < at + 4:
-            continue
-        try:
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-        except OSError:
-            cwd = ""
-        wt = Path(cwd or "/", argv[at + 3]).resolve()
-        if wt.is_dir() and any(str(wt).startswith(str(Path(r).resolve()) + "/") for r in roots):
-            worktrees.add(wt)
-    return len(worktrees)
-
-
-def admit(roots):
-    cpu, mem, tests = pressure("cpu", "avg60"), pressure("memory", "avg10"), specs_in_tests(roots)
+def admit():
+    cpu, mem = pressure("cpu", "avg60"), pressure("memory", "avg10")
     reasons = []
     if cpu > MAX_CPU:
         reasons.append(f"cpu {cpu:.0f}% > {MAX_CPU:.0f}%")
     if mem > MAX_MEMORY:
         reasons.append(f"memory {mem:.0f}% > {MAX_MEMORY:.0f}%")
-    if tests >= MAX_TESTS:
-        reasons.append(f"{tests} specs in tests (max {MAX_TESTS - 1})")
-    return {"cpu": cpu, "memory": mem, "tests": tests, "reasons": reasons}
+    return {"cpu": cpu, "memory": mem, "reasons": reasons}
 
 
 def load_queue():
@@ -367,7 +345,7 @@ def cmd_launch(specs, dirs, force):
         if row.get("pane") and data.get("state") == "done":
             print(f"{spec} already done in {row['pane']}")
             continue
-        verdict = admit({repo_root(d) for d in dirs})
+        verdict = admit()
         if verdict["reasons"] and not force:
             enqueue(spec, root, "; ".join(verdict["reasons"]))
             print(f"{spec} queued: {'; '.join(verdict['reasons'])}")
@@ -470,10 +448,9 @@ def cmd_recover(dirs, actions):
             print(f"{n} {action} failed: {e}")
 
 
-def cmd_admit(dirs):
-    v = admit({repo_root(d) for d in dirs})
-    print(f"cpu {v['cpu']:.1f}% (max {MAX_CPU:.0f}), memory {v['memory']:.1f}% (max {MAX_MEMORY:.0f}), "
-          f"specs in tests {v['tests']} (max {MAX_TESTS - 1})")
+def cmd_admit():
+    v = admit()
+    print(f"cpu {v['cpu']:.1f}% (max {MAX_CPU:.0f}), memory {v['memory']:.1f}% (max {MAX_MEMORY:.0f})")
     print("blocked: " + "; ".join(v["reasons"]) if v["reasons"] else "clear")
 
 
@@ -817,7 +794,7 @@ def main():
     elif args.cmd == "merges":
         cmd_merges(dirs)
     elif args.cmd == "admit":
-        cmd_admit(dirs)
+        cmd_admit()
     elif args.cmd == "unqueue":
         print(f"{args.spec} unqueued" if dequeue(args.spec, repo_root(dirs[0])) else f"{args.spec} was not queued")
 

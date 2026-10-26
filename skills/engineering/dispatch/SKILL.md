@@ -50,7 +50,7 @@ The operator's commands. "help" prints the first two columns, one line per comma
 | `answer <spec> <text>` | sends your answer to a spec waiting on its question | `dispatch answer <spec> <text>`, with the operator's words exactly as written; relay its line. A refusal (not waiting, still working, no pane) is relayed as is, and the answer is sent only when the operator asks again |
 | `drop <spec>` | takes a spec off the queue | `dispatch unqueue <spec>` |
 | `status` | one line per spec, what needs you first; done specs acked since their last change are left out | `dispatch status`, shown as it stands |
-| `pressure` | CPU, memory and test load, and whether a start would queue | `dispatch admit` |
+| `pressure` | CPU and memory pressure, and whether a start would queue | `dispatch admit` |
 | `ack <spec>` | marks a finished spec's PR seen: hides its line and closes its tab | `dispatch ack <spec>`; also when the operator says they have seen the PR. Relay its line |
 | `recover` | proposes resume, restart or leave for each cut-off spec | Start's step 1 |
 | `help` | this list | print the first two columns |

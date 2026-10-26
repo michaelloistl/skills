@@ -613,6 +613,29 @@ class Verify(Cli):
             self.assertRegex(proc.stdout.read(), r"^green ")
         self.assertEqual(proc.wait(timeout=15), 0)
 
+    def test_a_gate_that_locks_runs_while_another_holds_the_lock_and_is_told_its_path(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"verify": 'test "$DRIVE_SPEC_VERIFY_LOCK" = "$FIX/verify.lock"'}))
+        (self.wt / ".claude").mkdir()
+        (self.wt / ".claude" / "drive-spec.json").write_text(json.dumps({"gateLocks": True}))
+        with open(self.tmp / "verify.lock", "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertRegex(out.stdout, r"^green ")
+
+    def test_gate_locks_in_the_main_checkout_alone_still_takes_the_lock(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "gateLocks": True}))
+        lock = open(self.tmp / "verify.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        proc = subprocess.Popen([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=self.env,
+                                stdout=subprocess.PIPE, text=True)
+        self.assertRegex(proc.stdout.readline(), r"^waiting for the verify lock")
+        lock.close()
+        with proc.stdout:
+            self.assertRegex(proc.stdout.read(), r"^green ")
+        self.assertEqual(proc.wait(timeout=15), 0)
+
     def hold(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": HELD_GATE}))
 
@@ -1184,7 +1207,7 @@ class Dispatcher(DispatcherCase):
             f'else echo "$@" >> {prompts}; echo "{{}}"; fi\n')
         herdr = self.tmp / "bin" / "herdr"
         template = herdr.read_text()
-        env = dict(self.env, HERDR_PANE_ID="p1", XDG_STATE_HOME=str(self.tmp / "state"), DISPATCH_MAX_TESTS="99",
+        env = dict(self.env, HERDR_PANE_ID="p1", XDG_STATE_HOME=str(self.tmp / "state"),
                    DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101")
 
         def launch(status):
