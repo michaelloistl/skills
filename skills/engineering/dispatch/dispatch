@@ -182,6 +182,7 @@ def classify(n, data, pane, session, acked):
         "age": None,
         "attention": None,
         "detail": None,
+        "question": None,
         "acked": False,
     }
     if data:
@@ -191,11 +192,12 @@ def classify(n, data, pane, session, acked):
 
     state = row["state"]
     if herdr == "blocked":
-        row.update(attention="DIALOG", detail="dialog open in the pane")
+        row.update(attention="DIALOG", detail=f"dialog open in {where(pane)}: dispatch open {n}")
     elif not data:
         row["summary"] = "no status file"
     elif state == "waiting" and data.get("question") and data.get("question_blocking"):
-        row.update(attention="ASK", detail=data["question"])
+        row.update(attention="ASK", question=data["question"],
+                   detail=f"question waiting in {where(pane)}: dispatch open {n}")
     elif state == "halted":
         row.update(attention="HALT", detail=f"{row['summary']} → {data.get('next')}")
     elif state == "running" and not pane and not session:
@@ -211,8 +213,14 @@ def classify(n, data, pane, session, acked):
     return row
 
 
+def where(pane):
+    return (pane or {}).get("name") or (pane or {}).get("pane_id") or "no pane"
+
+
 def attention_key(row):
-    return (row["attention"], row["detail"] if row["attention"] in ("ASK", "HALT", "PAUSE", "PR") else None)
+    if row["attention"] == "ASK":
+        return (row["attention"], row["question"])
+    return (row["attention"], row["detail"] if row["attention"] in ("HALT", "PAUSE", "PR") else None)
 
 
 def line(row):
@@ -223,7 +231,7 @@ def line(row):
         return f"{row['spec']} no status file ({live})"
     text = f"{row['spec']} {row['state'] or '?'}·{row['step'] or '?'} {row['summary'] or ''} ({live}, {short_age(row['age'])})"
     if row.get("fyi"):
-        text += f" FYI: {row['fyi']}"
+        text += " FYI: a note waits in its pane"
     return text
 
 
@@ -340,7 +348,7 @@ def cmd_launch(specs, dirs, force):
             print(f"{spec} already running in {row.get('pane') or 'a Claude session outside herdr'}")
             continue
         if row.get("pane") and row.get("attention") == "ASK":
-            print(f"{spec} waiting on its question in {row['pane']}: send the answer with dispatch answer")
+            print(f"{spec} waiting on its question in {row['pane']}: dispatch open {spec}")
             continue
         if row.get("pane") and data.get("state") == "done":
             print(f"{spec} already done in {row['pane']}")
@@ -405,7 +413,7 @@ def recover_plan(dirs):
             else:
                 plan.append((n, "restart", f"interrupted at {r['step']} {when}; no session to reopen"))
         elif state == "waiting":
-            plan.append((n, "leave", f"waiting on your answer: {data.get('question')}"))
+            plan.append((n, "leave", "waiting on your answer in its pane"))
         elif state in ("halted", "paused"):
             plan.append((n, "leave", f"{state} at {r['step']}: {r['summary']}"))
     return plan
@@ -728,6 +736,17 @@ def cmd_answer(spec, text, dirs):
     print(f"{spec} answered in {row['pane']}: {question} → {text}")
 
 
+def cmd_open(spec, dirs):
+    row = next((r for r in snapshot(dirs) if r["spec"] == spec), None)
+    if not row or not row["pane"]:
+        sys.exit(f"{spec} not opened: no pane holds its session; recover it first")
+    try:
+        herdr_json("agent", "focus", row["pane"])
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+        sys.exit(f"{spec} not opened: {e}")
+    print(f"{spec} opened in {row['pane']}")
+
+
 def cmd_ack(spec, dirs):
     data = read_status_files(dirs).get(spec)
     if not data:
@@ -761,6 +780,8 @@ def main():
     sub.add_parser("watch", help="print a line whenever a spec starts or stops needing you")
     a = sub.add_parser("ack", help="hide a done spec until its status changes; close its tab when idle")
     a.add_argument("spec")
+    o = sub.add_parser("open", help="focus a spec's pane, to answer its question or dialog there")
+    o.add_argument("spec")
     an = sub.add_parser("answer", help="send the operator's answer to a spec waiting on its question")
     an.add_argument("spec")
     an.add_argument("text", nargs="+")
@@ -785,6 +806,8 @@ def main():
             pass
     elif args.cmd == "ack":
         cmd_ack(args.spec, dirs)
+    elif args.cmd == "open":
+        cmd_open(args.spec.lstrip("#"), dirs)
     elif args.cmd == "answer":
         cmd_answer(args.spec.lstrip("#"), " ".join(args.text), dirs)
     elif args.cmd == "launch":

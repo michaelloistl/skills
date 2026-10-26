@@ -1736,6 +1736,24 @@ class Questions(DispatcherCase):
         self.assertIn(f"`{decisions}` holds each answer, and it overrides the issue where they differ. Match",
                       (decisions.parent / "brief-11.md").read_text())
 
+    def test_a_question_points_at_its_pane_and_open_focuses_it(self):
+        calls = self.tmp / "herdr-calls"
+        (self.tmp / "bin" / "herdr").write_text(
+            '#!/bin/sh\nif [ "$1 $2" = "agent list" ]; then\n'
+            f'echo \'{{"result": {{"agents": [{{"pane_id": "p1", "name": "spec-10", "cwd": "{self.repo}", '
+            '"agent_status": "idle"}]}}\'\n'
+            f'else echo "$@" >> {calls}; echo "{{}}"; fi\n')
+        self.run_ds("gate", "10", GATE)
+        self.run_ds("ask", "10", "Public or sign-in? Recommend public.")
+        out = subprocess.run([str(DISPATCH), "--repo", str(self.repo), "status"], capture_output=True, text=True,
+                             env=self.env)
+        self.assertIn("10 ASK question waiting in spec-10: dispatch open 10\n", out.stdout)
+        self.assertNotIn("Public", out.stdout)
+        out = subprocess.run([str(DISPATCH), "--repo", str(self.repo), "open", "10"], capture_output=True, text=True,
+                             env=self.env)
+        self.assertEqual((out.returncode, out.stdout), (0, "10 opened in p1\n"), out.stderr)
+        self.assertEqual(calls.read_text(), "agent focus p1\n")
+
     def test_answered_needs_an_open_question(self):
         out = self.run_ds("answered", "10", "public")
         self.assertEqual(out.returncode, 2)
