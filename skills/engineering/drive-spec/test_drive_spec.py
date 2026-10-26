@@ -292,6 +292,7 @@ if out is not None and not silent:
 """
 
 GATE = 'echo run >> "$COUNTER"; test ! -f RED'
+NONE = "Deviations: none\nUnverified: none"
 HELD_GATE = ('echo run >> "$COUNTER"; sleep 60 & echo $! > "$FIX/held.pid"; '
              'while [ ! -f "$FIX/go" ]; do sleep 0.05; done; kill $!; test ! -f RED')
 
@@ -434,7 +435,7 @@ class Cli(unittest.TestCase):
         self.save()
 
     def land_11(self):
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 0, out.stderr)
         out = self.run_ds("land", "10", "11")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -712,32 +713,36 @@ class Verify(Cli):
         self.run_ds("gate", "10", GATE)
         out = self.run_ds("verify", "10", str(self.wt))
         self.assertEqual(out.returncode, 4, out.stdout)
-        self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 4)
+        self.assertEqual(self.run_ds("integrate", "10", "11", "--report", NONE).returncode, 4)
         self.assertFalse(any(p["merged_at"] for p in self.gh_state()["pulls"]))
 
 
 class Integrate(Cli):
     def test_opens_pr_and_merges_at_the_verified_head(self):
-        out = self.run_ds("integrate", "10", "11", "--deviations", "Deviations:\n- none of note")
+        out = self.run_ds("integrate", "10", "11", "--report",
+                          "Deviations:\n- none of note\nUnverified:\n- the toast shows only in a running app")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         pr = self.gh_state()["pulls"][0]
         self.assertEqual((pr["base"], pr["head"], pr["state"]),
                          ("agent/local-spec-10-export", "agent/issue-11-serializer", "closed"))
         self.assertEqual(pr["title"], "Create the serializer")
-        self.assertEqual(pr["body"], "Slice of #10. Ref #11.\n\nDeviations:\n- none of note")
+        head = self.origin_sha("agent/issue-11-serializer")
+        self.assertEqual(re.sub(r" at \S+", " at T", pr["body"]),
+                         f"Slice of #10. Ref #11.\n\nVerification:\n- Gate: `{GATE}`\n- Verdict: green {head[:12]} at T"
+                         "\n\nUnverified:\n- the toast shows only in a running app\n\nDeviations:\n- none of note")
         self.git(self.wt, "fetch", "-q", "origin")
         self.assertEqual(self.git(self.wt, "show", "origin/agent/local-spec-10-export:a.txt"), "a")
 
     def test_skips_the_gate_on_an_already_verified_head(self):
         self.run_ds("verify", "10", str(self.wt))
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.gate_runs(), 1)
 
     def test_reverifies_after_merging_an_advanced_spec_branch(self):
         self.run_ds("verify", "10", str(self.wt))
         self.advance_spec("other.txt", "o\n")
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.gate_runs(), 2)
         self.assertTrue((self.wt / "other.txt").exists())
@@ -745,14 +750,14 @@ class Integrate(Cli):
     def test_red_after_merge_does_not_merge(self):
         self.run_ds("verify", "10", str(self.wt))
         self.advance_spec("RED", "")
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 4)
         self.assertIn("halt the run", out.stdout)
         self.assertEqual(self.gh_state()["pulls"][0]["state"], "open")
 
     def test_conflict_exits_3_with_a_clean_worktree(self):
         self.advance_spec("a.txt", "theirs\n")
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 3, out.stderr)
         self.assertIn("conflict merging agent/local-spec-10-export", out.stdout)
         self.assertIn("a.txt", out.stdout)
@@ -761,7 +766,7 @@ class Integrate(Cli):
 
     def test_conflict_resolved_by_a_merger_then_integrates(self):
         self.advance_spec("a.txt", "theirs\n")
-        self.run_ds("integrate", "10", "11", "--deviations", "none")
+        self.run_ds("integrate", "10", "11", "--report", NONE)
         self.git(self.wt, "fetch", "-q", "origin")
         subprocess.run(["git", "merge", "origin/agent/local-spec-10-export"], cwd=self.wt, env=self.env,
                        capture_output=True)
@@ -774,40 +779,61 @@ class Integrate(Cli):
         (self.wt / "b.txt").write_text("b")
         self.git(self.wt, "add", "b.txt")
         self.git(self.wt, "commit", "-q", "-m", "Add b", "-m", "Co-Authored-By: someone")
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 2)
         self.assertIn("Add b", out.stderr)
         self.assertEqual(self.gh_state()["pulls"], [])
 
-    def test_new_pr_needs_deviations(self):
+    def test_new_pr_needs_a_report(self):
         out = self.run_ds("integrate", "10", "11")
         self.assertEqual(out.returncode, 2)
-        self.assertIn("--deviations", out.stderr)
+        self.assertIn("--report", out.stderr)
 
-    def test_deviations_from_stdin(self):
-        out = subprocess.run([str(SCRIPT), "integrate", "10", "11", "--deviations", "-"], cwd=self.repo,
-                             input="- built as a modal\n", capture_output=True, text=True, env=self.env)
+    def test_report_needs_both_lists(self):
+        out = self.run_ds("integrate", "10", "11", "--report", "Deviations: none")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no Unverified:", out.stderr)
+        self.assertEqual(self.gh_state()["pulls"], [])
+
+    def test_report_from_stdin(self):
+        out = subprocess.run([str(SCRIPT), "integrate", "10", "11", "--report", "-"], cwd=self.repo,
+                             input="Deviations:\n- built as a modal\nUnverified: none\n", capture_output=True,
+                             text=True, env=self.env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertTrue(self.gh_state()["pulls"][0]["body"].endswith("Deviations:\n- built as a modal"))
+        self.assertTrue(self.gh_state()["pulls"][0]["body"].endswith(
+            "Unverified: none\n\nDeviations:\n- built as a modal"))
+
+    def test_local_only_slice_needs_its_proof(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"verify": GATE, "localOnly": {"label": "needs:desktop", "proof": "docs/proof.md"}}))
+        self.edit_state(lambda st: st["issues"]["11"]["labels"].append("needs:desktop"))
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("Proof:", out.stderr)
+        out = self.run_ds("integrate", "10", "11", "--report", NONE + "\nProof: exported from the desktop app")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        body = self.gh_state()["pulls"][0]["body"]
+        self.assertRegex(body, r"- Verdict: green \w{12} at \S+\n- Local proof \(`needs:desktop`, per "
+                               r"`docs/proof.md`\): exported from the desktop app\n\nUnverified: none")
 
     def test_one_integration_at_a_time(self):
         notes = self.repo / ".git" / "drive-spec" / "spec-10"
         notes.mkdir(parents=True, exist_ok=True)
         with open(notes / "integrate.lock", "w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+            out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 2)
         self.assertIn("one slice at a time", out.stderr)
 
     def test_dirty_worktree_refused(self):
         (self.wt / "a.txt").write_text("changed")
-        self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 2)
+        self.assertEqual(self.run_ds("integrate", "10", "11", "--report", NONE).returncode, 2)
 
 
 class IntegratePending(Cli):
     def test_resumes_where_the_bounded_wait_stopped(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": HELD_GATE}))
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none", "--wait-minutes", "0.001")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE, "--wait-minutes", "0.001")
         self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
         self.assertIn("integrate 10 11` again", out.stdout)
         wait_for_pid(self.tmp / "held.pid")
@@ -820,7 +846,7 @@ class IntegratePending(Cli):
 
 class Land(Cli):
     def integrate(self):
-        out = self.run_ds("integrate", "10", "11", "--deviations", "none")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_lands_a_merged_slice(self):
@@ -971,7 +997,7 @@ class Frontier(Cli):
         status = self.repo / ".git" / "drive-spec" / "status"
         status.mkdir(parents=True)
         (status / "spec-10.inbox.md").write_text("## main advanced: #5\n")
-        self.assertEqual(self.run_ds("integrate", "10", "11", "--deviations", "none").returncode, 5)
+        self.assertEqual(self.run_ds("integrate", "10", "11", "--report", NONE).returncode, 5)
         self.assertEqual(self.gh_state()["pulls"], [])
 
     def test_blocked_slice_refuses(self):
@@ -1062,7 +1088,7 @@ class Finish(Cli):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("drive-spec done: all 2 slices landed, review clean. Spec PR #101.", self.comments(10))
         st = self.status_file()
-        self.assertEqual((st["state"], st["step"], st["next"]), ("done", "review-pr", "none"))
+        self.assertEqual((st["state"], st["step"], st["next"]), ("done", "qa-pr", "none"))
 
     def test_conflicts_post_the_list(self):
         self.assertEqual(self.run_ds("finish", "10", "conflicts").returncode, 2)
@@ -1160,7 +1186,7 @@ class Dispatcher(DispatcherCase):
         self.run_ds("finish", "10", "done")
         r = self.row()
         self.assertEqual((r["attention"], r["detail"], r["step"]),
-                         ("PR", "https://github.com/acme/app/pull/101", "review-pr"))
+                         ("PR", "https://github.com/acme/app/pull/101", "qa-pr"))
         self.assertIsNone(self.status_file()["question"])
 
     def test_done_with_review_leftovers(self):
@@ -1316,23 +1342,38 @@ class Confirm(DispatcherCase):
         self.assertEqual(out.returncode, 2)
         self.assertIn("#12", out.stderr)
 
-    def test_closes_the_spec_and_lists_deviations(self):
-        out = self.run_ds("integrate", "10", "11", "--deviations", "Deviations:\n- export runs inline, no job")
+    def test_closes_the_spec_with_verification_unverified_and_deviations(self):
+        out = self.run_ds("integrate", "10", "11", "--report",
+                          "Deviations:\n- export runs inline, no job\nUnverified:\n- the download in Safari")
         self.assertEqual(out.returncode, 0, out.stderr)
+        slice_head = self.origin_sha("agent/issue-11-serializer")
         self.run_ds("land", "10", "11")
         self.close_12()
         out = self.run_ds("confirm", "10", "--left", "- rename ExportJob")
         self.assertEqual(out.returncode, 0, out.stderr)
         spec_pr = self.gh_state()["pulls"][1]
-        self.assertEqual(spec_pr["body"], "Closes #10\n\nSlices, in build order:\n- #11 Create the serializer\n"
-                                          "- #12 Wire the route\n\nDeviations:\n\n#11 Create the serializer\n"
-                                          "- export runs inline, no job\n\nLeft from review:\n- rename ExportJob")
+        head = self.origin_sha("agent/local-spec-10-export")
+        self.assertEqual(re.sub(r" at \S+", " at T", spec_pr["body"]),
+                         "Closes #10\n\nSlices, in build order:\n- #11 Create the serializer\n- #12 Wire the route\n\n"
+                         f"Verification:\n- Gate: `{GATE}`\n- Spec branch: green {head[:12]} at T\n"
+                         f"- #11 Create the serializer (#100): green {slice_head[:12]} at T\n"
+                         "- #12 Wire the route: closed without a slice PR\n\n"
+                         "Unverified:\n\n#11 Create the serializer\n- the download in Safari\n\n"
+                         "Deviations:\n\n#11 Create the serializer\n- export runs inline, no job\n\n"
+                         "Left from review:\n- rename ExportJob")
         self.assertTrue(spec_pr["draft"])
         r = self.row()
         self.assertEqual((r["step"], r["pr_url"]), ("cleanup", "https://github.com/acme/app/pull/101"))
 
+    def test_refuses_an_unverified_spec_head(self):
+        self.edit_state(lambda st: [st["issues"][n].update(state="closed") for n in ("11", "12")])
+        out = self.run_ds("confirm", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("not verified green", out.stderr)
+
     def test_no_deviations_and_opens_a_missing_spec_pr(self):
         self.edit_state(lambda st: [st["issues"][n].update(state="closed") for n in ("11", "12")])
+        self.run_ds("verify", "10", str(self.spec_wt))
         out = self.run_ds("confirm", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         spec_pr = self.gh_state()["pulls"][0]
@@ -1361,6 +1402,13 @@ class Cleanup(DispatcherCase):
         r = self.row()
         self.assertEqual((r["step"], r["state"], r["pr_url"]), ("review-pr", "running", "https://github.com/acme/app/pull/101"))
         self.assertTrue(self.status_file()["summary"].endswith("; reviewing and fixing PR #101"))
+        self.assertIn("`/review-fix-pr 101`, then `drive-spec qa 10`", self.run_ds("next", "10").stdout)
+        out = self.run_ds("qa", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "next: /qa-pr 101\n")
+        r = self.row()
+        self.assertEqual((r["step"], r["state"]), ("qa-pr", "running"))
+        self.assertIn("`/qa-pr 101`, then `drive-spec finish 10 done`", self.run_ds("next", "10").stdout)
 
     def test_stops_a_gate_still_running_in_a_worktree_and_names_the_rest(self):
         self.finish_slices()

@@ -23,10 +23,11 @@ At every step boundary, and within step 6 at each dispatch, landing and halt. `s
 | `review` | `land` of the last slice, or `frontier` as it stops on `done` while the status still reads `build`; then `drive-spec review` at each round, fix and clean |
 | `confirm` | `drive-spec reviewed` |
 | `cleanup` | `drive-spec confirm` |
-| `review-pr` | `drive-spec cleanup`; `finish done`, or `finish halted --step review-pr` |
+| `review-pr` | `drive-spec cleanup`; `finish halted --step review-pr` |
+| `qa-pr` | `drive-spec qa`; `finish done`, or `finish halted --step qa-pr` |
 | any, `waiting` | `drive-spec ask`; `drive-spec answered` sets it `running` again |
 
-`step` is the step's name: `resolve`, `guard`, `worktree`, `preview`, `explore`, `build`, `review`, `confirm`, `cleanup`, `review-pr`.
+`step` is the step's name: `resolve`, `guard`, `worktree`, `preview`, `explore`, `build`, `review`, `confirm`, `cleanup`, `review-pr`, `qa-pr`.
 
 While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes `updated_at` every 5 minutes (`status.sh <spec> --touch`), so a run idle on a background gate never reads as stalled; `pr-<n>` refreshes the running spec whose `pr_url` is that PR.
 
@@ -34,9 +35,9 @@ While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes
 |---|---|---|
 | `running` | the run is working | what it does next |
 | `waiting` | the run has stopped for the operator's answer | what it does once answered |
-| `halted` | a slice went red, step 2 refused the spec, or step 10's fix pass went red | the resume command |
+| `halted` | a slice went red, step 2 refused the spec, step 10's fix pass went red, or step 11 failed a scenario | the resume command |
 | `paused` | `maxSlices`, only held slices left, or `--dry-run` | the resume command |
-| `done` | step 10 posted its status comment | `none` |
+| `done` | step 11 posted its QA comment with no failed scenario | `none` |
 
 `summary` in step 6 counts progress: `landed 3/7; building #2990, #2991`.
 
@@ -60,7 +61,7 @@ A judgement call the run made on its own and the operator may want to revisit is
 
 ## Inbox
 
-The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step, and only once the spec branch exists: the end of `drive-spec open` (step 3), then the start of `preview`, `frontier` (before every pick, and before step 7), `integrate`, `confirm` and `cleanup`. Each reads it itself: with notes waiting, it prints them and exits 5, and runs again once the notes are handled. Notes that arrive before step 3 wait in the inbox for `open`; notes that arrive during step 10 stay unread; once the run is `done`, the dispatcher stops writing notes and alerts the operator itself when base touches files the draft PR changes (from `branch`).
+The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step, and only once the spec branch exists: the end of `drive-spec open` (step 3), then the start of `preview`, `frontier` (before every pick, and before step 7), `integrate`, `confirm` and `cleanup`. Each reads it itself: with notes waiting, it prints them and exits 5, and runs again once the notes are handled. Notes that arrive before step 3 wait in the inbox for `open`; notes that arrive during steps 10 and 11 stay unread; once the run is `done`, the dispatcher stops writing notes and alerts the operator itself when base touches files the draft PR changes (from `branch`).
 
 ```sh
 <skill dir>/status.sh <spec> --inbox

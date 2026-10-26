@@ -880,6 +880,21 @@ def bodied_commits(wt, since):
     return [c[:2] for c in commits if c[2].strip()]
 
 
+def record_verification(run, pr, head):
+    """Write the verdict that clears `head` into the slice PR's Verification: section, keeping its proof lines."""
+    gate = run_gate_of(run)
+    body = json.loads(gh(f"repos/{run.repo}/pulls/{pr}", "--jq", "{body}"))["body"] or ""
+    lines = [f"- Gate: `{gate}`", f"- Verdict: {verdict_line(verdict_of(run, head, gate), head)}"]
+    lines += [x for x in (section(body, "Verification") or "").splitlines() if x.startswith("- Local proof")]
+    new = "Verification:\n" + "\n".join(lines) + "\n\n"
+    if section(body, "Verification") is None:
+        body = re.sub(r"^(Unverified:|Deviations:)", lambda x: new + x.group(1), body, count=1, flags=re.M)
+    else:
+        body = re.sub(r"^Verification:.*?(?=^(?:Unverified|Deviations):)", lambda _: new, body, count=1,
+                      flags=re.S | re.M)
+    gh("-X", "PATCH", f"repos/{run.repo}/pulls/{pr}", "-f", f"body={body}", "--silent")
+
+
 def merge_pr(run, pr, head):
     """Merge the PR at exactly `head`. True when merged, False when GitHub says it cannot merge."""
     for _ in range(40):
@@ -900,7 +915,45 @@ def merge_pr(run, pr, head):
     return True
 
 
-def cmd_integrate(spec, m, deviations, wait=None):
+SECTIONS = ("Verification", "Unverified", "Deviations", "Proof", "Left from review")
+
+
+def section(body, label):
+    """The text under `label:` in a PR body or an implementer report, up to the next known label; None when absent."""
+    others = "|".join(re.escape(x) for x in SECTIONS)
+    m = re.search(rf"^{re.escape(label)}:[ \t]*\n?(.*?)(?=^(?:{others}):|\Z)", (body or "").replace("\r\n", "\n"),
+                  re.S | re.M)
+    return m.group(1).strip() if m else None
+
+
+def listed(text):
+    """A report list, or "" when it is empty or `none`."""
+    text = (text or "").strip()
+    return "" if text.lower().rstrip(".") in ("", "none") else text
+
+
+def verdict_of(run, sha, gate):
+    """The green record that clears this commit under this gate, its own or its tree's; None when there is none."""
+    if not green(run, sha, gate):
+        return None
+    rec = record(run, sha)
+    if rec.get("exit") == 0 and rec.get("gate") == gate:
+        return rec
+    return json.loads((run.notes / "verified" / f"tree-{tree_of(run, sha)}.json").read_text())
+
+
+def verdict_line(rec, sha):
+    return f"green {sha[:12]} at {rec.get('finished_at', '?')}"
+
+
+def slice_body(spec, m, gate, verdict, proof, unverified, deviations):
+    lines = [f"- Gate: `{gate}`", f"- Verdict: {verdict}"] + proof
+    return (f"Slice of #{spec}. Ref #{m}.\n\nVerification:\n" + "\n".join(lines)
+            + "\n\nUnverified:" + (f"\n{unverified}" if unverified else " none")
+            + f"\n\nDeviations:\n{deviations}")
+
+
+def cmd_integrate(spec, m, report_arg, wait=None):
     run = Run(spec)
     deadline = None if wait is None else time.monotonic() + wait * 60
     wt, branch = slice_worktree(run, m)
@@ -928,15 +981,28 @@ def cmd_integrate(spec, m, deviations, wait=None):
     if open_prs:
         pr = open_prs[0]["number"]
     else:
-        if not deviations:
-            raise Failed("opening the slice PR needs --deviations: the implementer's list, or `none`", REFUSE)
-        text = sys.stdin.read() if deviations == "-" else deviations
-        text = re.sub(r"^\s*Deviations:\s*", "", text.strip())
-        title = gh(f"repos/{run.repo}/issues/{m}", "--jq", ".title").strip()
+        if not report_arg:
+            raise Failed("opening the slice PR needs --report: the implementer's Deviations: and Unverified: lists",
+                         REFUSE)
+        text = sys.stdin.read() if report_arg == "-" else report_arg
+        deviations, unverified, proof = (section(text, x) for x in ("Deviations", "Unverified", "Proof"))
+        missing = [x for x, v in (("Deviations:", deviations), ("Unverified:", unverified)) if v is None]
+        if missing:
+            raise Failed(f"the report has no {' or '.join(missing)} list: pass the implementer's, or `none`", REFUSE)
+        info = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "{title, labels: [.labels[].name]}"))
+        local = run.config.get("localOnly") or {}
+        proof_lines = []
+        if local.get("label") in info["labels"]:
+            if not listed(proof):
+                raise Failed(f"#{m} carries `{local['label']}`: the report needs the implementer's Proof: result",
+                             REFUSE)
+            proof_lines = [f"- Local proof (`{local['label']}`, per `{local.get('proof', '')}`): "
+                           + " ".join(proof.split())]
         git(wt, "push", "--quiet", "-u", "origin", branch)
         pr = json.loads(gh(f"repos/{run.repo}/pulls", "-f", f"base={spec_branch}", "-f", f"head={branch}",
-                           "-f", f"title={title}",
-                           "-f", f"body=Slice of #{spec}. Ref #{m}.\n\nDeviations:\n{text}",
+                           "-f", f"title={info['title']}",
+                           "-f", "body=" + slice_body(spec, m, run_gate_of(run), "pending", proof_lines,
+                                                      listed(unverified), deviations or "none"),
                            "--jq", "{number}"))["number"]
         print(f"opened #{pr}")
 
@@ -970,6 +1036,7 @@ def cmd_integrate(spec, m, deviations, wait=None):
         git(wt, "fetch", "--quiet", "origin")
         if git(wt, "rev-parse", f"origin/{spec_branch}") != target:
             continue
+        record_verification(run, pr, head)
         if merge_pr(run, pr, head):
             print(f"merged #{pr}: #{m} into {spec_branch} at {head[:12]}; next: drive-spec land {spec} {m}")
             return 0
@@ -1736,14 +1803,19 @@ def cmd_reviewed(spec, left):
 
 
 def left_of(body):
-    m = re.search(r"^Left from review:\s*\n(.*)\Z", body or "", re.S | re.M)
-    return m.group(1).strip() if m else ""
+    return section(body, "Left from review") or ""
 
 
-def deviations_of(body):
-    m = re.search(r"^Deviations:\s*\n?(.*)\Z", body or "", re.S | re.M)
-    text = (m.group(1) if m else "").strip()
-    return "" if text.lower().rstrip(".") in ("", "none") else text
+def per_slice(found):
+    return "\n\n".join(f"#{x['number']} {x['title']}\n{d}" for x, d in found)
+
+
+def slice_verification(x, pr, body):
+    """One slice's line in the spec PR's Verification: section, from its PR's own."""
+    lines = (section(body, "Verification") or "").splitlines()
+    verdict = next((v.split(":", 1)[1].strip() for v in lines if v.startswith("- Verdict:")), "no verdict recorded")
+    out = [f"- #{x['number']} {x['title']}" + (f" (#{pr}): {verdict}" if pr else ": closed without a slice PR")]
+    return out + ["  " + v for v in lines if v.startswith("- Local proof")]
 
 
 def cmd_confirm(spec, left):
@@ -1761,22 +1833,36 @@ def cmd_confirm(spec, left):
         raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
     base = run.base()
     spec_pr = ensure_spec_pr(run, plan, base)
+    gate = run_gate_of(run)
+    git(run.repo_dir, "fetch", "--quiet", "origin")
+    head = git(run.repo_dir, "rev-parse", f"origin/{plan['spec_branch']}")
+    rec = verdict_of(run, head, gate)
+    if not rec:
+        raise Failed(f"the spec branch HEAD {head[:12]} is not verified green: `drive-spec review {spec}` first",
+                     REFUSE)
     merged = [p for p in run.prs("closed", plan["spec_branch"]) if p["merged_at"]]
-    pr_body = {}
+    pr_of, pr_body = {}, {}
     for p in merged:
         m = re.match(r"agent/issue-(\d+)-", p["head"])
         if m:
+            pr_of[int(m.group(1))] = p["number"]
             pr_body[int(m.group(1))] = json.loads(gh(f"repos/{run.repo}/pulls/{p['number']}", "--jq", "{body}"))["body"]
-    found = [(x, deviations_of(pr_body.get(x["number"]))) for x in plan["slices"]]
+    verification = [f"- Gate: `{gate}`", f"- Spec branch: {verdict_line(rec, head)}"]
+    for x in plan["slices"]:
+        verification += slice_verification(x, pr_of.get(x["number"]), pr_body.get(x["number"]))
+    found = [(x, listed(section(pr_body.get(x["number"]), "Deviations"))) for x in plan["slices"]]
     found = [(x, d) for x, d in found if d]
-    body = f"Closes #{spec}\n\n{slice_listing(plan)}\n\n"
-    body += ("Deviations:\n\n" + "\n\n".join(f"#{x['number']} {x['title']}\n{d}" for x, d in found)) if found \
-        else "Deviations: none"
+    unverified = [(x, listed(section(pr_body.get(x["number"]), "Unverified"))) for x in plan["slices"]]
+    unverified = [(x, u) for x, u in unverified if u]
+    body = f"Closes #{spec}\n\n{slice_listing(plan)}\n\nVerification:\n" + "\n".join(verification) + "\n\n"
+    body += ("Unverified:\n\n" + per_slice(unverified)) if unverified else "Unverified: none"
+    body += "\n\n" + (("Deviations:\n\n" + per_slice(found)) if found else "Deviations: none")
     if left:
         body += "\n\nLeft from review:\n" + left.strip()
     gh("-X", "PATCH", f"repos/{run.repo}/pulls/{spec_pr['number']}", "-f", f"body={body}", "--silent")
     post_progress(run, plan, base, spec_pr)
-    summary = f"spec PR #{spec_pr['number']} closes #{spec}; {len(found)} slice(s) with deviations"
+    summary = (f"spec PR #{spec_pr['number']} closes #{spec}; {len(found)} slice(s) with deviations, "
+               f"{len(unverified)} with unverified behaviour")
     run.status(step="cleanup", state="running", summary=summary, next="drive-spec cleanup", pr_url=spec_pr["url"],
                branch=plan["spec_branch"])
     print(f"{summary}: {spec_pr['url']}")
@@ -1813,10 +1899,23 @@ def cmd_cleanup(spec):
     run.status(step="review-pr", state="running",
                summary="cleaned up: " + (", ".join(removed) or "nothing left")
                + (f"; reviewing and fixing PR #{spec_pr['number']}" if spec_pr else ""),
-               next="/review-fix-pr, then drive-spec finish done", branch=plan["spec_branch"],
+               next=f"/review-fix-pr, then drive-spec qa {spec}", branch=plan["spec_branch"],
                **({"pr_url": url} if url else {}))
     print("removed " + (", ".join(removed) or "nothing"))
     print(url or "no open spec PR")
+    return 0
+
+
+def cmd_qa(spec):
+    run = Run(spec)
+    plan = checked_plan(run)
+    spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"])
+    if not spec_pr:
+        raise Failed("no open spec PR to QA", REFUSE)
+    run.status(step="qa-pr", state="running", summary=f"running QA on PR #{spec_pr['number']}",
+               next=f"/qa-pr {spec_pr['number']}, then drive-spec finish done", branch=plan["spec_branch"],
+               pr_url=spec_pr["url"])
+    print(f"next: /qa-pr {spec_pr['number']}")
     return 0
 
 
@@ -1893,7 +1992,7 @@ STEP_COMMANDS = {
 def next_step(run, status):
     """The command that carries a run on from its status file alone."""
     spec, step, state = run.spec, status.get("step"), status.get("state")
-    if not status or not (run.notes / "run.json").is_file() and step not in ("review-pr", None):
+    if not status or not (run.notes / "run.json").is_file() and step not in ("review-pr", "qa-pr", None):
         return "resolve", f"step 1: resolve the run, then `drive-spec gate {spec} '<verify>' --base <base>`"
     if state == "done":
         return step, "none: the run is done"
@@ -1908,7 +2007,10 @@ def next_step(run, status):
                       else f"`drive-spec explore {spec}`")
     if step == "review-pr":
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
-        return step, f"`/review-fix-pr {pr}`, then `drive-spec finish {spec} done`"
+        return step, f"`/review-fix-pr {pr}`, then `drive-spec qa {spec}`"
+    if step == "qa-pr":
+        pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
+        return step, f"`/qa-pr {pr}`, then `drive-spec finish {spec} done`"
     if step in STEP_COMMANDS:
         return step, f"`{STEP_COMMANDS[step].format(spec=spec)}`"
     return step or "resolve", f"`drive-spec gate {spec} '<verify>' --base <base>`"
@@ -1923,7 +2025,7 @@ def cmd_next(spec):
 
 # halt and finish
 
-OUTCOMES = {"done": ("done", "review-pr"), "halted": ("halted", "build"), "conflicts": ("halted", "explore"),
+OUTCOMES = {"done": ("done", "qa-pr"), "halted": ("halted", "build"), "conflicts": ("halted", "explore"),
             "ceiling": ("paused", "build"), "held": ("paused", "build"), "refused": ("halted", "guard")}
 
 
@@ -2026,7 +2128,7 @@ def main():
     i = sub.add_parser("integrate", help="merge the spec branch into a slice, verify, push, merge its PR")
     i.add_argument("spec")
     i.add_argument("slice")
-    i.add_argument("--deviations", help="the implementer's Deviations list, `none`, or `-` for stdin")
+    i.add_argument("--report", help="the implementer's Deviations:, Unverified: and Proof: lists, or `-` for stdin")
     i.add_argument("--wait-minutes", type=float, dest="wait",
                    help="return after this long, exit 6, while a gate runs on; run again to pick up where it stopped")
     la = sub.add_parser("land", help="close a merged slice, remove its worktree and branch, open the spec PR")
@@ -2050,7 +2152,7 @@ def main():
     op = sub.add_parser("open", help="open the spec worktree: resume the spec branch from origin, or cut and push it")
     op.add_argument("spec")
     op.add_argument("--base", help="base branch; default from the status file, config, or the repo")
-    co = sub.add_parser("confirm", help="with every slice closed: the spec PR closes the spec and lists deviations")
+    co = sub.add_parser("confirm", help="with every slice closed: the spec PR closes the spec, with verification, unverified and deviations")
     co.add_argument("spec")
     co.add_argument("--left", help="what the last review left open, or `-` for stdin")
     pv = sub.add_parser("preview", help="print the run, refresh the progress comment; --dry-run pauses there")
@@ -2069,6 +2171,8 @@ def main():
     rv.add_argument("--left", help="more for the left list, beyond the rounds' judgement calls; `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
+    qa = sub.add_parser("qa", help="step 11: mark QA of the spec PR begun and print the /qa-pr command")
+    qa.add_argument("spec")
     ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
     ak.add_argument("spec")
     ak.add_argument("question", help="the question, with the options and your recommendation")
@@ -2099,7 +2203,7 @@ def main():
         elif args.cmd == "verify":
             code = cmd_verify(spec, args.worktree, args.gate, args.wait, args.worker)
         elif args.cmd == "integrate":
-            code = cmd_integrate(spec, int(args.slice.lstrip("#")), args.deviations, args.wait)
+            code = cmd_integrate(spec, int(args.slice.lstrip("#")), args.report, args.wait)
         elif args.cmd == "land":
             code = cmd_land(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "progress":
@@ -2110,6 +2214,8 @@ def main():
             code = cmd_confirm(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "cleanup":
             code = cmd_cleanup(spec)
+        elif args.cmd == "qa":
+            code = cmd_qa(spec)
         elif args.cmd == "ask":
             code = cmd_ask(spec, args.question, args.blocking, args.step, args.ref)
         elif args.cmd == "explore":
