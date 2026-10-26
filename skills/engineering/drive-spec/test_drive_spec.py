@@ -321,7 +321,7 @@ class Cli(unittest.TestCase):
     """The script end to end: real git against a bare origin, a fake `gh` holding the tracker."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.tmp = Path(tempfile.mkdtemp(prefix="drive-spec-test-")).resolve()
         self.addCleanup(self.reap)
         self.origin = self.tmp / "origin.git"
         self.repo = self.tmp / "repo"
