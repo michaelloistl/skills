@@ -1208,7 +1208,7 @@ class Dispatcher(DispatcherCase):
         herdr = self.tmp / "bin" / "herdr"
         template = herdr.read_text()
         env = dict(self.env, HERDR_PANE_ID="p1", XDG_STATE_HOME=str(self.tmp / "state"),
-                   DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101")
+                   DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101", DISPATCH_MAX_LOAD="9999")
 
         def launch(status):
             herdr.write_text(template.replace("{STATUS}", status))
@@ -1225,6 +1225,12 @@ class Dispatcher(DispatcherCase):
         self.assertEqual(launch("done"), ("10 resumed in p1 with /review-fix-pr 101", "agent prompt p1 /review-fix-pr 101"))
         subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "state=running", "step=build"], cwd=self.repo, env=env)
         self.assertEqual(launch("idle"), ("10 resumed in p1 with /drive-spec 10", "agent prompt p1 /drive-spec 10"))
+
+    def test_load_above_its_limit_blocks_a_launch(self):
+        env = dict(self.env, DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101", DISPATCH_MAX_LOAD="-1")
+        out = subprocess.run([str(DISPATCH), "--repo", str(self.repo), "admit"], capture_output=True, text=True,
+                             env=env)
+        self.assertRegex(out.stdout, r"\nblocked: load \d+\.\d > -1\n$")
 
     def test_refusal_halts_at_guard(self):
         self.edit_state(lambda st: st["issues"]["10"].update(body="## Parent\n\n#1\n"))

@@ -25,6 +25,7 @@ FETCH_SECONDS = 120
 MERGED_PR = re.compile(r"Merge pull request #(\d+) from \S+?/(\S+)")
 MAX_CPU = float(os.environ.get("DISPATCH_MAX_CPU", 40))
 MAX_MEMORY = float(os.environ.get("DISPATCH_MAX_MEMORY", 5))
+MAX_LOAD = float(os.environ.get("DISPATCH_MAX_LOAD", os.cpu_count() or 1))
 STALL_SECONDS = 15 * 60
 TICK_SECONDS = 60
 POLL_SECONDS = 1.0
@@ -269,13 +270,15 @@ def pressure(kind, window):
 
 
 def admit():
-    cpu, mem = pressure("cpu", "avg60"), pressure("memory", "avg10")
+    cpu, mem, load = pressure("cpu", "avg60"), pressure("memory", "avg10"), os.getloadavg()[1]
     reasons = []
     if cpu > MAX_CPU:
         reasons.append(f"cpu {cpu:.0f}% > {MAX_CPU:.0f}%")
     if mem > MAX_MEMORY:
         reasons.append(f"memory {mem:.0f}% > {MAX_MEMORY:.0f}%")
-    return {"cpu": cpu, "memory": mem, "reasons": reasons}
+    if load > MAX_LOAD:
+        reasons.append(f"load {load:.1f} > {MAX_LOAD:g}")
+    return {"cpu": cpu, "memory": mem, "load": load, "reasons": reasons}
 
 
 def load_queue():
@@ -458,7 +461,8 @@ def cmd_recover(dirs, actions):
 
 def cmd_admit():
     v = admit()
-    print(f"cpu {v['cpu']:.1f}% (max {MAX_CPU:.0f}), memory {v['memory']:.1f}% (max {MAX_MEMORY:.0f})")
+    print(f"cpu {v['cpu']:.1f}% (max {MAX_CPU:.0f}), memory {v['memory']:.1f}% (max {MAX_MEMORY:.0f}), "
+          f"load {v['load']:.1f} (max {MAX_LOAD:g})")
     print("blocked: " + "; ".join(v["reasons"]) if v["reasons"] else "clear")
 
 

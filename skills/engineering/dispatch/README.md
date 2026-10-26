@@ -27,6 +27,7 @@ A launch queues when any of these holds; each limit has an env override.
 |---|---|---|
 | `/proc/pressure/cpu` `some avg60` | > 40 | `DISPATCH_MAX_CPU` |
 | `/proc/pressure/memory` `some avg10` | > 5 | `DISPATCH_MAX_MEMORY` |
+| 5-minute load average, which sees steady work on every core that CPU pressure misses | > the CPU count | `DISPATCH_MAX_LOAD` |
 
 ## State
 
