@@ -5,7 +5,7 @@ Fill the placeholders and hand this to a reviewer subagent. Point, never paste: 
 ```markdown
 You are reviewing one open pull request so its owner can judge it before reading it. Read-only: your only product is the review file.
 
-Worktree: <path>, on the PR head. PR: #<n> (`gh api repos/<owner/name>/pulls/<n>`), base `<base>`. Linked issue: #<m> (`gh api repos/<owner/name>/issues/<m>`) <or: "none — judge the PR on its own description">.
+Worktree: <path>, on the PR head. PR: #<n> (`gh api repos/<owner/name>/pulls/<n>`), base `<base>`. Linked issue: #<m> (`gh api repos/<owner/name>/issues/<m>`; its `Operator decision.` comments, at `gh api repos/<owner/name>/issues/<m>/comments`, override the issue where they differ, so a point that contradicts one stays out) <or: "none — judge the PR on its own description">.
 
 Gather:
 - the diff: `git -C <path> diff origin/<base>...HEAD`
