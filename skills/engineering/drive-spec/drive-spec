@@ -19,7 +19,7 @@ from pathlib import Path
 REF = re.compile(r"#(\d+)\b")
 HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*#*\s*$")
 MARKER = "<!-- implement-spec -->"
-PR_FIELDS = ".[] | {number, head: .head.ref, url: .html_url, merged_at}"
+PR_FIELDS = ".[] | {number, head: .head.ref, sha: .head.sha, url: .html_url, merged_at}"
 VERIFY_LOCK = os.environ.get("DRIVE_SPEC_VERIFY_LOCK", "/tmp/drive-spec-verify.lock")
 VERIFY_TIMEOUT_MINUTES = 60
 TIMED_OUT = 124
@@ -2040,6 +2040,18 @@ OUTCOMES = {"done": ("done", "qa-pr"), "halted": ("halted", "build"), "conflicts
             "ceiling": ("paused", "build"), "held": ("paused", "build"), "refused": ("halted", "guard")}
 
 
+def qa_passed(run, spec_pr):
+    n, head = spec_pr["number"], spec_pr["sha"][:12]
+    verdicts = [b.splitlines()[0] for b in json_lines(gh("--paginate", f"repos/{run.repo}/issues/{n}/comments",
+                                                         "--jq", ".[] | .body | tojson"))
+                if b.startswith(f"qa-pr done at {head}:")]
+    if not verdicts:
+        raise Failed(f"not done: no `qa-pr done` comment on PR #{n} names {head}: `drive-spec qa {run.spec}`, "
+                     f"then `/qa-pr {n}`", REFUSE)
+    if not re.search(r"\b0 failed\b", verdicts[-1]):
+        raise Failed(f"not done: {verdicts[-1]} Halt the run on the failed scenarios", REFUSE)
+
+
 def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=None):
     spec = run.spec
     plan = make_plan(run)
@@ -2062,6 +2074,7 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=Non
             spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"]) if plan["spec_branch"] else None
             if not spec_pr:
                 raise Failed("not done: no open spec PR", REFUSE)
+            qa_passed(run, spec_pr)
             if left is None:
                 left = left_of(json.loads(gh(f"repos/{run.repo}/pulls/{spec_pr['number']}", "--jq", "{body}"))["body"])
             review = "review left findings open" if left else "review clean"

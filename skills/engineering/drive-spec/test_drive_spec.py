@@ -434,6 +434,11 @@ class Cli(unittest.TestCase):
         fn(self.state)
         self.save()
 
+    def qa_done(self, failed=0):
+        head = self.origin_sha("agent/local-spec-10-export")[:12]
+        self.edit_state(lambda st: st["comments"].append(
+            {"id": 990, "issue": 101, "body": f"qa-pr done at {head}: 5 passed, {failed} failed, 1 not verified."}))
+
     def land_11(self):
         out = self.run_ds("integrate", "10", "11", "--report", NONE)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -1081,9 +1086,19 @@ class Finish(Cli):
         self.assertIn("#11, #12 still open", out.stderr)
         self.assertEqual(self.comments(10), [])
 
+    def test_done_needs_qa_of_the_spec_head(self):
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        out = self.run_ds("finish", "10", "done")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("no `qa-pr done` comment on PR #101 names", out.stderr)
+        self.qa_done(failed=1)
+        self.assertIn("failed", self.run_ds("finish", "10", "done").stderr)
+
     def test_done(self):
         self.land_11()
         self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        self.qa_done()
         out = self.run_ds("finish", "10", "done")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("drive-spec done: all 2 slices landed, review clean. Spec PR #101.", self.comments(10))
@@ -1183,6 +1198,7 @@ class Dispatcher(DispatcherCase):
         subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "question=keep CSV?", "question_blocking=false"],
                        cwd=self.repo, env=self.env)
         self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        self.qa_done()
         self.run_ds("finish", "10", "done")
         r = self.row()
         self.assertEqual((r["attention"], r["detail"], r["step"]),
@@ -1192,6 +1208,7 @@ class Dispatcher(DispatcherCase):
     def test_done_with_review_leftovers(self):
         self.land_11()
         self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        self.qa_done()
         out = subprocess.run([str(SCRIPT), "finish", "10", "done", "--left", "-"], cwd=self.repo, env=self.env,
                              input="- rename ExportJob\n", capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
