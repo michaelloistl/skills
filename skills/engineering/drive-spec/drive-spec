@@ -1946,6 +1946,11 @@ def cmd_qa(spec):
     spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"])
     if not spec_pr:
         raise Failed("no open spec PR to QA", REFUSE)
+    if run.config.get("qa") is False:
+        run.status(step="qa-pr", state="running", summary=f"QA off; finishing PR #{spec_pr['number']}",
+                   next="drive-spec finish done", branch=plan["spec_branch"], pr_url=spec_pr["url"])
+        print(f"next: drive-spec finish {spec} done (qa off in .claude/drive-spec.json)")
+        return 0
     run.status(step="qa-pr", state="running", summary=f"running QA on PR #{spec_pr['number']}",
                next=f"/qa-pr {spec_pr['number']}, then drive-spec finish done", branch=plan["spec_branch"],
                pr_url=spec_pr["url"])
@@ -2047,6 +2052,8 @@ def next_step(run, status):
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
         return step, f"`/review-fix-pr {pr}`, then `drive-spec qa {spec}`"
     if step == "qa-pr":
+        if run.config.get("qa") is False:
+            return step, f"`drive-spec finish {spec} done`"
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
         return step, f"`/qa-pr {pr}`, then `drive-spec finish {spec} done`"
     if step in STEP_COMMANDS:
@@ -2101,7 +2108,8 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=Non
             spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"]) if plan["spec_branch"] else None
             if not spec_pr:
                 raise Failed("not done: no open spec PR", REFUSE)
-            qa_passed(run, spec_pr)
+            if run.config.get("qa") is not False:
+                qa_passed(run, spec_pr)
             if left is None:
                 left = left_of(json.loads(gh(f"repos/{run.repo}/pulls/{spec_pr['number']}", "--jq", "{body}"))["body"])
             review = "review left findings open" if left else "review clean"

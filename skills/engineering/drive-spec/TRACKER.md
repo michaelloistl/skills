@@ -52,7 +52,7 @@ A fresh comment on the spec issue as the run's last action, never an edit: edits
 
 | Outcome | First line | Refused when |
 |---|---|---|
-| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` With a `Left from review:` list in the spec PR body (or `--left`), `review left findings open`, then the list | a slice is open, or no spec PR is |
+| done | `drive-spec done: all <k> slices landed, review clean. Spec PR #<pr>.` With a `Left from review:` list in the spec PR body (or `--left`), `review left findings open`, then the list | a slice is open, no spec PR is, or (unless `qa` is `false`) no `qa-pr done` comment names its head with 0 failed |
 | halted | `drive-spec halted on #<m>: <why>.`, or without a slice `drive-spec halted: <why>.` | no `--why` |
 | conflicts | `drive-spec halted before building: the spec and its slices disagree.`, then the list from `conflicts.md` | `conflicts.md` is empty |
 | ceiling | `drive-spec paused at maxSlices: <landed> of <k> slices landed.` | |

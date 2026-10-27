@@ -1130,6 +1130,14 @@ class Finish(Cli):
         st = self.status_file()
         self.assertEqual((st["state"], st["step"], st["next"]), ("done", "qa-pr", "none"))
 
+    def test_done_without_qa_when_qa_is_off(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "qa": False}))
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        out = self.run_ds("finish", "10", "done")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("drive-spec done: all 2 slices landed, review clean. Spec PR #101.", self.comments(10))
+
     def test_conflicts_post_the_list(self):
         self.assertEqual(self.run_ds("finish", "10", "conflicts").returncode, 2)
         notes = self.repo / ".git" / "drive-spec" / "spec-10"
@@ -1451,6 +1459,15 @@ class Cleanup(DispatcherCase):
         r = self.row()
         self.assertEqual((r["step"], r["state"]), ("qa-pr", "running"))
         self.assertIn("`/qa-pr 101`, then `drive-spec finish 10 done`", self.run_ds("next", "10").stdout)
+
+    def test_qa_off_points_at_finish(self):
+        self.finish_slices()
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "qa": False}))
+        out = self.run_ds("qa", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "next: drive-spec finish 10 done (qa off in .claude/drive-spec.json)\n")
+        self.assertEqual(self.row()["step"], "qa-pr")
+        self.assertIn("`drive-spec finish 10 done`", self.run_ds("next", "10").stdout)
 
     def test_stops_a_gate_still_running_in_a_worktree_and_names_the_rest(self):
         self.finish_slices()
