@@ -1,0 +1,11 @@
+{
+  "baseBranch": "main",
+  "verify": "scripts/verify.sh",
+  "parallel": false,
+  "worktreeRoot": ".claude/worktrees",
+  "qa": false,
+  "localOnly": {
+    "label": "needs:rex",
+    "proof": "docs/agents/rex-proof.md"
+  }
+}
