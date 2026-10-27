@@ -15,7 +15,7 @@ Round <k> raised these, each citing the written rule it breaks (`Rule:`) or how 
 
 Fix every one. Test-first where a test can exist: write it, watch it fail, make it pass; a `Fails:` finding's test reproduces its steps. Change only what the findings ask for.
 
-Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer. Then run the verify gate: `<skill dir>/drive-spec verify <spec> <path> --wait-minutes 9`, in the foreground with a 10-minute Bash timeout. Exit 6 prints `running …`: the gate goes on, so run the same command again until it prints a verdict. Its exit code is the verdict, so run it bare: no pipe and no command after it. Red: fix, commit, verify again.
+Before the gate, run the repo's lint command, as `CLAUDE.md` or `AGENTS.md` names it, and the tests of every class you changed, until both pass. Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer. Then run the verify gate: `<skill dir>/drive-spec verify <spec> <path> --wait-minutes 9`, in the foreground with a 10-minute Bash timeout. Exit 6 prints `running …`: the gate goes on, so run the same command again until it prints a verdict. Its exit code is the verdict, so run it bare: no pipe and no command after it. Red: fix, commit, verify again.
 
 Report back in one paragraph: what you changed for each finding, the commit SHAs, and the verdict line `drive-spec verify` printed, quoted verbatim (`green SHA` or `red SHA: …`).
 ```
