@@ -488,15 +488,16 @@ class Heartbeat:
             subprocess.run([str(script), self.spec, "--touch"], cwd=self.run.repo_dir, timeout=60)
 
 
-def verify_lock(head, wt, heartbeat):
-    """The host-wide gate lock, one gate at a time; says who holds it before waiting."""
+def verify_lock(head, wt, heartbeat, log):
+    """The host-wide gate lock, one gate at a time; says who holds it before waiting, and in the gate's log."""
     lock = open(VERIFY_LOCK, "a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock.seek(0)
-        print(f"waiting for the verify lock, held by {lock.read().strip() or 'a gate run outside drive-spec'}",
-              flush=True)
+        waiting = f"waiting for the verify lock, held by {lock.read().strip() or 'a gate run outside drive-spec'}"
+        log.write_text(waiting + "\n")
+        print(waiting, flush=True)
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -661,7 +662,7 @@ def run_claimed(run, wt, head, gate):
         logs = run.notes / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         log = logs / f"{head}.log"
-        lock = None if load_config(Path(wt)).get("gateLocks") else verify_lock(head, wt, heartbeat)
+        lock = None if load_config(Path(wt)).get("gateLocks") else verify_lock(head, wt, heartbeat, log)
         try:
             if green(run, head, gate):
                 return
@@ -728,9 +729,15 @@ def settle(run, wt, deadline, keep=None):
     return True
 
 
-def pending(head, wait):
-    print(f"running {head[:12]}: the gate is still running after {wait:g} minutes; run this same command again "
-          "to keep waiting")
+def pending(run, head, wait):
+    try:
+        last = next((x.strip() for x in reversed((run.notes / "logs" / f"{head}.log").read_text().splitlines())
+                     if x.strip()), "")
+    except OSError:
+        last = ""
+    state = f"queued after {wait:g} minutes, {last}" if last.startswith("waiting for ") \
+        else f"the gate is still running after {wait:g} minutes"
+    print(f"running {head[:12]}: {state}; run this same command again to keep waiting")
 
 
 def spawn_worker(run, wt, gate):
@@ -757,7 +764,7 @@ def verify(run, wt, gate=None, wait=None):
         return True
     deadline = None if wait is None else time.monotonic() + wait * 60
     if not settle(run, wt, deadline, keep=head):
-        pending(head, wait)
+        pending(run, head, wait)
         return None
     worker = None
     held = runner(run, head)
@@ -770,7 +777,7 @@ def verify(run, wt, gate=None, wait=None):
         worker = spawn_worker(run, wt, gate)
     rec = attach(run, head, deadline, worker)
     if rec is None:
-        pending(head, wait)
+        pending(run, head, wait)
         return None
     if rec.get("missing") or rec.get("gate") != gate:
         raise Failed(f"the gate run on {head[:12]} ended without a verdict; log {run.notes / 'logs' / f'{head}.log'}")

@@ -657,6 +657,27 @@ class Verify(Cli):
         self.assertRegex(out.stdout, r"green [0-9a-f]{12}")
         self.assertEqual(self.gate_runs(), 1)
 
+    def test_a_bounded_wait_on_a_gate_queued_for_a_slot_says_who_holds_it(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": (
+            'echo "waiting for one of 2 verify slots, held by pid 9 verifying x" >&2; ' + HELD_GATE)}))
+        out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.01")
+        self.assertEqual(out.returncode, 6, out.stderr)
+        self.assertRegex(out.stdout, r"^running [0-9a-f]{12}: queued after 0\.01 minutes, waiting for one of 2 "
+                                     r"verify slots, held by pid 9 verifying x; run this same command again")
+        (self.tmp / "go").write_text("")
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "1").returncode, 0)
+
+    def test_a_bounded_wait_on_the_verify_lock_says_who_holds_it(self):
+        lock = open(self.tmp / "verify.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock.write("pid 1 verifying abc in /elsewhere\n")
+        lock.flush()
+        out = self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "0.01")
+        self.assertEqual(out.returncode, 6, out.stderr)
+        self.assertIn("queued after 0.01 minutes, waiting for the verify lock, held by pid 1 verifying abc", out.stdout)
+        lock.close()
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt), "--wait-minutes", "1").returncode, 0)
+
     def test_a_second_run_on_the_same_commit_attaches(self):
         self.hold()
         first = subprocess.Popen([str(SCRIPT), "verify", "10", str(self.wt)], cwd=self.repo, env=self.env,
