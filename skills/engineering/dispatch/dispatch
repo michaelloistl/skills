@@ -61,6 +61,15 @@ def read_status_files(dirs):
     return specs
 
 
+def read_archived(dirs, n):
+    for d in dirs:
+        try:
+            return json.loads((d / "archive" / f"spec-{n}.json").read_text())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def herdr_agents():
     try:
         return json.loads(run(["herdr", "agent", "list"]) or "{}").get("result", {}).get("agents", [])
@@ -152,7 +161,8 @@ def snapshot(dirs):
 
     rows = []
     for n in sorted(set(files) | set(pane_of) | set(session_of), key=lambda x: int(x) if x.isdigit() else 0):
-        rows.append(classify(n, files.get(n), pane_of.get(n), session_of.get(n), acked))
+        rows.append(classify(n, files.get(n), pane_of.get(n), session_of.get(n), acked,
+                             None if n in files else read_archived(dirs, n)))
 
     live = {r["spec"] for r in rows if r["herdr"] in ("working", "blocked") or r["session"] == "busy"}
     roots = {repo_root(d) for d in dirs}
@@ -167,7 +177,7 @@ def snapshot(dirs):
     return rows
 
 
-def classify(n, data, pane, session, acked):
+def classify(n, data, pane, session, acked, archived=None):
     herdr = pane.get("agent_status") if pane else None
     busy = (session or {}).get("status") == "busy"
     live = herdr in ("working", "blocked") or busy
@@ -194,6 +204,10 @@ def classify(n, data, pane, session, acked):
     state = row["state"]
     if herdr == "blocked":
         row.update(attention="DIALOG", detail=f"dialog open in {where(pane)}: dispatch open {n}")
+    elif not data and archived:
+        row.update(state="landed", pr_url=archived.get("pr_url"), age=age(archived.get("updated_at")),
+                   acked=acked.get(n) == archived.get("updated_at"),
+                   summary=f"PR landed, status archived; dispatch ack {n} closes its tab")
     elif not data:
         row["summary"] = "no status file"
     elif state == "waiting" and data.get("question") and data.get("question_blocking"):
@@ -229,7 +243,9 @@ def line(row):
         return f"{row['spec']} {row['attention']} {row['detail']}"
     live = "busy" if row["session"] == "busy" else row["herdr"] or row["session"] or "no pane"
     if not row["state"]:
-        return f"{row['spec']} no status file ({live})"
+        return f"{row['spec']} no status file ({live}); dispatch ack {row['spec']} closes its tab"
+    if row["state"] == "landed":
+        return f"{row['spec']} {row['summary']} ({live})"
     text = f"{row['spec']} {row['state'] or '?'}·{row['step'] or '?'} {row['summary'] or ''} ({live}, {short_age(row['age'])})"
     if row.get("fyi"):
         text += " FYI: a note waits in its pane"
@@ -752,14 +768,17 @@ def cmd_open(spec, dirs):
 
 
 def cmd_ack(spec, dirs):
-    data = read_status_files(dirs).get(spec)
-    if not data:
-        sys.exit(f"dispatch: no status file for {spec}")
-    acked = load_acked()
-    acked[spec] = data.get("updated_at")
-    save_json(ACKED, acked)
+    data = read_status_files(dirs).get(spec) or read_archived(dirs, spec)
     row = next((r for r in snapshot(dirs) if r["spec"] == spec), None)
     pane = (row or {}).get("pane")
+    if not data and not pane:
+        sys.exit(f"{spec} not acked: no status file, archived or live, and no pane")
+    if data:
+        acked = load_acked()
+        acked[spec] = data.get("updated_at")
+        save_json(ACKED, acked)
+    else:
+        data = {"state": "done", "session_id": (row or {}).get("session_id")}
     if data.get("state") != "done" or not pane:
         print(f"{spec} acked" + ("; pane kept, not done" if pane else ""))
         return
@@ -772,7 +791,8 @@ def cmd_ack(spec, dirs):
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, TypeError) as e:
         print(f"{spec} acked; tab not closed: {e}")
         return
-    print(f"{spec} acked; tab {tab} closed, resume with claude --resume {data.get('session_id')}")
+    sid = data.get("session_id")
+    print(f"{spec} acked; tab {tab} closed" + (f", resume with claude --resume {sid}" if sid else ""))
 
 
 def main():
@@ -809,7 +829,7 @@ def main():
         except KeyboardInterrupt:
             pass
     elif args.cmd == "ack":
-        cmd_ack(args.spec, dirs)
+        cmd_ack(args.spec.lstrip("#"), dirs)
     elif args.cmd == "open":
         cmd_open(args.spec.lstrip("#"), dirs)
     elif args.cmd == "answer":
