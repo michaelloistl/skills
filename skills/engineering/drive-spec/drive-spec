@@ -1796,6 +1796,7 @@ def cmd_review(spec):
     brief_path.write_text(fill("REVIEWER.md", {
         "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
         "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
+        "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
         "out": round_file(run, k, "json")}, {
         "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier)}) + "\n")
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",

@@ -1676,6 +1676,10 @@ class Boundaries(DispatcherCase):
         self.assertEqual(self.origin_sha("agent/local-spec-10-export"), self.git(self.spec_wt, "rev-parse", "HEAD"))
         self.assertIn(str(self.notes() / "review" / "round-1.json"),
                       (self.notes() / "review" / "round-2.brief.md").read_text())
+        round_1 = json.loads((self.notes() / "review" / "round-1.meta.json").read_text())["head"]
+        self.assertIn(f"diff {round_1}..{self.git(self.spec_wt, 'rev-parse', 'HEAD')}` is what changed since",
+                      (self.notes() / "review" / "round-2.brief.md").read_text())
+        self.assertNotIn("is what changed since", (self.notes() / "review" / "round-1.brief.md").read_text())
         self.round_(2, self.CALL)
         self.assertIn("review clean at round 2", self.run_ds("review", "10").stdout)
         out = self.run_ds("reviewed", "10")
