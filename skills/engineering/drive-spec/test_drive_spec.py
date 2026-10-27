@@ -1620,7 +1620,7 @@ class Boundaries(DispatcherCase):
         self.assertIn("no finished review round", self.run_ds("reviewed", "10").stderr)
         self.round_(1, self.RULE, self.CALL)
         out = self.run_ds("review", "10")
-        self.assertIn("round 1 raised 1 rule finding(s) and 1 judgement call(s)", out.stdout)
+        self.assertIn("round 1 raised 1 finding(s) to fix and 1 judgement call(s)", out.stdout)
         fix = (self.notes() / "review" / "round-1.fix.md").read_text()
         self.assertIn("1. `README:1`: No CSV export.\n   Rule: spec #10: Export to CSV", fix)
         self.assertNotIn("Rename ExportJob", fix)
@@ -1669,6 +1669,19 @@ class Boundaries(DispatcherCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("hours-<start>-<end>.csv", (self.notes() / "review" / "round-1.fix.md").read_text())
 
+    def test_a_bug_finding_goes_to_the_fixer_and_blocks_reviewed(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, {"kind": "bug", "path": "README", "line": 1, "finding": "An invalid submit shows no error.",
+                        "fails": "Submit a start after the end: the sheet re-renders with no message."})
+        out = self.run_ds("review", "10")
+        self.assertIn("round 1 raised 1 finding(s) to fix and 0 judgement call(s)", out.stdout)
+        self.assertIn("1. `README:1`: An invalid submit shows no error.\n   Fails: Submit a start after the end",
+                      (self.notes() / "review" / "round-1.fix.md").read_text())
+        self.assertIn("not a clean review", self.run_ds("reviewed", "10").stderr)
+
     def test_a_round_that_does_not_fit_is_sent_back(self):
         self.run_ds("gate", "10", GATE)
         self.close_all()
@@ -1676,10 +1689,12 @@ class Boundaries(DispatcherCase):
         self.run_ds("review", "10")
         self.round_(1, {"kind": "rule", "rule": "be tidy", "finding": "Untidy."},
                     {"kind": "rule", "rule": "NOPE.md: x", "finding": "y"},
-                    {"kind": "judgement", "path": "gone.rb", "finding": "z"}, {"kind": "nit", "finding": "w"})
+                    {"kind": "judgement", "path": "gone.rb", "finding": "z"}, {"kind": "nit", "finding": "w"},
+                    {"kind": "bug", "finding": "Breaks."})
         err = self.run_ds("review", "10").stderr
         for fault in ("finding 1: a rule finding quotes no rule", "finding 2: NOPE.md is no file",
-                      "finding 3: no file gone.rb", "finding 4: kind is neither"):
+                      "finding 3: no file gone.rb", "finding 4: kind is not rule, bug or judgement",
+                      "finding 5: a bug finding says not how it fails"):
             self.assertIn(fault, err)
 
     def test_a_round_is_read_against_the_head_it_reviewed(self):

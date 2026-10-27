@@ -1633,8 +1633,8 @@ def read_round(run, k, wt):
     if data.get("head") != head:
         faults.append(f"head is {data.get('head')}, the round reviewed {head}")
     for n, x in enumerate(data["findings"], 1):
-        if not isinstance(x, dict) or x.get("kind") not in ("rule", "judgement"):
-            faults.append(f"finding {n}: kind is neither rule nor judgement")
+        if not isinstance(x, dict) or x.get("kind") not in ("rule", "bug", "judgement"):
+            faults.append(f"finding {n}: kind is not rule, bug or judgement")
             continue
         if not str(x.get("finding") or "").strip():
             faults.append(f"finding {n}: no finding text")
@@ -1646,6 +1646,8 @@ def read_round(run, k, wt):
                 faults.append(f"finding {n}: a rule finding quotes no rule (`SOURCE: THE RULE`)")
             elif not (SOURCE.fullmatch(source[0].strip()) or at_head(wt, head, source[0].strip())):
                 faults.append(f"finding {n}: {source[0].strip()} is no file, spec, slice or decisions.md")
+        if x["kind"] == "bug" and not str(x.get("fails") or "").strip():
+            faults.append(f"finding {n}: a bug finding says not how it fails (`fails`)")
     if faults:
         raise Failed(f"{f} does not fit REVIEWER.md: " + "; ".join(faults)
                      + ". Send the round's reviewer back to fix it", REFUSE)
@@ -1655,6 +1657,10 @@ def read_round(run, k, wt):
 def where(x):
     return f"`{x['path']}:{x['line']}`" if x.get("path") and x.get("line") else f"`{x['path']}`" if x.get("path") \
         else "(missing)"
+
+
+def to_fix(findings):
+    return [x for x in findings if x["kind"] in ("rule", "bug")]
 
 
 def judgement_calls(run, wt):
@@ -1731,7 +1737,7 @@ def cmd_review(spec):
                   f"`Read {round_file(run, k, 'brief.md')} and follow it.`; then `drive-spec review {spec}` again")
             return 0
         data = read_round(run, k, wt)
-        rules = [x for x in data["findings"] if x["kind"] == "rule"]
+        rules = to_fix(data["findings"])
         calls = len(data["findings"]) - len(rules)
         if data["head"] == head and not rules:
             run.status(step="review", state="running", summary=f"review clean at round {k}, {calls} judgement "
@@ -1741,21 +1747,22 @@ def cmd_review(spec):
         if data["head"] == head:
             fix = round_file(run, k, "fix.md")
             if not fix.is_file():
-                findings = "\n".join(f"{n}. {where(x)}: {' '.join(x['finding'].split())}\n   Rule: {x['rule']}"
+                findings = "\n".join(f"{n}. {where(x)}: {' '.join(x['finding'].split())}\n   "
+                                     + (f"Rule: {x['rule']}" if x["kind"] == "rule" else f"Fails: {x['fails']}")
                                      for n, x in enumerate(rules, 1))
                 fix.write_text(fill("REVIEW-FIXER.md", {
                     "path": wt, "spec": spec, "repo": run.repo, "notes": run.notes, "k": k, "findings": findings,
                     "skill dir": Path(__file__).resolve().parent}, {"decided": decided}) + "\n")
-            run.status(step="review", state="running", summary=f"review round {k}: {len(rules)} rule finding(s), "
+            run.status(step="review", state="running", summary=f"review round {k}: {len(rules)} finding(s) to fix, "
                        "fixing", next=f"drive-spec review {spec} once the fixes are green", branch=plan["spec_branch"])
-            print(f"round {k} raised {len(rules)} rule finding(s) and {calls} judgement call(s)")
+            print(f"round {k} raised {len(rules)} finding(s) to fix and {calls} judgement call(s)")
             print(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`; then "
                   f"`drive-spec review {spec}` again")
             return 0
         cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
         answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
         if k >= cap and rules and not answered:
-            raise Failed(f"{k} review rounds and round {k} still raised rule findings: ask the operator whether to "
+            raise Failed(f"{k} review rounds and round {k} still raised findings to fix: ask the operator whether to "
                          f"go on (`drive-spec ask {spec} ...`); once answered, `drive-spec review {spec}` starts "
                          "another round", REFUSE)
     k += 1
@@ -1789,7 +1796,7 @@ def cmd_reviewed(spec, left):
     if not ks or not round_file(run, ks[-1], "json").is_file():
         raise Failed(f"no finished review round: `drive-spec review {spec}`", REFUSE)
     last = read_round(run, ks[-1], wt)
-    if last["head"] != head or any(x["kind"] == "rule" for x in last["findings"]):
+    if last["head"] != head or to_fix(last["findings"]):
         raise Failed(f"round {ks[-1]} is not a clean review of {head[:12]}: `drive-spec review {spec}`", REFUSE)
     kept = run.notes / "left.md"
     lines = judgement_calls(run, wt) + ([left.strip()] if left and left.strip() else [])

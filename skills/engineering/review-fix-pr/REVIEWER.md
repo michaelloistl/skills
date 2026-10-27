@@ -18,7 +18,7 @@ Review the diff against the linked issue for:
 - **Conventions** — the repo's documented patterns and vocabulary.
 - **Decisions** — anything contradicting an ADR; name the ADR.
 
-Raise each point once: a point already in the PR's existing feedback stays out. Every inline comment names a line in the new version of a file that appears in the diff.
+Raise each point once: a point already in the PR's existing feedback stays out. The PR body's `Left from review:` list is open, not feedback: raise every item on it the head still has that is a bug. Every inline comment names a line in the new version of a file that appears in the diff.
 
 Write `<review-file>` as a GitHub reviews-API payload:
 
