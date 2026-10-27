@@ -1682,6 +1682,19 @@ class Boundaries(DispatcherCase):
                       "finding 3: no file gone.rb", "finding 4: kind is neither"):
             self.assertIn(fault, err)
 
+    def test_a_round_is_read_against_the_head_it_reviewed(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.commit(self.spec_wt, "old.rb", "x\n", "Add old")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, {"kind": "rule", "rule": "old.rb: x", "path": "old.rb", "line": 1, "finding": "Rename old.rb."})
+        self.run_ds("review", "10")
+        self.git(self.spec_wt, "mv", "old.rb", "new.rb")
+        self.git(self.spec_wt, "commit", "-qm", "Rename old.rb")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.assertNotIn("no file old.rb", self.run_ds("review", "10").stderr)
+
     def test_rounds_past_the_cap_wait_for_the_operator(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 1}))
         self.run_ds("gate", "10", GATE)

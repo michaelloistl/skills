@@ -1615,6 +1615,10 @@ def round_file(run, k, kind):
     return run.notes / "review" / f"round-{k}.{kind}"
 
 
+def at_head(wt, head, path):
+    return subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{head}:{path}"], capture_output=True).returncode == 0
+
+
 def read_round(run, k, wt):
     """A round's findings, held to the form REVIEWER.md sets. Refuses one that does not fit, naming each fault."""
     head = json.loads(round_file(run, k, "meta.json").read_text())["head"]
@@ -1634,13 +1638,13 @@ def read_round(run, k, wt):
             continue
         if not str(x.get("finding") or "").strip():
             faults.append(f"finding {n}: no finding text")
-        if x.get("path") and not (Path(wt) / x["path"]).exists():
+        if x.get("path") and not at_head(wt, head, x["path"]):
             faults.append(f"finding {n}: no file {x['path']}")
         if x["kind"] == "rule":
             source = str(x.get("rule") or "").split(":", 1)
             if len(source) < 2 or not source[1].strip():
                 faults.append(f"finding {n}: a rule finding quotes no rule (`SOURCE: THE RULE`)")
-            elif not (SOURCE.fullmatch(source[0].strip()) or (Path(wt) / source[0].strip()).is_file()):
+            elif not (SOURCE.fullmatch(source[0].strip()) or at_head(wt, head, source[0].strip())):
                 faults.append(f"finding {n}: {source[0].strip()} is no file, spec, slice or decisions.md")
     if faults:
         raise Failed(f"{f} does not fit REVIEWER.md: " + "; ".join(faults)
