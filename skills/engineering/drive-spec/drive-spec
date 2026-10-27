@@ -1708,10 +1708,15 @@ def spec_head(run, plan, push):
     verify_cmd = f"`drive-spec verify {spec} {wt} --wait-minutes 9`"
     if head != remote:
         if git(wt, "rev-list", "--count", f"HEAD..origin/{branch}") != "0":
-            if git(wt, "rev-list", "--count", f"origin/{branch}..HEAD") != "0":
+            if git(wt, "rev-list", "--count", f"origin/{branch}..HEAD") == "0":
+                git(wt, "pull", "--quiet", "--ff-only")
+                head = remote
+            elif git(wt, "rev-list", "--no-merges", f"HEAD..origin/{branch}", f"^origin/{run.base()}"):
                 raise Failed(f"{wt} and origin/{branch} have diverged: settle it by hand", REFUSE)
-            git(wt, "pull", "--quiet", "--ff-only")
-            head = remote
+            else:
+                merge_base_merges(wt, branch)
+                raise Failed(f"merged the base merges on origin/{branch} into {wt}; {verify_cmd}, then this again",
+                             REFUSE)
         elif not push:
             raise Failed(f"{wt} is not at origin/{branch}: push the fixes", REFUSE)
         elif not green(run, head, gate):
@@ -1725,6 +1730,16 @@ def spec_head(run, plan, push):
     if not green(run, head, gate):
         raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
     return wt, head
+
+
+def merge_base_merges(wt, branch):
+    merged = subprocess.run(["git", "-C", str(wt), "merge", "--quiet", "--no-edit", f"origin/{branch}"],
+                            capture_output=True, text=True)
+    if merged.returncode:
+        subprocess.run(["git", "-C", str(wt), "merge", "--abort"], capture_output=True)
+        raise Failed(f"origin/{branch} holds base merges that conflict with {wt}: a merger subagent there runs "
+                     f"`git merge origin/{branch}`, resolves and commits, then verify", REFUSE)
+    print(f"merged the base merges on origin/{branch}", flush=True)
 
 
 def cmd_review(spec):
@@ -1947,6 +1962,10 @@ def one_line(text, width=160):
 def cmd_ask(spec, question, blocking, step, ref=None):
     run = Run(spec)
     current = run.current()
+    if current.get("question") and current.get("question_blocking") is True and current.get("state") == "waiting":
+        raise Failed(f"a question already waits for the operator: {one_line(current['question'], 120)} Fold this "
+                     f"one into it, as one `drive-spec ask {spec}` with every question and `--ref` listing each, "
+                     "or wait for its answer", REFUSE)
     pending_ref = run.notes / "question-ref"
     if ref:
         known = {r for r, _ in questions(run)}
@@ -2159,7 +2178,7 @@ def main():
     i = sub.add_parser("integrate", help="merge the spec branch into a slice, verify, push, merge its PR")
     i.add_argument("spec")
     i.add_argument("slice")
-    i.add_argument("--report", help="the implementer's Deviations:, Unverified: and Proof: lists, or `-` for stdin")
+    i.add_argument("--report", "--deviations", dest="report", help="the implementer's Deviations:, Unverified: and Proof: lists, or `-` for stdin")
     i.add_argument("--wait-minutes", type=float, dest="wait",
                    help="return after this long, exit 6, while a gate runs on; run again to pick up where it stopped")
     la = sub.add_parser("land", help="close a merged slice, remove its worktree and branch, open the spec PR")

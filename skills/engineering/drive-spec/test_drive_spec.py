@@ -744,6 +744,10 @@ class Verify(Cli):
 
 
 class Integrate(Cli):
+    def test_takes_the_old_deviations_flag(self):
+        out = self.run_ds("integrate", "10", "11", "--deviations", NONE)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
     def test_opens_pr_and_merges_at_the_verified_head(self):
         out = self.run_ds("integrate", "10", "11", "--report",
                           "Deviations:\n- none of note\nUnverified:\n- the toast shows only in a running app")
@@ -1683,6 +1687,39 @@ class Boundaries(DispatcherCase):
         self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith(
             "\n\nLeft from review:\n- `README:1`: Rename ExportJob."))
 
+    def diverge(self, base_only):
+        work = self.tmp / "outside"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        self.commit(work, "base.txt", "x\n", "Advance main")
+        self.git(work, "push", "-q", "origin", "main")
+        self.git(work, "switch", "-q", "agent/local-spec-10-export")
+        self.git(work, "merge", "-q", "--no-edit", "main")
+        if not base_only:
+            self.commit(work, "outside.txt", "x\n", "Commit outside the run")
+        self.git(work, "push", "-q", "origin", "agent/local-spec-10-export")
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+
+    def test_review_merges_a_spec_branch_that_origin_advanced_only_by_base_merges(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.diverge(base_only=True)
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("merged the base merges on origin/agent/local-spec-10-export", out.stdout)
+        self.assertIn("drive-spec verify 10", out.stderr)
+        self.assertTrue((self.spec_wt / "base.txt").is_file())
+        self.run_ds("verify", "10", str(self.spec_wt))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("pushed ", out.stdout)
+
+    def test_review_refuses_a_spec_branch_with_outside_commits(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.diverge(base_only=False)
+        self.assertIn("have diverged", self.run_ds("review", "10").stderr)
+
     def test_review_reattaches_a_detached_spec_branch_before_pushing(self):
         self.run_ds("gate", "10", GATE)
         self.close_all()
@@ -1855,6 +1892,17 @@ class Questions(DispatcherCase):
         self.run_ds("start", "10", "11")
         self.assertIn(f"`{decisions}` holds each answer, and it overrides the issue where they differ. Match",
                       (decisions.parent / "brief-11.md").read_text())
+
+    def test_a_second_blocking_ask_is_refused_while_one_waits(self):
+        self.run_ds("gate", "10", GATE)
+        self.run_ds("ask", "10", "Public or sign-in?")
+        out = self.run_ds("ask", "10", "CSV or JSON?")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("a question already waits", out.stderr)
+        self.assertEqual(self.status_file()["question"], "Public or sign-in?")
+        self.assertEqual(self.run_ds("ask", "10", "Also note this.", "--no-block").returncode, 2)
+        self.run_ds("answered", "10", "public")
+        self.assertEqual(self.run_ds("ask", "10", "CSV or JSON?").returncode, 0)
 
     def test_a_question_points_at_its_pane_and_open_focuses_it(self):
         calls = self.tmp / "herdr-calls"

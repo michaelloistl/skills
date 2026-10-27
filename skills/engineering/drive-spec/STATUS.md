@@ -49,7 +49,7 @@ When the run needs the operator's decision to go on, ask it and end the turn:
 drive-spec ask <spec> "<the question, with the options and your recommendation>"
 ```
 
-It writes `state=waiting` with the question, blocking, at the current step. The question is read on a phone with no other context: name the issue, the choice, and what each answer leads to. The answer arrives as the next prompt; record it before acting on it:
+It writes `state=waiting` with the question, blocking, at the current step. One question waits at a time, and `ask` refuses another until it is answered: put every decision the run needs now into one question. The question is read on a phone with no other context: name the issue, the choice, and what each answer leads to. The answer arrives as the next prompt; record it before acting on it:
 
 ```sh
 drive-spec answered <spec> "<the operator's words>"
