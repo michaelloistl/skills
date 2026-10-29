@@ -927,6 +927,67 @@ class RexRecover(Recover):
         self.assertEqual(self.calls(), self.cleared("p1"))
 
 
+class Merges(DispatchCase):
+    """Every `merges` scenario, inside herdr; `RexMerges` runs them inside Rex."""
+
+    def setUp(self):
+        super().setUp()
+        origin = self.tmp / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], env=self.env, check=True)
+        self.git("remote", "add", "origin", str(origin))
+        self.land("a.txt", "Initial commit")
+
+    def git(self, *args):
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       env=self.env, check=True, capture_output=True)
+
+    def land(self, name, subject):
+        (self.repo / name).write_text(subject)
+        self.git("add", name)
+        self.git("commit", "-q", "-m", subject)
+        self.git("push", "-q", "origin", "HEAD:main")
+
+    def test_notes_a_landing_and_archives_the_spec_it_merged(self):
+        self.spec(pane="p1")
+        self.spec(11, branch="agent/spec-11")
+        self.pane()
+        self.assertEqual(self.ok("merges"), ["nothing to note"])
+        self.land("b.txt", "Merge pull request #5 from michaelloistl/agent/spec-11")
+        self.assertEqual(self.ok("merges"), ["noted to 10"])
+        self.assertIn("## main advanced: #5 Merge pull request #5", (self.status / "spec-10.inbox.md").read_text())
+        self.assertTrue((self.status / "archive" / "spec-11.json").exists())
+        self.assertEqual(self.calls(), [])
+
+
+class RexMerges(Merges):
+    mux = "rex"
+
+
+class Queue(DispatchCase):
+    """`admit` and `unqueue`, inside herdr; `RexQueue` runs them inside Rex."""
+
+    def test_admit_is_clear_without_pressure(self):
+        out = self.ok("admit")
+        self.assertTrue(out[0].startswith("cpu "), out)
+        self.assertEqual(out[1:], ["clear"])
+        self.assertEqual(self.calls(), [])
+
+    def test_admit_names_the_pressure_that_blocks(self):
+        out = self.ok("admit", DISPATCH_MAX_LOAD="-1")
+        self.assertTrue(out[1].startswith("blocked: load "), out)
+
+    def test_unqueue_drops_a_queued_spec(self):
+        self.queue("10", "11")
+        self.assertEqual(self.ok("unqueue", "10"), ["10 unqueued"])
+        self.assertEqual([q["spec"] for q in self.saved("queue.json")], ["11"])
+        self.assertEqual(self.ok("unqueue", "10"), ["10 was not queued"])
+        self.assertEqual(self.calls(), [])
+
+
+class RexQueue(Queue):
+    mux = "rex"
+
+
 class Watch(DispatchCase):
     def watch(self, **env):
         """A running `dispatch watch`; `next_line(within)` returns its next line, or None after `within` seconds."""
