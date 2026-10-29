@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "dispatch"
 ACKED = STATE_DIR / "acked.json"
@@ -143,7 +144,8 @@ def snapshot(dirs):
         if n:
             session_of[n] = s
     for n, data in files.items():
-        pane = by_pane.get(data.get("herdr_pane"))
+        pane_id, mux = (data["pane"], data.get("mux")) if data.get("pane") else (data.get("herdr_pane"), "herdr")
+        pane = by_pane.get(pane_id) if mux in (None, MUX.name) else None
         pane_session = (pane or {}).get("session")
         if pane and not (pane_session and data.get("session_id") and pane_session != data["session_id"]):
             pane_of[n] = pane
@@ -501,6 +503,7 @@ class StatusWatch:
 class Herdr:
     """The multiplexer interface, over herdr's CLI and socket. Pane rows: id, label, cwd, title, state
     (working, blocked, idle, done or None), tab, and session (the Claude session id) where known."""
+    name = "herdr"
 
     def panes(self):
         try:
@@ -601,7 +604,102 @@ class HerdrEvents:
         self.sock, self.panes = None, None
 
 
-MUX = Herdr()
+class Rex:
+    """The multiplexer interface over the `rex` CLI. A Rex session is a herdr workspace, a window a tab, a block a
+    pane. Rex gives no Claude session id, so pane rows carry none."""
+    name = "rex"
+    STATES = ("working", "blocked", "idle", "done")
+
+    def json(self, *args):
+        try:
+            return json.loads(run(["rex", "--autostart=false", *args]) or "{}")
+        except ValueError:
+            return {}
+
+    def panes(self):
+        rows = []
+        for s in self.json("ls", "--json").get("sessions", []):
+            view = self.json("window", "ls", "-s", s.get("session_id", ""), "--json")
+            for w in view.get("windows", []):
+                for block in (b for layer in w.get("layers", []) for b in layer.get("blocks", [])):
+                    if block.get("creator_name") == "com.superlogical.terminal":
+                        row = self.pane(block, w)
+                        if row:
+                            rows.append(row)
+        return rows
+
+    def pane(self, block, window):
+        """The block's row, from its Claude's root `program_status` record; None when no Claude runs there."""
+        b = block.get("block_id", "")
+        records = self.json("block", "call", "-b", b, "program_status").get("records", [])
+        claude = [r for r in records if r.get("effective_app") == "claude-code"]
+        record = next((r for r in claude if not r.get("id")), None)
+        if not record:
+            return None
+        state = record.get("state") if record.get("state") in self.STATES else "idle"
+        label = block.get("label") if spec_of(block.get("label")) else window.get("label") or block.get("label")
+        pwd = self.json("block", "call", "-b", b, "pwd").get("pwd")
+        cwd = unquote(urlparse(pwd).path) if pwd else \
+            (self.json("block", "call", "-b", b, "process").get("foreground") or {}).get("cwd")
+        return {"id": b, "label": label, "cwd": cwd, "title": self.json("block", "call", "-b", b, "title").get("title"),
+                "state": state, "tab": window.get("window_id"), "session": None}
+
+    def unbuilt(self, *_, **__):
+        raise RuntimeError("not yet supported under Rex")
+
+    open_tab = prompt = focus = close_tab = unbuilt
+
+    def own_pane(self):
+        return os.environ.get("REX_BLOCK")
+
+    def events(self):
+        return NoEvents()
+
+
+class NoMux:
+    """Neither herdr nor Rex: no panes, and every pane command refused."""
+    name = None
+
+    def panes(self):
+        return []
+
+    def events(self):
+        return NoEvents()
+
+    def own_pane(self):
+        return None
+
+
+class NoEvents:
+    sock = None
+
+    def arm(self):
+        pass
+
+    def drain(self):
+        pass
+
+
+MUXES = {"herdr": Herdr, "rex": Rex}
+PRESENT = {"herdr": "HERDR_ENV", "rex": "REX_SESSION"}
+PANE_COMMANDS = ("launch", "open", "answer", "ack")
+MUX = NoMux()
+
+
+def pick_mux():
+    """`DISPATCH_MUX`, else herdr inside herdr (even inside Rex), else Rex inside Rex, else none. Returns the
+    backend and why pane commands must refuse, or None when they may run."""
+    forced = os.environ.get("DISPATCH_MUX")
+    if forced:
+        if forced not in MUXES:
+            sys.exit(f"dispatch: DISPATCH_MUX={forced} is not a multiplexer: use herdr or rex")
+        absent = None if os.environ.get(PRESENT[forced]) else \
+            f"DISPATCH_MUX={forced} but not inside {'herdr' if forced == 'herdr' else 'Rex'} ({PRESENT[forced]} unset)"
+        return MUXES[forced](), absent
+    for name in ("herdr", "rex"):
+        if os.environ.get(PRESENT[name]):
+            return MUXES[name](), None
+    return NoMux(), "not inside herdr or Rex"
 
 
 def git(root, *args):
@@ -852,6 +950,10 @@ def main():
     u.add_argument("spec")
     args = p.parse_args()
 
+    global MUX
+    MUX, refusal = pick_mux()
+    if refusal and (args.cmd in PANE_COMMANDS or (args.cmd == "recover" and args.do)):
+        sys.exit(f"dispatch {args.cmd} refused: {refusal}")
     dirs = [status_dir(r) for r in (args.repo or ["."])]
     if args.cmd == "status":
         cmd_status(dirs, args.json)

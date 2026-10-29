@@ -6,7 +6,7 @@ One JSON file per spec, read by a dispatcher that watches every run on the machi
 <skill dir>/status.sh <spec> step=<step> state=<state> summary="<one line>" next="<one line>" [base=…] [branch=…] [pr_url=…] [question="…" question_blocking=true|false]
 ```
 
-`status.sh` sits beside this file. It writes `$GIT_COMMON_DIR/drive-spec/status/spec-<spec>.json` atomically, merges into the previous write, stamps `updated_at`, `repo`, `host`, `session_id`, `config_dir` (the session's Claude config dir, where the dispatcher looks the session up) and `herdr_pane` itself, and always exits 0: a status write never stops the run. `key=` with an empty value clears that key.
+`status.sh` sits beside this file. It writes `$GIT_COMMON_DIR/drive-spec/status/spec-<spec>.json` atomically, merges into the previous write, stamps `updated_at`, `repo`, `host`, `session_id`, `config_dir` (the session's Claude config dir, where the dispatcher looks the session up), `pane` and `mux` itself, and always exits 0: a status write never stops the run. `key=` with an empty value clears that key. `pane` is the multiplexer pane the run writes from: `HERDR_PANE_ID` with `mux` `herdr`, else `REX_BLOCK` with `mux` `rex`; with neither set, the previous pair stays. A file written before `pane` existed holds `herdr_pane` instead, which the dispatcher still reads as a herdr pane; the next write with a pane replaces it.
 
 ## When
 

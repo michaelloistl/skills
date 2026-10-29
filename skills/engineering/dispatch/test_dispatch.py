@@ -1,8 +1,9 @@
 """Tests for the dispatch script. Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/dispatch
 
-Each test runs `dispatch` as a subprocess in a throwaway git repo, with fake `herdr` and `claude` first on PATH. The
-fakes answer from per-test JSON fixtures and log their argv; tests assert only on printed lines, exit status, state
-files and the logged calls."""
+Each test runs `dispatch` as a subprocess in a throwaway git repo, with fake `herdr`, `rex` and `claude` first on PATH.
+The fakes answer from per-test JSON fixtures and log their argv; tests assert only on printed lines, exit status,
+state files and the logged calls. A class with `mux = "rex"` runs inside a fake Rex instead of a fake herdr, from
+fixtures equivalent to herdr's, and expects the same lines."""
 
 import json
 import os
@@ -39,6 +40,32 @@ else:
     print("{}")
 '''
 
+FAKE_REX = r'''
+import json, os, sys
+fix = os.environ["FIX"]
+args = [a for a in sys.argv[1:] if a != "--autostart=false"]
+with open(os.path.join(fix, "rex-calls"), "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+try:
+    with open(os.path.join(fix, "rex.json")) as f:
+        state = json.load(f)
+except OSError:
+    state = {}
+sessions = state.get("sessions", [])
+if args == ["ls", "--json"]:
+    print(json.dumps({"sessions": [{"session_id": s["session_id"], "label": s["label"]} for s in sessions]}))
+elif args[:3] == ["window", "ls", "-s"]:
+    print(json.dumps(next((s for s in sessions if s["session_id"] == args[3]), {"windows": []})))
+elif args[:3] == ["block", "call", "-b"]:
+    block = state.get("blocks", {}).get(args[3])
+    if block is None:
+        sys.stderr.write(f"Error: block target {args[3]!r} not found\n")
+        sys.exit(3)
+    print(json.dumps(block.get(args[4], {})))
+else:
+    print("{}")
+'''
+
 FAKE_CLAUDE = r'''
 import os, sys
 try:
@@ -54,6 +81,8 @@ def stamp(minutes_ago=0):
 
 
 class DispatchCase(unittest.TestCase):
+    mux = "herdr"
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="dispatch-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -61,38 +90,76 @@ class DispatchCase(unittest.TestCase):
         self.repo.mkdir()
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
-        for name, body in (("herdr", FAKE_HERDR), ("claude", FAKE_CLAUDE)):
+        for name, body in (("herdr", FAKE_HERDR), ("rex", FAKE_REX), ("claude", FAKE_CLAUDE)):
             (bin_dir / name).write_text(f"#!{sys.executable}\n{body}")
             (bin_dir / name).chmod(0o755)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("HERDR_", "REX_", "DISPATCH_", "CLAUDE_"))}
-        self.env = dict(env, PATH=f"{bin_dir}:{os.environ['PATH']}", FIX=str(self.tmp),
+        inside = dict(HERDR_ENV="1", HERDR_WORKSPACE_ID="W1", HERDR_PANE_ID="p0") if self.mux == "herdr" else \
+            dict(REX_SESSION="S1", REX_BLOCK="p0")
+        self.env = dict(env, **inside, PATH=f"{bin_dir}:{os.environ['PATH']}", FIX=str(self.tmp),
                         XDG_STATE_HOME=str(self.tmp / "state"), CLAUDE_CONFIG_DIR=str(self.tmp / "claude"),
-                        HERDR_ENV="1", HERDR_WORKSPACE_ID="W1", HERDR_PANE_ID="p0",
-                        DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101", DISPATCH_MAX_LOAD="9999",
+                        DISPATCH_MUX=self.mux, DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101", DISPATCH_MAX_LOAD="9999",
                         GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], env=self.env, check=True)
         self.status = self.repo / ".git" / "drive-spec" / "status"
         self.status.mkdir(parents=True)
         self.state_dir = self.tmp / "state" / "dispatch"
         self.panes = []
+        self.rex_sessions = {"S1": {"session_id": "S1", "label": "main", "windows": []}}
+        self.blocks = {}
         self.herdr({})
+        self.shell("S1")
 
     def herdr(self, extra):
         (self.tmp / "herdr.json").write_text(json.dumps(dict(extra, agents=self.panes)))
 
-    def pane(self, pane_id="p1", status="idle", name="spec-10", tab="T1", session=None, cwd=None):
-        p = {"pane_id": pane_id, "name": name, "terminal_title_stripped": "", "cwd": str(cwd or self.repo),
+    def rex(self):
+        (self.tmp / "rex.json").write_text(json.dumps({"sessions": list(self.rex_sessions.values()),
+                                                       "blocks": self.blocks}))
+
+    def window(self, session, tab, label):
+        s = self.rex_sessions.setdefault(session, {"session_id": session, "label": session, "windows": []})
+        w = next((w for w in s["windows"] if w["window_id"] == tab), None)
+        if not w:
+            w = {"window_id": tab, "label": label, "layers": [{"kind": "tiled", "blocks": []}]}
+            s["windows"].append(w)
+        return w
+
+    def shell(self, session, block="b-shell"):
+        """A Rex terminal block with no Claude in it, in the repo: not an agent pane."""
+        self.window(session, "W-shell", "spec-10 notes")["layers"][0]["blocks"].append(
+            {"block_id": block, "label": "shell", "creator_name": "com.superlogical.terminal"})
+        self.blocks[block] = {"program_status": {"records": []}, "pwd": {"pwd": f"file://host{self.repo}"},
+                              "title": {"title": "drive-spec-10"}}
+        self.rex()
+
+    def pane(self, pane_id="p1", status="idle", name="spec-10", tab="T1", session=None, cwd=None, title="",
+             rex_session="S1", rex_records=None, pwd=True):
+        """One Claude pane, in both the herdr and the Rex fixture. Rex: block `pane_id` labelled `shell` in window
+        `tab` labelled `name`, its root claude-code record in state `status`."""
+        cwd = str(cwd or self.repo)
+        p = {"pane_id": pane_id, "name": name, "terminal_title_stripped": title, "cwd": cwd,
              "agent_status": status, "tab_id": tab}
         if session:
             p["agent_session"] = {"value": session}
         self.panes.append(p)
         self.herdr({})
+        self.window(rex_session, tab, name)["layers"][0]["blocks"].append(
+            {"block_id": pane_id, "label": "shell", "creator_name": "com.superlogical.terminal"})
+        records = rex_records or [{"state": status, "app": "claude-code", "effective_app": "claude-code"}]
+        self.blocks[pane_id] = {"program_status": {"records": records}, "title": {"title": title},
+                                "process": {"foreground": {"cwd": cwd}}}
+        if pwd:
+            self.blocks[pane_id]["pwd"] = {"pwd": f"file://host{cwd}"}
+        self.rex()
 
     def sessions(self, *sessions):
         (self.tmp / "claude.json").write_text(json.dumps(list(sessions)))
 
     def spec(self, n=10, archived=False, **fields):
+        if "pane" in fields:
+            fields.setdefault("mux", self.mux)
         data = dict({"spec": n, "step": "build", "state": "running", "summary": "landed 0/2",
                      "next": f"/drive-spec {n}", "updated_at": stamp()}, **fields)
         d = self.status / "archive" if archived else self.status
@@ -129,13 +196,15 @@ class DispatchCase(unittest.TestCase):
 
 
 class Status(DispatchCase):
+    """Every `status` scenario, inside herdr; `RexStatus` runs them inside Rex."""
+
     def test_a_blocked_pane_is_a_dialog(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane(status="blocked")
         self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 DIALOG dialog open in spec-10: dispatch open 10"])
 
     def test_a_blocking_question_asks(self):
-        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1")
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, pane="p1")
         self.pane()
         self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 ASK question waiting in spec-10: dispatch open 10"])
 
@@ -144,7 +213,7 @@ class Status(DispatchCase):
         self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 HALT export test red. → /review-fix-pr 101"])
 
     def test_a_quiet_running_spec_stalls(self):
-        self.spec(updated_at=stamp(20), herdr_pane="p1")
+        self.spec(updated_at=stamp(20), pane="p1")
         self.pane()
         self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 STALL quiet 20m at build"])
 
@@ -163,12 +232,12 @@ class Status(DispatchCase):
     def test_tags_sort_by_urgency(self):
         self.spec(11, state="paused", summary="paused.")
         self.spec(12, state="halted", summary="red.")
-        self.spec(13, herdr_pane="p1")
+        self.spec(13, pane="p1")
         self.pane(status="blocked", name="spec-13")
         self.assertEqual([x.split()[1] for x in self.ok("status")[1:]], ["DIALOG", "HALT", "PAUSE"])
 
     def test_a_working_spec_is_ok(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane(status="working")
         self.assertEqual(self.ok("status"), ["OK", " 10 running·build landed 0/2 (working, 0m)"])
 
@@ -201,11 +270,126 @@ class Status(DispatchCase):
         self.assertEqual(self.ok("status"), ["OK", " 10 running·build landed 0/2 (busy, 20m)"])
 
     def test_json_reports_the_live_state_as_mux(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane(status="working")
         row = json.loads(self.dispatch("status", "--json").stdout)[0]
         self.assertEqual((row["pane"], row["mux"]), ("p1", "working"))
         self.assertNotIn("herdr", row)
+
+    def test_a_pane_titled_with_its_spec_joins(self):
+        self.spec()
+        self.pane(name="", title="drive-spec-10", status="working")
+        self.assertEqual(self.ok("status"), ["OK", " 10 running·build landed 0/2 (working, 0m)"])
+
+    def test_the_status_files_pane_joins_without_a_spec_name(self):
+        self.spec(pane="p1", session_id="S1")
+        self.pane(name="scratch", status="blocked")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 DIALOG dialog open in scratch: dispatch open 10"])
+
+    def test_a_pane_of_the_other_multiplexer_is_not_joined(self):
+        self.spec(pane="p1", mux="rex" if self.mux == "herdr" else "herdr")
+        self.pane(name="scratch", status="working")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 GONE no session; last build: landed 0/2"])
+
+
+class RexStatus(Status):
+    mux = "rex"
+
+    def test_panes_in_other_sessions_are_seen(self):
+        self.spec(pane="p1")
+        self.pane(status="blocked", rex_session="S2")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 DIALOG dialog open in spec-10: dispatch open 10"])
+
+    def test_state_is_the_root_claude_records_not_a_subagents(self):
+        self.spec(pane="p1")
+        self.pane(rex_records=[{"id": "sub1", "state": "working", "effective_app": "claude-code"},
+                               {"state": "blocked", "effective_app": "claude-code"}])
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 DIALOG dialog open in spec-10: dispatch open 10"])
+
+    def test_an_unknown_state_reads_idle(self):
+        self.spec(pane="p1", updated_at=stamp(20))
+        self.pane(status="error")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 STALL quiet 20m at build"])
+
+    def test_a_block_without_a_claude_record_is_no_pane(self):
+        self.spec(pane="p1")
+        self.pane(rex_records=[{"state": "working", "effective_app": "vim"}])
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 GONE no session; last build: landed 0/2"])
+
+    def test_a_block_with_no_pwd_takes_its_process_cwd(self):
+        self.pane(name="drive-spec-10", pwd=False)
+        self.assertEqual(self.ok("status"), ["OK", " 10 no status file (idle); dispatch ack 10 closes its tab"])
+
+
+class Legacy(DispatchCase):
+    def test_a_herdr_pane_key_joins_inside_herdr(self):
+        self.spec(herdr_pane="p1")
+        self.pane(name="scratch", status="working")
+        self.assertEqual(self.ok("status"), ["OK", " 10 running·build landed 0/2 (working, 0m)"])
+
+    def test_a_herdr_pane_key_is_ignored_inside_rex(self):
+        self.spec(herdr_pane="p1")
+        self.pane(name="scratch", status="working")
+        self.assertEqual(self.ok("status", DISPATCH_MUX="rex", REX_SESSION="S1"),
+                         ["NEEDS YOU", " 10 GONE no session; last build: landed 0/2"])
+
+
+class Detection(DispatchCase):
+    def setUp(self):
+        super().setUp()
+        self.spec(state="waiting", pane="p1", mux=None)
+        self.pane(status="working")
+        for k in ("DISPATCH_MUX", "HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_PANE_ID"):
+            del self.env[k]
+
+    def listed(self):
+        return {name for name in ("herdr", "rex") if (self.tmp / f"{name}-calls").exists()}
+
+    def test_inside_rex_uses_rex(self):
+        self.assertEqual(self.ok("status", REX_SESSION="S1"), ["OK", " 10 waiting·build landed 0/2 (working, 0m)"])
+        self.assertEqual(self.listed(), {"rex"})
+
+    def test_inside_herdr_uses_herdr(self):
+        self.assertEqual(self.ok("status", HERDR_ENV="1"), ["OK", " 10 waiting·build landed 0/2 (working, 0m)"])
+        self.assertEqual(self.listed(), {"herdr"})
+
+    def test_herdr_wins_inside_both(self):
+        self.ok("status", HERDR_ENV="1", REX_SESSION="S1")
+        self.assertEqual(self.listed(), {"herdr"})
+
+    def test_the_variable_forces_one(self):
+        self.ok("status", DISPATCH_MUX="rex", HERDR_ENV="1", REX_SESSION="S1")
+        self.assertEqual(self.listed(), {"rex"})
+
+    def test_outside_both_pane_commands_refuse(self):
+        for args in (["launch", "10"], ["open", "10"], ["answer", "10", "yes"], ["ack", "10"],
+                     ["recover", "--do", "10=resume"]):
+            self.assertEqual(self.refused(*args), f"dispatch {args[0]} refused: not inside herdr or Rex")
+        self.assertEqual(self.listed(), set())
+
+    def test_outside_both_status_shows_no_pane(self):
+        self.assertEqual(self.ok("status"), ["OK", " 10 waiting·build landed 0/2 (no pane, 0m)"])
+        self.assertEqual(self.ok("recover"), ["10 LEAVE? waiting on your answer in its pane"])
+        self.assertEqual(self.ok("merges"), ["nothing to note"])
+
+    def test_a_forced_multiplexer_not_present_refuses_pane_commands(self):
+        self.assertEqual(self.refused("open", "10", DISPATCH_MUX="rex"),
+                         "dispatch open refused: DISPATCH_MUX=rex but not inside Rex (REX_SESSION unset)")
+        self.assertEqual(self.refused("ack", "10", DISPATCH_MUX="herdr"),
+                         "dispatch ack refused: DISPATCH_MUX=herdr but not inside herdr (HERDR_ENV unset)")
+
+    def test_an_unknown_value_is_rejected(self):
+        self.assertEqual(self.refused("status", DISPATCH_MUX="tmux"),
+                         "dispatch: DISPATCH_MUX=tmux is not a multiplexer: use herdr or rex")
+
+    def test_watch_runs_outside_both(self):
+        self.spec(state="halted", summary="red.")
+        proc = subprocess.Popen([str(DISPATCH), "--repo", str(self.repo), "watch"], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, env=self.env)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "10 HALT red. → /drive-spec 10")
 
 
 class Launch(DispatchCase):
