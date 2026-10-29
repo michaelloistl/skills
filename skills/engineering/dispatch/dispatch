@@ -184,6 +184,7 @@ def classify(n, data, pane, session, acked, archived=None):
     row = {
         "spec": n,
         "pane": pane["id"] if pane else None,
+        "tab": pane["tab"] if pane else None,
         "mux": mux,
         "session": (session or {}).get("status"),
         "state": None,
@@ -333,7 +334,7 @@ def cmd_launch(specs, dirs, force):
     for spec in specs:
         row, data = rows.get(spec, {}), files.get(spec, {})
         if is_live(row) or (row.get("session") and not row.get("pane")):
-            print(f"{spec} already running in {row.get('pane') or 'a Claude session outside herdr'}")
+            print(f"{spec} already running in {row.get('pane') or 'a Claude session with no pane'}")
             continue
         if row.get("pane") and row.get("attention") == "ASK":
             print(f"{spec} waiting on its question in {row['pane']}: dispatch open {spec}")
@@ -559,6 +560,10 @@ class Herdr:
     def own_pane(self):
         return os.environ.get("HERDR_PANE_ID")
 
+    def own_tab(self):
+        own = self.own_pane()
+        return next((p["tab"] for p in self.panes() if own and p["id"] == own), None)
+
     def events(self):
         return HerdrEvents(self)
 
@@ -709,13 +714,31 @@ class Rex:
                 return
             time.sleep(0.5)
 
-    def unbuilt(self, *_, **__):
-        raise RuntimeError("not yet supported under Rex")
+    def window_of(self, block):
+        """The (session, window) holding the block, in any Rex session; (None, None) when none does."""
+        for s in self.json("ls", "--json").get("sessions", []):
+            view = self.json("window", "ls", "-s", s.get("session_id", ""), "--json")
+            for w in view.get("windows", []):
+                if any(b.get("block_id") == block for layer in w.get("layers", []) for b in layer.get("blocks", [])):
+                    return s.get("session_id"), w.get("window_id")
+        return None, None
 
-    focus = close_tab = unbuilt
+    def focus(self, pane):
+        """Makes the block's window active in its session, then focuses the block."""
+        session, window = self.window_of(pane)
+        if not window:
+            raise RuntimeError(f"rex: no window holds {pane}")
+        self.call("window", "focus", "-s", session, window)
+        self.call("block", "focus", "-s", session, pane)
+
+    def close_tab(self, tab):
+        self.call("window", "close", tab)
 
     def own_pane(self):
         return os.environ.get("REX_BLOCK")
+
+    def own_tab(self):
+        return self.window_of(self.own_pane())[1] if self.own_pane() else None
 
     def events(self):
         return NoEvents()
@@ -732,6 +755,9 @@ class NoMux:
         return NoEvents()
 
     def own_pane(self):
+        return None
+
+    def own_tab(self):
         return None
 
 
@@ -977,10 +1003,10 @@ def cmd_ack(spec, dirs):
     if data.get("state") != "done" or not pane:
         print(f"{spec} acked" + ("; pane kept, not done" if pane else ""))
         return
-    if is_live(row) or pane == MUX.own_pane():
+    tab = row["tab"]
+    if is_live(row) or pane == MUX.own_pane() or (tab and tab == MUX.own_tab()):
         print(f"{spec} acked; pane {pane} kept, still active")
         return
-    tab = next((p["tab"] for p in MUX.panes() if p["id"] == pane), None)
     try:
         MUX.close_tab(tab)
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, TypeError) as e:
@@ -1004,7 +1030,7 @@ def main():
     an = sub.add_parser("answer", help="send the operator's answer to a spec waiting on its question")
     an.add_argument("spec")
     an.add_argument("text", nargs="+")
-    lp = sub.add_parser("launch", help="start drive-specs in new herdr tabs, or queue them under pressure")
+    lp = sub.add_parser("launch", help="start drive-specs in new tabs, or queue them under pressure")
     lp.add_argument("specs", nargs="+")
     lp.add_argument("--force", action="store_true", help="start even under pressure")
     sub.add_parser("admit", help="show pressure and whether a launch would start or queue")

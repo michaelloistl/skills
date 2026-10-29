@@ -438,6 +438,12 @@ class Launch(DispatchCase):
         self.assertEqual(self.ok("launch", "10"), ["10 already running in p1"])
         self.assertEqual(self.calls(), [])
 
+    def test_skips_a_spec_whose_session_runs_with_no_pane(self):
+        self.spec(session_id="S1")
+        self.sessions({"sessionId": "S1", "cwd": str(self.repo), "name": "drive-spec-10", "status": "busy"})
+        self.assertEqual(self.ok("launch", "10"), ["10 already running in a Claude session with no pane"])
+        self.assertEqual(self.calls(), [])
+
     def test_resumes_an_idle_pane_with_the_runs_next_command(self):
         self.spec(state="halted", summary="red.", next="/review-fix-pr 101", pane="p1")
         self.pane()
@@ -535,105 +541,216 @@ class RexLaunch(Launch):
 
 
 class Open(DispatchCase):
+    """Every `open` scenario, inside herdr; `RexOpen` runs them inside Rex."""
+
+    def focused(self, pane, tab):
+        return [f"agent focus {pane}"]
+
+    def fail_focus(self):
+        self.herdr({"fail": {"agent focus": "no such pane"}})
+        return "herdr agent focus: no such pane"
+
     def test_focuses_the_specs_pane(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
         self.assertEqual(self.ok("open", "10"), ["10 opened in p1"])
-        self.assertEqual(self.calls(), ["agent focus p1"])
+        self.assertEqual(self.calls(), self.focused("p1", "T1"))
+
+    def test_focuses_the_right_pane_among_several(self):
+        self.spec(11, pane="p2")
+        self.pane("p1", name="spec-10")
+        self.pane("p2", name="spec-11", tab="T2")
+        self.assertEqual(self.ok("open", "11"), ["11 opened in p2"])
+        self.assertEqual(self.calls(), self.focused("p2", "T2"))
 
     def test_refuses_without_a_pane(self):
         self.spec()
         self.assertEqual(self.refused("open", "10"), "10 not opened: no pane holds its session; recover it first")
+        self.assertEqual(self.calls(), [])
 
     def test_reports_a_failed_focus(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
-        self.herdr({"fail": {"agent focus": "no such pane"}})
-        self.assertEqual(self.refused("open", "10"), "10 not opened: herdr agent focus: no such pane")
+        message = self.fail_focus()
+        self.assertEqual(self.refused("open", "10"), f"10 not opened: {message}")
+
+
+class RexOpen(Open):
+    mux = "rex"
+
+    def focused(self, pane, tab):
+        return [f"window focus -s S1 {tab}", f"block focus -s S1 {pane}"]
+
+    def fail_focus(self):
+        (self.tmp / "rex.json").write_text(json.dumps({"sessions": list(self.rex_sessions.values()),
+                                                       "blocks": self.blocks,
+                                                       "fail": {"window focus": "no such window"}}))
+        return "rex window focus: no such window"
+
+    def test_focuses_a_pane_in_another_session(self):
+        self.spec(pane="p1")
+        self.pane(rex_session="S2")
+        self.assertEqual(self.ok("open", "10"), ["10 opened in p1"])
+        self.assertEqual(self.calls(), ["window focus -s S2 T1", "block focus -s S2 p1"])
 
 
 class Answer(DispatchCase):
+    """Every `answer` scenario, inside herdr; `RexAnswer` runs them inside Rex."""
+
+    def prompted(self, pane, text):
+        return [f"agent prompt {pane} {text}"]
+
     def waiting(self, status="idle"):
-        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1")
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, pane="p1")
         self.pane(status=status)
 
     def test_prompts_the_pane_quoting_the_question(self):
         self.waiting()
         self.assertEqual(self.ok("answer", "10", "yes,", "keep", "it"), ["10 answered in p1: keep CSV? → yes, keep it"])
         self.assertEqual(self.calls(),
-                         ["agent prompt p1 The operator's answer to your question (keep CSV?): yes, keep it"])
+                         self.prompted("p1", "The operator's answer to your question (keep CSV?): yes, keep it"))
+
+    def test_prompts_the_right_pane_among_several(self):
+        self.pane("p1", name="spec-10")
+        self.spec(11, state="waiting", question="keep CSV?", question_blocking=True, pane="p2")
+        self.pane("p2", name="spec-11", tab="T2")
+        self.assertEqual(self.ok("answer", "11", "no"), ["11 answered in p2: keep CSV? → no"])
+        self.assertEqual(self.calls(), self.prompted("p2", "The operator's answer to your question (keep CSV?): no"))
 
     def test_refuses_without_a_status_file(self):
+        self.pane(name="drive-spec-10")
         self.assertEqual(self.refused("answer", "10", "yes"), "10 not answered: no status file")
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_a_spec_not_waiting(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
         self.assertEqual(self.refused("answer", "10", "yes"),
                          "10 not answered: it is not waiting on a question (running)")
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_a_non_blocking_question(self):
-        self.spec(state="waiting", question="keep CSV?", question_blocking=False, herdr_pane="p1")
+        self.spec(state="waiting", question="keep CSV?", question_blocking=False, pane="p1")
         self.pane()
         self.assertEqual(self.refused("answer", "10", "yes"),
                          "10 not answered: it is not waiting on a question (waiting)")
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_without_a_pane(self):
         self.spec(state="waiting", question="keep CSV?", question_blocking=True)
         self.assertEqual(self.refused("answer", "10", "yes"),
                          "10 not answered: no pane holds its session; recover it first")
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_a_working_pane(self):
         self.waiting("working")
         self.assertEqual(self.refused("answer", "10", "yes"),
                          "10 not answered: it is working; send it once it settles")
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_a_blocked_pane(self):
         self.waiting("blocked")
         self.assertEqual(self.refused("answer", "10", "yes"),
                          "10 not answered: it is blocked; send it once it settles")
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_a_busy_session(self):
         self.waiting()
-        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1", session_id="S1")
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, pane="p1", session_id="S1")
         self.sessions({"sessionId": "S1", "cwd": str(self.repo), "name": "drive-spec-10", "status": "busy"})
         self.assertEqual(self.refused("answer", "10", "yes"), "10 not answered: it is busy; send it once it settles")
         self.assertEqual(self.calls(), [])
 
 
+class RexAnswer(Answer):
+    mux = "rex"
+
+    def prompted(self, pane, text):
+        return [f"send -b {pane} -- {text}", f"send-key -b {pane} enter"]
+
+
 class Ack(DispatchCase):
+    """Every `ack` scenario, inside herdr; `RexAck` runs them inside Rex."""
+
+    def closed(self, tab):
+        return [f"tab close {tab}"]
+
+    def own(self, pane):
+        return {"HERDR_PANE_ID": pane}
+
     def test_closes_a_done_specs_idle_tab(self):
-        self.spec(state="done", herdr_pane="p1", session_id="S1", updated_at="2026-01-01T00:00:00Z")
+        self.spec(state="done", pane="p1", session_id="S1", updated_at="2026-01-01T00:00:00Z")
         self.pane()
         self.assertEqual(self.ok("ack", "10"), ["10 acked; tab T1 closed, resume with claude --resume S1"])
-        self.assertEqual(self.calls(), ["tab close T1"])
+        self.assertEqual(self.calls(), self.closed("T1"))
         self.assertEqual(self.saved("acked.json"), {"10": "2026-01-01T00:00:00Z"})
 
+    def test_closes_the_right_tab_among_several(self):
+        self.pane("p1", name="spec-10")
+        self.spec(11, state="done", pane="p2")
+        self.pane("p2", name="spec-11", tab="T2")
+        self.assertEqual(self.ok("ack", "11"), ["11 acked; tab T2 closed"])
+        self.assertEqual(self.calls(), self.closed("T2"))
+
     def test_keeps_an_active_pane(self):
-        self.spec(state="done", herdr_pane="p1")
+        self.spec(state="done", pane="p1")
         self.pane(status="working")
         self.assertEqual(self.ok("ack", "10"), ["10 acked; pane p1 kept, still active"])
         self.assertEqual(self.calls(), [])
 
     def test_never_closes_its_own_pane(self):
-        self.spec(state="done", herdr_pane="p1")
+        self.spec(state="done", pane="p1")
         self.pane()
-        self.assertEqual(self.ok("ack", "10", HERDR_PANE_ID="p1"), ["10 acked; pane p1 kept, still active"])
+        self.assertEqual(self.ok("ack", "10", **self.own("p1")), ["10 acked; pane p1 kept, still active"])
+        self.assertEqual(self.calls(), [])
+
+    def test_never_closes_the_tab_it_runs_in(self):
+        self.spec(state="done", pane="p1")
+        self.pane()
+        self.pane("p0", name="dispatcher", tab="T1")
+        self.assertEqual(self.ok("ack", "10", **self.own("p0")), ["10 acked; pane p1 kept, still active"])
         self.assertEqual(self.calls(), [])
 
     def test_keeps_the_pane_of_a_spec_not_done(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
         self.assertEqual(self.ok("ack", "10"), ["10 acked; pane kept, not done"])
         self.assertEqual(self.calls(), [])
 
+    def test_closes_the_tab_of_a_landed_spec(self):
+        self.spec(archived=True, state="done", session_id="S1", updated_at="2026-01-01T00:00:00Z")
+        self.pane(name="drive-spec-10")
+        self.assertEqual(self.ok("ack", "10"), ["10 acked; tab T1 closed, resume with claude --resume S1"])
+        self.assertEqual(self.calls(), self.closed("T1"))
+        self.assertEqual(self.saved("acked.json"), {"10": "2026-01-01T00:00:00Z"})
+
     def test_closes_the_tab_of_a_pane_with_no_status_file(self):
         self.pane(name="drive-spec-10")
         self.assertEqual(self.ok("ack", "10"), ["10 acked; tab T1 closed"])
-        self.assertEqual(self.calls(), ["tab close T1"])
+        self.assertEqual(self.calls(), self.closed("T1"))
 
     def test_refuses_with_neither_status_nor_pane(self):
         self.assertEqual(self.refused("ack", "10"), "10 not acked: no status file, archived or live, and no pane")
+        self.assertEqual(self.calls(), [])
+
+
+class RexAck(Ack):
+    mux = "rex"
+
+    def closed(self, tab):
+        return [f"window close {tab}"]
+
+    def own(self, pane):
+        return {"REX_BLOCK": pane}
+
+    def test_never_closes_the_window_of_its_shell_block(self):
+        self.spec(state="done", pane="p1")
+        self.pane()
+        self.window("S1", "T1", "spec-10")["layers"][0]["blocks"].append(
+            {"block_id": "p0", "label": "shell", "creator_name": "com.superlogical.terminal"})
+        self.rex()
+        self.assertEqual(self.ok("ack", "10"), ["10 acked; pane p1 kept, still active"])
+        self.assertEqual(self.calls(), [])
 
 
 class Recover(DispatchCase):
