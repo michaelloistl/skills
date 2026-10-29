@@ -28,7 +28,7 @@ MAX_CPU = float(os.environ.get("DISPATCH_MAX_CPU", 40))
 MAX_MEMORY = float(os.environ.get("DISPATCH_MAX_MEMORY", 5))
 MAX_LOAD = float(os.environ.get("DISPATCH_MAX_LOAD", os.cpu_count() or 1))
 STALL_SECONDS = 15 * 60
-TICK_SECONDS = 60
+TICK_SECONDS = float(os.environ.get("DISPATCH_TICK_SECONDS", 60))
 POLL_SECONDS = 1.0
 READY_SECONDS = float(os.environ.get("DISPATCH_READY_SECONDS", 90))
 SETTLE_SECONDS = float(os.environ.get("DISPATCH_SETTLE_SECONDS", 30))
@@ -605,6 +605,9 @@ class HerdrEvents:
         if not data:
             self.close()
 
+    def wake_in(self):
+        return None
+
     def close(self):
         if self.sock:
             self.sock.close()
@@ -744,7 +747,55 @@ class Rex:
         return self.window_of(self.own_pane())[1] if self.own_pane() else None
 
     def events(self):
-        return NoEvents()
+        return RexEvents()
+
+
+class RexEvents:
+    """Rex events as wake hints: a `rex events` child whose stdout is `sock`. Every wake re-reads the snapshot, so
+    which events arrive doesn't matter. A stream that ends or can't start is restarted by `arm()` after a backoff
+    (1 s, doubling to the tick, reset once a stream delivers); `close()` stops it."""
+    COMMAND = ["rex", "--autostart=false", "events", "--all", "--json"]
+
+    def __init__(self):
+        self.proc, self.sock = None, None
+        self.backoff, self.retry_at = 1.0, 0.0
+
+    def arm(self):
+        if self.proc or time.monotonic() < self.retry_at:
+            return
+        self.retry_at = time.monotonic() + self.backoff
+        self.backoff = min(self.backoff * 2, TICK_SECONDS)
+        try:
+            self.proc = subprocess.Popen(self.COMMAND, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+            self.sock = self.proc.stdout
+        except OSError:
+            self.proc = None
+
+    def wake_in(self):
+        """Seconds until a dead stream may restart; None while one runs."""
+        return None if self.proc else max(0.0, self.retry_at - time.monotonic())
+
+    def drain(self):
+        try:
+            data = os.read(self.sock.fileno(), 65536)
+        except OSError:
+            data = b""
+        if data:
+            self.backoff = 1.0
+        else:
+            self.close()
+
+    def close(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc.stdout.close()
+        self.proc, self.sock = None, None
 
 
 class NoMux:
@@ -770,7 +821,13 @@ class NoEvents:
     def arm(self):
         pass
 
+    def wake_in(self):
+        return None
+
     def drain(self):
+        pass
+
+    def close(self):
         pass
 
 
@@ -935,29 +992,34 @@ def cmd_watch(dirs):
     except (OSError, ValueError):
         reported = {}
     last_fetch = 0.0
-    while True:
-        if time.monotonic() - last_fetch >= FETCH_SECONDS:
-            last_fetch = time.monotonic()
-            for a in check_merges(dirs)[0]:
-                print(a, flush=True)
-        rows = snapshot(dirs)
-        events.arm()
-        current = {r["spec"]: list(attention_key(r)) for r in rows}
-        for r in rows:
-            n = r["spec"]
-            if current[n] != reported.get(n, [None, None]):
-                print(line(r) if r["attention"] else f"{n} ok {line(r).split(' ', 1)[1]}", flush=True)
-        for n in reported.keys() - current.keys():
-            print(f"{n} gone from view", flush=True)
-        if current != reported:
-            reported = current
-            save_json(REPORTED, reported)
+    try:
+        while True:
+            if time.monotonic() - last_fetch >= FETCH_SECONDS:
+                last_fetch = time.monotonic()
+                for a in check_merges(dirs)[0]:
+                    print(a, flush=True)
+            rows = snapshot(dirs)
+            events.arm()
+            current = {r["spec"]: list(attention_key(r)) for r in rows}
+            for r in rows:
+                n = r["spec"]
+                if current[n] != reported.get(n, [None, None]):
+                    print(line(r) if r["attention"] else f"{n} ok {line(r).split(' ', 1)[1]}", flush=True)
+            for n in reported.keys() - current.keys():
+                print(f"{n} gone from view", flush=True)
+            if current != reported:
+                reported = current
+                save_json(REPORTED, reported)
 
-        ready = notify.wait([events.sock] if events.sock else [], TICK_SECONDS)
-        time.sleep(0.5)
-        notify.drain()
-        if events.sock and events.sock in ready:
-            events.drain()
+            retry = events.wake_in()
+            ready = notify.wait([events.sock] if events.sock else [],
+                                TICK_SECONDS if retry is None else min(TICK_SECONDS, retry))
+            time.sleep(0.5)
+            notify.drain()
+            if events.sock and events.sock in ready:
+                events.drain()
+    finally:
+        events.close()
 
 
 def cmd_answer(spec, text, dirs):
