@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,6 +54,22 @@ try:
 except OSError:
     state = {}
 sessions = state.get("sessions", [])
+if args[:1] == ["events"]:
+    # The event stream: logs its pid, exits at once under `"events": "exit"`, else prints one line once the file
+    # `event` appears and stays alive until `events-stop` appears (a cleanup), so an orphan outlives its watch.
+    import time
+    with open(os.path.join(fix, "events-pids"), "a") as f:
+        f.write(f"{os.getpid()}\n")
+    if state.get("events") == "exit":
+        sys.exit(0)
+    sent = False
+    while not os.path.exists(os.path.join(fix, "events-stop")):
+        if not sent and os.path.exists(os.path.join(fix, "event")):
+            print(json.dumps({"type": "session_event", "payload": {"event": {"type": "program_status_changed"}}}),
+                  flush=True)
+            sent = True
+        time.sleep(0.05)
+    sys.exit(0)
 for prefix, message in state.get("fail", {}).items():
     if " ".join(args).startswith(prefix):
         sys.stderr.write(f"Error: {message}\n")
@@ -898,14 +916,112 @@ class RexRecover(Recover):
 
 
 class Watch(DispatchCase):
-    def test_prints_what_needs_the_operator(self):
-        self.spec(state="halted", summary="red.")
+    def watch(self, **env):
+        """A running `dispatch watch`; `next_line(within)` returns its next line, or None after `within` seconds."""
         proc = subprocess.Popen([str(DISPATCH), "--repo", str(self.repo), "watch"], stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, env=self.env)
+                                stderr=subprocess.DEVNULL, text=True, env=dict(self.env, **env))
         self.addCleanup(proc.stdout.close)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
-        self.assertEqual(proc.stdout.readline().strip(), "10 HALT red. → /drive-spec 10")
+        lines = []
+        threading.Thread(target=lambda: lines.extend(l.strip() for l in proc.stdout), daemon=True).start()
+
+        def next_line(within=10):
+            deadline = time.monotonic() + within
+            while not lines and time.monotonic() < deadline:
+                time.sleep(0.05)
+            return lines.pop(0) if lines else None
+        proc.next_line = next_line
+        return proc
+
+    def test_prints_what_needs_the_operator(self):
+        self.spec(state="halted", summary="red.")
+        self.assertEqual(self.watch().next_line(), "10 HALT red. → /drive-spec 10")
+
+    def test_wakes_on_a_status_file_write(self):
+        self.spec(state="halted", summary="red.")
+        watch = self.watch(DISPATCH_TICK_SECONDS="60")
+        self.assertEqual(watch.next_line(), "10 HALT red. → /drive-spec 10")
+        self.spec(state="paused", summary="over budget.")
+        self.assertEqual(watch.next_line(within=10), "10 PAUSE over budget. → /drive-spec 10")
+
+    def test_rereads_on_the_tick(self):
+        self.spec(session_id="s-10")
+        watch = self.watch(DISPATCH_TICK_SECONDS="1")
+        self.assertEqual(watch.next_line(), "10 GONE no session; last build: landed 0/2")
+        self.sessions({"sessionId": "s-10", "status": "busy", "cwd": str(self.repo)})
+        self.assertRegex(watch.next_line(within=10), r"^10 ok running·build landed 0/2 \(busy, ")
+
+
+class RexWatch(Watch):
+    mux = "rex"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup((self.tmp / "events-stop").touch)
+
+    def streams(self):
+        f = self.tmp / "events-pids"
+        return [int(p) for p in f.read_text().split()] if f.exists() else []
+
+    def wait_for_stream(self, count=1):
+        deadline = time.monotonic() + 10
+        while len(self.streams()) < count and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertGreaterEqual(len(self.streams()), count)
+
+    def alive(self, pid):
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(state) and not state.startswith("Z")
+
+    def test_a_rex_event_wakes_it_before_the_tick(self):
+        self.spec(pane="p1")
+        self.pane(status="working")
+        watch = self.watch(DISPATCH_TICK_SECONDS="30")
+        self.wait_for_stream()
+        self.blocks["p1"]["program_status"]["records"][0]["state"] = "blocked"
+        self.rex()
+        self.assertIsNone(watch.next_line(within=3))
+        (self.tmp / "event").touch()
+        self.assertEqual(watch.next_line(within=10), "10 DIALOG dialog open in spec-10: dispatch open 10")
+        self.assertIn("events --all --json", self.logged())
+
+    def test_a_stream_that_ends_is_restarted_and_status_files_still_wake_it(self):
+        (self.tmp / "rex.json").write_text(json.dumps({"sessions": list(self.rex_sessions.values()),
+                                                       "blocks": self.blocks, "events": "exit"}))
+        self.spec(state="halted", summary="red.")
+        watch = self.watch(DISPATCH_TICK_SECONDS="60")
+        self.assertEqual(watch.next_line(), "10 HALT red. → /drive-spec 10")
+        self.spec(state="paused", summary="over budget.")
+        self.assertEqual(watch.next_line(within=10), "10 PAUSE over budget. → /drive-spec 10")
+        self.wait_for_stream(count=2)
+
+    def test_runs_without_rex(self):
+        (self.tmp / "bin" / "rex").unlink()
+        self.spec(state="halted", summary="red.")
+        watch = self.watch(DISPATCH_TICK_SECONDS="60")
+        self.assertEqual(watch.next_line(), "10 HALT red. → /drive-spec 10")
+        self.spec(state="paused", summary="over budget.")
+        self.assertEqual(watch.next_line(within=10), "10 PAUSE over budget. → /drive-spec 10")
+
+    def test_runs_on_the_tick_without_rex(self):
+        (self.tmp / "bin" / "rex").unlink()
+        self.test_rereads_on_the_tick()
+
+    def test_a_superseded_watch_stops_its_stream(self):
+        self.spec(state="halted", summary="red.")
+        first = self.watch()
+        self.assertEqual(first.next_line(), "10 HALT red. → /drive-spec 10")
+        self.wait_for_stream()
+        stream = self.streams()[0]
+        self.assertTrue(self.alive(stream))
+        self.watch()
+        self.assertEqual(first.next_line(), "watch superseded by a newer one: leave this one stopped")
+        first.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while self.alive(stream) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(self.alive(stream))
 
 
 if __name__ == "__main__":
