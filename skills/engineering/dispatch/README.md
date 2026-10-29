@@ -17,15 +17,23 @@ Python 3, standard library only. Run it from inside the repo, or pass `--repo PA
 - `dispatch recover [--do <spec>=resume|restart|leave …]`: without `--do`, proposes an action for each spec whose status says `running` but whose session is not working, plus `leave` for waiting, halted and paused specs. With `--do`, acts: `resume` sends `/drive-spec <n>` to the spec's own session (in its restored pane, or reopened with `claude --resume` in a new tab); `restart` sends it to a fresh session (`/clear` in its pane, or a new tab). drive-spec resumes from the tracker and branches either way.
 - `dispatch merges`: fetches each repo's base branch once and handles every first-parent commit since the last fetch. Each unfinished spec whose branch shares files with the commit, or has no branch on origin yet, gets a base note appended to its inbox, naming the PR, its files, and the files it shares with the spec branch; the spec reads it at its next boundary (drive-spec's STATUS.md, Inbox). A done spec whose draft PR overlaps prints `OVERLAP`. A spec whose own PR landed is archived.
 
-A spec is joined across three sources: its status file, its herdr pane (by the pane id in the file, or a pane titled `drive-spec-<n>`), and its Claude session (`claude agents --json`, which still reads `busy` while background subagents run and herdr reads `idle`).
+A spec is joined across three sources: its status file, its pane (by the pane id in the file, or a pane labelled or titled `spec-<n>` or `drive-spec-<n>`), and its Claude session (`claude agents --json`, which still reads `busy` while background subagents run and herdr reads `idle`).
 
 ## Tests
 
-`test_dispatch.py` runs the script as a subprocess in a throwaway git repo, with fake `herdr` and `claude` first on `PATH` answering from per-test JSON fixtures and logging their calls:
+`test_dispatch.py` runs the script as a subprocess in a throwaway git repo, with fake `herdr`, `rex` and `claude` first on `PATH` answering from per-test JSON fixtures and logging their calls. The `status` scenarios run inside both multiplexers, from equivalent fixtures, expecting the same lines:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/dispatch
 ```
+
+## Multiplexer
+
+dispatch works the panes of one multiplexer, herdr or Rex. `DISPATCH_MUX=herdr|rex` picks it; unset, it is herdr when `HERDR_ENV` is set, even inside Rex, else Rex when `REX_SESSION` is set, else none. Any other value is refused, naming the valid ones. With none, `launch`, `open`, `answer`, `ack` and `recover --do` refuse with `not inside herdr or Rex`, and `status`, `watch`, `merges` still run with every spec showing `no pane`. A forced multiplexer whose variable is unset refuses those commands the same way, naming the variable.
+
+Rex's terms map onto herdr's: a herdr workspace is a Rex session, a tab a window, a pane a block. dispatch lists every Rex session (`rex ls`), its windows and terminal blocks (`rex window ls`), and per block `program_status`, `title` and `pwd`. A block is a Claude pane when `program_status` holds a root `claude-code` record (one with no `id`; subagents add their own), and that record's state is the pane's: `idle`, `working`, `blocked`, `done`, any other reading `idle`. Its tab is its window, named by the block's label when that names a spec, else the window's label. Its cwd is `pwd`, else its foreground process's cwd. Rex gives no Claude session id, so a status file's `session_id` is checked against the pane only under herdr.
+
+A status file names its pane in `pane` with its multiplexer in `mux`; dispatch ignores a `pane` from the other multiplexer, and reads a legacy `herdr_pane` as a herdr pane.
 
 ## Admission
 

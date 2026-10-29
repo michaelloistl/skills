@@ -318,6 +318,44 @@ def assert_gone(case, pid):
     case.fail(f"pid {pid} still runs")
 
 
+def scrubbed():
+    """This process's env without the multiplexer it may run inside: each test says which it is in."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("HERDR_", "REX_")) and k != "DISPATCH_MUX"}
+
+
+class PaneRecord(unittest.TestCase):
+    """`status.sh` records the pane it writes from, and its multiplexer."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="status-sh-test-")).resolve()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.env = dict(scrubbed(), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", str(self.repo)], env=self.env, check=True)
+
+    def write(self, **env):
+        subprocess.run([str(SCRIPT.with_name("status.sh")), "10", "step=build"], cwd=self.repo,
+                       env=dict(self.env, **env), check=True)
+        st = json.loads((self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").read_text())
+        return st.get("pane"), st.get("mux"), st.get("herdr_pane")
+
+    def test_a_herdr_pane(self):
+        self.assertEqual(self.write(HERDR_PANE_ID="p1", REX_BLOCK="block:1"), ("p1", "herdr", None))
+
+    def test_a_rex_block(self):
+        self.assertEqual(self.write(REX_BLOCK="block:1"), ("block:1", "rex", None))
+
+    def test_neither_keeps_the_previous_pane(self):
+        self.write(REX_BLOCK="block:1")
+        self.assertEqual(self.write(), ("block:1", "rex", None))
+
+    def test_a_pane_replaces_a_legacy_herdr_pane(self):
+        status = self.repo / ".git" / "drive-spec" / "status"
+        status.mkdir(parents=True)
+        (status / "spec-10.json").write_text(json.dumps({"spec": 10, "herdr_pane": "p1"}))
+        self.assertEqual(self.write(), (None, None, "p1"))
+        self.assertEqual(self.write(REX_BLOCK="block:1"), ("block:1", "rex", None))
+
+
 class Cli(unittest.TestCase):
     """The script end to end: real git against a bare origin, a fake `gh` holding the tracker."""
 
@@ -331,7 +369,7 @@ class Cli(unittest.TestCase):
         gh = self.tmp / "bin" / "gh"
         gh.write_text(f"#!{sys.executable}\n{FAKE_GH}")
         gh.chmod(0o755)
-        self.env = dict(os.environ, PATH=f"{self.tmp / 'bin'}:{os.environ['PATH']}", FIX=str(self.tmp),
+        self.env = dict(scrubbed(), PATH=f"{self.tmp / 'bin'}:{os.environ['PATH']}", FIX=str(self.tmp),
                         COUNTER=str(self.counter), DRIVE_SPEC_POLL_SECONDS="0",
                         DRIVE_SPEC_VERIFY_LOCK=str(self.tmp / "verify.lock"), CLAUDE_CODE_REMOTE="false",
                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
@@ -1172,10 +1210,11 @@ class DispatcherCase(Cli):
 
     def setUp(self):
         super().setUp()
-        for name, out in (("herdr", "{}"), ("claude", "[]")):
+        for name, out in (("herdr", "{}"), ("rex", "{}"), ("claude", "[]")):
             f = self.tmp / "bin" / name
             f.write_text(f"#!/bin/sh\necho '{out}'\n")
             f.chmod(0o755)
+        self.env.update(HERDR_ENV="1", DISPATCH_MUX="herdr")
 
     def row(self):
         st = self.status_file()
