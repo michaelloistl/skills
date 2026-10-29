@@ -1,0 +1,442 @@
+"""Tests for the dispatch script. Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/dispatch
+
+Each test runs `dispatch` as a subprocess in a throwaway git repo, with fake `herdr` and `claude` first on PATH. The
+fakes answer from per-test JSON fixtures and log their argv; tests assert only on printed lines, exit status, state
+files and the logged calls."""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DISPATCH = Path(__file__).with_name("dispatch")
+
+FAKE_HERDR = r'''
+import json, os, sys
+fix = os.environ["FIX"]
+args = sys.argv[1:]
+with open(os.path.join(fix, "herdr-calls"), "a") as f:
+    f.write(json.dumps(args) + "\n")
+try:
+    with open(os.path.join(fix, "herdr.json")) as f:
+        state = json.load(f)
+except OSError:
+    state = {}
+for prefix, message in state.get("fail", {}).items():
+    if " ".join(args).startswith(prefix):
+        sys.stderr.write(json.dumps({"error": {"message": message}}))
+        sys.exit(1)
+if args[:2] == ["agent", "list"]:
+    print(json.dumps({"result": {"agents": state.get("agents", [])}}))
+elif args[:2] == ["tab", "create"]:
+    print(json.dumps({"result": {"tab": {"tab_id": "T9"}, "root_pane": {"pane_id": "p9"}}}))
+else:
+    print("{}")
+'''
+
+FAKE_CLAUDE = r'''
+import os, sys
+try:
+    with open(os.path.join(os.environ["FIX"], "claude.json")) as f:
+        sys.stdout.write(f.read())
+except OSError:
+    print("[]")
+'''
+
+
+def stamp(minutes_ago=0):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class DispatchCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dispatch-test-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        for name, body in (("herdr", FAKE_HERDR), ("claude", FAKE_CLAUDE)):
+            (bin_dir / name).write_text(f"#!{sys.executable}\n{body}")
+            (bin_dir / name).chmod(0o755)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("HERDR_", "REX_", "DISPATCH_", "CLAUDE_"))}
+        self.env = dict(env, PATH=f"{bin_dir}:{os.environ['PATH']}", FIX=str(self.tmp),
+                        XDG_STATE_HOME=str(self.tmp / "state"), CLAUDE_CONFIG_DIR=str(self.tmp / "claude"),
+                        HERDR_ENV="1", HERDR_WORKSPACE_ID="W1", HERDR_PANE_ID="p0",
+                        DISPATCH_MAX_CPU="101", DISPATCH_MAX_MEMORY="101", DISPATCH_MAX_LOAD="9999",
+                        GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], env=self.env, check=True)
+        self.status = self.repo / ".git" / "drive-spec" / "status"
+        self.status.mkdir(parents=True)
+        self.state_dir = self.tmp / "state" / "dispatch"
+        self.panes = []
+        self.herdr({})
+
+    def herdr(self, extra):
+        (self.tmp / "herdr.json").write_text(json.dumps(dict(extra, agents=self.panes)))
+
+    def pane(self, pane_id="p1", status="idle", name="spec-10", tab="T1", session=None, cwd=None):
+        p = {"pane_id": pane_id, "name": name, "terminal_title_stripped": "", "cwd": str(cwd or self.repo),
+             "agent_status": status, "tab_id": tab}
+        if session:
+            p["agent_session"] = {"value": session}
+        self.panes.append(p)
+        self.herdr({})
+
+    def sessions(self, *sessions):
+        (self.tmp / "claude.json").write_text(json.dumps(list(sessions)))
+
+    def spec(self, n=10, archived=False, **fields):
+        data = dict({"spec": n, "step": "build", "state": "running", "summary": "landed 0/2",
+                     "next": f"/drive-spec {n}", "updated_at": stamp()}, **fields)
+        d = self.status / "archive" if archived else self.status
+        d.mkdir(exist_ok=True)
+        (d / f"spec-{n}.json").write_text(json.dumps(data))
+
+    def queue(self, *specs):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "queue.json").write_text(json.dumps(
+            [{"spec": s, "repo": str(self.repo), "reason": "load 9.0 > 8", "queued_at": stamp()} for s in specs]))
+
+    def dispatch(self, *args, **env):
+        return subprocess.run([str(DISPATCH), "--repo", str(self.repo), *args], capture_output=True, text=True,
+                              env=dict(self.env, **env), timeout=60)
+
+    def ok(self, *args, **env):
+        out = self.dispatch(*args, **env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.splitlines()
+
+    def refused(self, *args, **env):
+        out = self.dispatch(*args, **env)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        return out.stderr.strip()
+
+    def calls(self):
+        """The fake herdr's calls, bar the listings every command makes."""
+        f = self.tmp / "herdr-calls"
+        listed = [json.loads(c) for c in f.read_text().splitlines()] if f.exists() else []
+        return [" ".join(c) for c in listed if c[:2] != ["agent", "list"]]
+
+    def saved(self, name):
+        return json.loads((self.state_dir / name).read_text())
+
+
+class Status(DispatchCase):
+    def test_a_blocked_pane_is_a_dialog(self):
+        self.spec(herdr_pane="p1")
+        self.pane(status="blocked")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 DIALOG dialog open in spec-10: dispatch open 10"])
+
+    def test_a_blocking_question_asks(self):
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 ASK question waiting in spec-10: dispatch open 10"])
+
+    def test_a_halt_relays_why_and_resume(self):
+        self.spec(state="halted", summary="export test red.", next="/review-fix-pr 101")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 HALT export test red. → /review-fix-pr 101"])
+
+    def test_a_quiet_running_spec_stalls(self):
+        self.spec(updated_at=stamp(20), herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 STALL quiet 20m at build"])
+
+    def test_a_running_spec_without_pane_or_session_is_gone(self):
+        self.spec()
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 GONE no session; last build: landed 0/2"])
+
+    def test_a_pause_relays_resume(self):
+        self.spec(state="paused", summary="paused at maxSlices.")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 PAUSE paused at maxSlices. → /drive-spec 10"])
+
+    def test_done_relays_the_pr(self):
+        self.spec(state="done", step="qa-pr", pr_url="https://github.com/acme/app/pull/101")
+        self.assertEqual(self.ok("status"), ["NEEDS YOU", " 10 PR https://github.com/acme/app/pull/101"])
+
+    def test_tags_sort_by_urgency(self):
+        self.spec(11, state="paused", summary="paused.")
+        self.spec(12, state="halted", summary="red.")
+        self.spec(13, herdr_pane="p1")
+        self.pane(status="blocked", name="spec-13")
+        self.assertEqual([x.split()[1] for x in self.ok("status")[1:]], ["DIALOG", "HALT", "PAUSE"])
+
+    def test_a_working_spec_is_ok(self):
+        self.spec(herdr_pane="p1")
+        self.pane(status="working")
+        self.assertEqual(self.ok("status"), ["OK", " 10 running·build landed 0/2 (working, 0m)"])
+
+    def test_the_head_of_the_queue_is_ready_when_pressure_clears(self):
+        self.queue("10", "11")
+        self.assertEqual(self.ok("status"), ["QUEUED", " 10 READY queued 0m: load 9.0 > 8",
+                                             " 11 queued 0m: load 9.0 > 8"])
+
+    def test_the_queue_waits_under_pressure(self):
+        self.queue("10")
+        self.assertEqual(self.ok("status", DISPATCH_MAX_LOAD="-1"), ["QUEUED", " 10 queued 0m: load 9.0 > 8"])
+
+    def test_a_landed_spec_reads_from_the_archive(self):
+        self.spec(archived=True, state="done", pr_url="https://github.com/acme/app/pull/101")
+        self.pane(name="drive-spec-10")
+        self.assertEqual(self.ok("status"),
+                         ["OK", " 10 PR landed, status archived; dispatch ack 10 closes its tab (idle)"])
+
+    def test_a_pane_with_no_status_file(self):
+        self.pane(name="drive-spec-10")
+        self.assertEqual(self.ok("status"), ["OK", " 10 no status file (idle); dispatch ack 10 closes its tab"])
+
+    def test_a_pane_outside_the_repo_is_not_joined_by_name(self):
+        self.pane(name="drive-spec-10", cwd=self.tmp)
+        self.assertEqual(self.ok("status"), ["no specs"])
+
+    def test_a_busy_session_counts_as_live(self):
+        self.spec(updated_at=stamp(20), session_id="S1")
+        self.sessions({"sessionId": "S1", "cwd": str(self.repo), "name": "drive-spec-10", "status": "busy"})
+        self.assertEqual(self.ok("status"), ["OK", " 10 running·build landed 0/2 (busy, 20m)"])
+
+    def test_json_reports_the_live_state_as_mux(self):
+        self.spec(herdr_pane="p1")
+        self.pane(status="working")
+        row = json.loads(self.dispatch("status", "--json").stdout)[0]
+        self.assertEqual((row["pane"], row["mux"]), ("p1", "working"))
+        self.assertNotIn("herdr", row)
+
+
+class Launch(DispatchCase):
+    def test_starts_a_new_tab(self):
+        self.assertEqual(self.ok("launch", "10"), ["10 started in tab T9 (pane p9)"])
+        self.assertEqual(self.calls(), [
+            f"tab create --workspace W1 --cwd {self.repo} --label spec-10 --no-focus",
+            "agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10",
+            "agent prompt spec-10 /drive-spec 10",
+        ])
+
+    def test_skips_a_spec_already_running(self):
+        self.spec(herdr_pane="p1")
+        self.pane(status="working")
+        self.assertEqual(self.ok("launch", "10"), ["10 already running in p1"])
+        self.assertEqual(self.calls(), [])
+
+    def test_resumes_an_idle_pane_with_the_runs_next_command(self):
+        self.spec(state="halted", summary="red.", next="/review-fix-pr 101", herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("launch", "10"), ["10 resumed in p1 with /review-fix-pr 101"])
+        self.assertEqual(self.calls(), ["agent prompt p1 /review-fix-pr 101"])
+
+    def test_leaves_a_spec_waiting_on_its_question(self):
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("launch", "10"), ["10 waiting on its question in p1: dispatch open 10"])
+        self.assertEqual(self.calls(), [])
+
+    def test_leaves_a_done_spec(self):
+        self.spec(state="done", herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("launch", "10"), ["10 already done in p1"])
+        self.assertEqual(self.calls(), [])
+
+    def test_queues_under_pressure(self):
+        out = self.ok("launch", "10", DISPATCH_MAX_LOAD="-1")
+        self.assertEqual(len(out), 1)
+        self.assertRegex(out[0], r"^10 queued: load \d+\.\d > -1$")
+        self.assertEqual([(q["spec"], q["repo"]) for q in self.saved("queue.json")], [("10", str(self.repo))])
+        self.assertEqual(self.calls(), [])
+
+    def test_force_starts_under_pressure(self):
+        self.queue("10")
+        self.assertEqual(self.ok("launch", "10", "--force", DISPATCH_MAX_LOAD="-1"),
+                         ["10 started in tab T9 (pane p9) from the queue"])
+        self.assertEqual(self.saved("queue.json"), [])
+
+    def test_a_failed_start_closes_its_tab(self):
+        self.herdr({"fail": {"agent start": "claude did not start"}})
+        self.assertEqual(self.ok("launch", "10"), ["10 failed to start: herdr agent start: claude did not start"])
+        self.assertEqual(self.calls()[-1], "tab close T9")
+
+
+class Open(DispatchCase):
+    def test_focuses_the_specs_pane(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("open", "10"), ["10 opened in p1"])
+        self.assertEqual(self.calls(), ["agent focus p1"])
+
+    def test_refuses_without_a_pane(self):
+        self.spec()
+        self.assertEqual(self.refused("open", "10"), "10 not opened: no pane holds its session; recover it first")
+
+    def test_reports_a_failed_focus(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.herdr({"fail": {"agent focus": "no such pane"}})
+        self.assertEqual(self.refused("open", "10"), "10 not opened: herdr agent focus: no such pane")
+
+
+class Answer(DispatchCase):
+    def waiting(self, status="idle"):
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1")
+        self.pane(status=status)
+
+    def test_prompts_the_pane_quoting_the_question(self):
+        self.waiting()
+        self.assertEqual(self.ok("answer", "10", "yes,", "keep", "it"), ["10 answered in p1: keep CSV? → yes, keep it"])
+        self.assertEqual(self.calls(),
+                         ["agent prompt p1 The operator's answer to your question (keep CSV?): yes, keep it"])
+
+    def test_refuses_without_a_status_file(self):
+        self.assertEqual(self.refused("answer", "10", "yes"), "10 not answered: no status file")
+
+    def test_refuses_a_spec_not_waiting(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.refused("answer", "10", "yes"),
+                         "10 not answered: it is not waiting on a question (running)")
+
+    def test_refuses_a_non_blocking_question(self):
+        self.spec(state="waiting", question="keep CSV?", question_blocking=False, herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.refused("answer", "10", "yes"),
+                         "10 not answered: it is not waiting on a question (waiting)")
+
+    def test_refuses_without_a_pane(self):
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True)
+        self.assertEqual(self.refused("answer", "10", "yes"),
+                         "10 not answered: no pane holds its session; recover it first")
+
+    def test_refuses_a_working_pane(self):
+        self.waiting("working")
+        self.assertEqual(self.refused("answer", "10", "yes"),
+                         "10 not answered: it is working; send it once it settles")
+
+    def test_refuses_a_blocked_pane(self):
+        self.waiting("blocked")
+        self.assertEqual(self.refused("answer", "10", "yes"),
+                         "10 not answered: it is blocked; send it once it settles")
+
+    def test_refuses_a_busy_session(self):
+        self.waiting()
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1", session_id="S1")
+        self.sessions({"sessionId": "S1", "cwd": str(self.repo), "name": "drive-spec-10", "status": "busy"})
+        self.assertEqual(self.refused("answer", "10", "yes"), "10 not answered: it is busy; send it once it settles")
+        self.assertEqual(self.calls(), [])
+
+
+class Ack(DispatchCase):
+    def test_closes_a_done_specs_idle_tab(self):
+        self.spec(state="done", herdr_pane="p1", session_id="S1", updated_at="2026-01-01T00:00:00Z")
+        self.pane()
+        self.assertEqual(self.ok("ack", "10"), ["10 acked; tab T1 closed, resume with claude --resume S1"])
+        self.assertEqual(self.calls(), ["tab close T1"])
+        self.assertEqual(self.saved("acked.json"), {"10": "2026-01-01T00:00:00Z"})
+
+    def test_keeps_an_active_pane(self):
+        self.spec(state="done", herdr_pane="p1")
+        self.pane(status="working")
+        self.assertEqual(self.ok("ack", "10"), ["10 acked; pane p1 kept, still active"])
+        self.assertEqual(self.calls(), [])
+
+    def test_never_closes_its_own_pane(self):
+        self.spec(state="done", herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("ack", "10", HERDR_PANE_ID="p1"), ["10 acked; pane p1 kept, still active"])
+        self.assertEqual(self.calls(), [])
+
+    def test_keeps_the_pane_of_a_spec_not_done(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("ack", "10"), ["10 acked; pane kept, not done"])
+        self.assertEqual(self.calls(), [])
+
+    def test_closes_the_tab_of_a_pane_with_no_status_file(self):
+        self.pane(name="drive-spec-10")
+        self.assertEqual(self.ok("ack", "10"), ["10 acked; tab T1 closed"])
+        self.assertEqual(self.calls(), ["tab close T1"])
+
+    def test_refuses_with_neither_status_nor_pane(self):
+        self.assertEqual(self.refused("ack", "10"), "10 not acked: no status file, archived or live, and no pane")
+
+
+class Recover(DispatchCase):
+    def test_proposes_an_action_per_spec(self):
+        self.spec(10, herdr_pane="p1")
+        self.pane()
+        self.spec(11, session_id="S1")
+        self.spec(12)
+        self.spec(13, state="waiting", question="q?", question_blocking=True)
+        self.spec(14, state="halted", summary="red.")
+        self.spec(15, herdr_pane="p2")
+        self.pane("p2", status="working", name="spec-15")
+        self.assertEqual(self.ok("recover"), [
+            "10 RESUME? interrupted at build 0m ago; session back in p1",
+            "11 RESUME? interrupted at build 0m ago; reopen its session in a new tab",
+            "12 RESTART? interrupted at build 0m ago; no session to reopen",
+            "13 LEAVE? waiting on your answer in its pane",
+            "14 LEAVE? halted at build: red.",
+        ])
+
+    def test_nothing_to_recover(self):
+        self.assertEqual(self.ok("recover"), ["nothing to recover"])
+
+    def test_leave(self):
+        self.spec()
+        self.assertEqual(self.ok("recover", "--do", "10=leave"), ["10 left alone"])
+        self.assertEqual(self.calls(), [])
+
+    def test_resume_in_its_pane(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("recover", "--do", "#10=resume"), ["10 resumed in p1"])
+        self.assertEqual(self.calls(), ["agent prompt p1 /drive-spec 10"])
+
+    def test_resume_reopens_its_session_in_a_new_tab(self):
+        self.spec(session_id="S1")
+        self.assertEqual(self.ok("recover", "--do", "10=resume"), ["10 resumed in tab T9 (pane p9)"])
+        self.assertEqual(self.calls(), [
+            f"tab create --workspace W1 --cwd {self.repo} --label spec-10 --no-focus",
+            "agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10 --resume S1",
+            "agent prompt spec-10 /drive-spec 10",
+        ])
+
+    def test_restart_clears_its_pane(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("recover", "--do", "10=restart"), ["10 restarted fresh in p1"])
+        self.assertEqual(self.calls(), ["agent prompt p1 /clear --wait --timeout 30000",
+                                        "agent prompt p1 /drive-spec 10"])
+
+    def test_restart_in_a_new_tab(self):
+        self.spec(session_id="S1")
+        self.assertEqual(self.ok("recover", "--do", "10=restart"), ["10 restarted in tab T9 (pane p9)"])
+        self.assertEqual(self.calls()[1], "agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10")
+
+    def test_reports_a_failed_action(self):
+        self.spec(herdr_pane="p1")
+        self.pane()
+        self.herdr({"fail": {"agent prompt": "pane gone"}})
+        self.assertEqual(self.ok("recover", "--do", "10=resume"), ["10 resume failed: herdr agent prompt: pane gone"])
+
+    def test_an_unknown_action(self):
+        self.spec()
+        self.assertEqual(self.ok("recover", "--do", "10=poke"),
+                         ["10 unknown action 'poke': use resume, restart or leave"])
+
+
+class Watch(DispatchCase):
+    def test_prints_what_needs_the_operator(self):
+        self.spec(state="halted", summary="red.")
+        proc = subprocess.Popen([str(DISPATCH), "--repo", str(self.repo), "watch"], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, env=self.env)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "10 HALT red. → /drive-spec 10")
+
+
+if __name__ == "__main__":
+    unittest.main()

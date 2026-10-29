@@ -19,6 +19,14 @@ Python 3, standard library only. Run it from inside the repo, or pass `--repo PA
 
 A spec is joined across three sources: its status file, its herdr pane (by the pane id in the file, or a pane titled `drive-spec-<n>`), and its Claude session (`claude agents --json`, which still reads `busy` while background subagents run and herdr reads `idle`).
 
+## Tests
+
+`test_dispatch.py` runs the script as a subprocess in a throwaway git repo, with fake `herdr` and `claude` first on `PATH` answering from per-test JSON fixtures and logging their calls:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/dispatch
+```
+
 ## Admission
 
 A launch queues when any of these holds; each limit has an env override.
