@@ -7,6 +7,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -14,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "dispatch"
 ACKED = STATE_DIR / "acked.json"
@@ -27,8 +29,10 @@ MAX_CPU = float(os.environ.get("DISPATCH_MAX_CPU", 40))
 MAX_MEMORY = float(os.environ.get("DISPATCH_MAX_MEMORY", 5))
 MAX_LOAD = float(os.environ.get("DISPATCH_MAX_LOAD", os.cpu_count() or 1))
 STALL_SECONDS = 15 * 60
-TICK_SECONDS = 60
+TICK_SECONDS = float(os.environ.get("DISPATCH_TICK_SECONDS", 60))
 POLL_SECONDS = 1.0
+READY_SECONDS = float(os.environ.get("DISPATCH_READY_SECONDS", 90))
+SETTLE_SECONDS = float(os.environ.get("DISPATCH_SETTLE_SECONDS", 30))
 TITLE = re.compile(r"\b(?:drive-spec|spec)[- ](\d+)\b")
 
 ORDER = ["DIALOG", "ASK", "HALT", "STALL", "GONE", "PAUSE", "PR"]
@@ -68,13 +72,6 @@ def read_archived(dirs, n):
         except (OSError, ValueError):
             continue
     return None
-
-
-def herdr_agents():
-    try:
-        return json.loads(run(["herdr", "agent", "list"]) or "{}").get("result", {}).get("agents", [])
-    except ValueError:
-        return []
 
 
 def claude_sessions(files=None):
@@ -132,26 +129,27 @@ def in_repos(cwd, dirs):
 
 def snapshot(dirs):
     files = read_status_files(dirs)
-    all_agents = herdr_agents()
+    all_panes = MUX.panes()
     all_sessions = claude_sessions(files)
-    agents = [a for a in all_agents if in_repos(a.get("cwd"), dirs)]
+    panes = [p for p in all_panes if in_repos(p["cwd"], dirs)]
     sessions = [s for s in all_sessions if in_repos(s.get("cwd"), dirs)]
     acked = load_acked()
 
-    by_pane = {a["pane_id"]: a for a in all_agents}
+    by_pane = {p["id"]: p for p in all_panes}
     pane_of = {}
-    for a in agents:
-        n = spec_of(a.get("name")) or spec_of(a.get("terminal_title_stripped"))
+    for p in panes:
+        n = spec_of(p["label"]) or spec_of(p["title"])
         if n:
-            pane_of.setdefault(n, a)
+            pane_of.setdefault(n, p)
     session_of = {}
     for s in sessions:
         n = spec_of(s.get("name"))
         if n:
             session_of[n] = s
     for n, data in files.items():
-        pane = by_pane.get(data.get("herdr_pane"))
-        pane_session = ((pane or {}).get("agent_session") or {}).get("value")
+        pane_id, mux = (data["pane"], data.get("mux")) if data.get("pane") else (data.get("herdr_pane"), "herdr")
+        pane = by_pane.get(pane_id) if mux in (None, MUX.name) else None
+        pane_session = (pane or {}).get("session")
         if pane and not (pane_session and data.get("session_id") and pane_session != data["session_id"]):
             pane_of[n] = pane
         sid = data.get("session_id")
@@ -164,7 +162,7 @@ def snapshot(dirs):
         rows.append(classify(n, files.get(n), pane_of.get(n), session_of.get(n), acked,
                              None if n in files else read_archived(dirs, n)))
 
-    live = {r["spec"] for r in rows if r["herdr"] in ("working", "blocked") or r["session"] == "busy"}
+    live = {r["spec"] for r in rows if is_live(r)}
     roots = {repo_root(d) for d in dirs}
     queued = [q for q in load_queue() if q["repo"] in roots and q["spec"] not in live]
     verdict = admit() if queued else None
@@ -177,14 +175,18 @@ def snapshot(dirs):
     return rows
 
 
+def is_live(row):
+    """Its Claude is working or blocked in its pane, or its session is busy (background subagents)."""
+    return row.get("mux") in ("working", "blocked") or row.get("session") == "busy"
+
+
 def classify(n, data, pane, session, acked, archived=None):
-    herdr = pane.get("agent_status") if pane else None
-    busy = (session or {}).get("status") == "busy"
-    live = herdr in ("working", "blocked") or busy
+    mux = pane["state"] if pane else None
     row = {
         "spec": n,
-        "pane": pane["pane_id"] if pane else None,
-        "herdr": herdr,
+        "pane": pane["id"] if pane else None,
+        "tab": pane["tab"] if pane else None,
+        "mux": mux,
         "session": (session or {}).get("status"),
         "state": None,
         "step": None,
@@ -201,8 +203,8 @@ def classify(n, data, pane, session, acked, archived=None):
                    pr_url=data.get("pr_url"), age=age(data.get("updated_at")),
                    acked=data.get("state") == "done" and acked.get(n) == data.get("updated_at"))
 
-    state = row["state"]
-    if herdr == "blocked":
+    state, live = row["state"], is_live(row)
+    if mux == "blocked":
         row.update(attention="DIALOG", detail=f"dialog open in {where(pane)}: dispatch open {n}")
     elif not data and archived:
         row.update(state="landed", pr_url=archived.get("pr_url"), age=age(archived.get("updated_at")),
@@ -229,7 +231,7 @@ def classify(n, data, pane, session, acked, archived=None):
 
 
 def where(pane):
-    return (pane or {}).get("name") or (pane or {}).get("pane_id") or "no pane"
+    return (pane or {}).get("label") or (pane or {}).get("id") or "no pane"
 
 
 def attention_key(row):
@@ -241,7 +243,7 @@ def attention_key(row):
 def line(row):
     if row["attention"]:
         return f"{row['spec']} {row['attention']} {row['detail']}"
-    live = "busy" if row["session"] == "busy" else row["herdr"] or row["session"] or "no pane"
+    live = "busy" if row["session"] == "busy" else row["mux"] or row["session"] or "no pane"
     if not row["state"]:
         return f"{row['spec']} no status file ({live}); dispatch ack {row['spec']} closes its tab"
     if row["state"] == "landed":
@@ -257,7 +259,7 @@ def cmd_status(dirs, as_json):
     if as_json:
         print(json.dumps(rows, indent=2))
         return
-    rows = [r for r in rows if not (r["acked"] and r["herdr"] not in ("working", "blocked") and r["session"] != "busy")]
+    rows = [r for r in rows if not (r["acked"] and not is_live(r))]
     needs = sorted((r for r in rows if r["attention"] in ORDER), key=lambda r: ORDER.index(r["attention"]))
     queued = [r for r in rows if r["state"] == "queued"]
     rest = [r for r in rows if r not in needs and r not in queued]
@@ -326,45 +328,14 @@ def dequeue(spec, root):
     return rest != queue
 
 
-def herdr_json(*args):
-    out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=120)
-    if out.returncode != 0:
-        try:
-            message = json.loads(out.stderr)["error"]["message"]
-        except (ValueError, KeyError, TypeError):
-            message = out.stderr.strip() or f"exit {out.returncode}"
-        raise RuntimeError(f"herdr {args[0]} {args[1]}: {message}")
-    return json.loads(out.stdout or "{}").get("result", {})
-
-
-def start(spec, root, session=None):
-    workspace = os.environ.get("HERDR_WORKSPACE_ID")
-    if not workspace:
-        raise RuntimeError("not inside herdr (HERDR_WORKSPACE_ID unset)")
-    tab = herdr_json("tab", "create", "--workspace", workspace, "--cwd", root,
-                     "--label", f"spec-{spec}", "--no-focus")
-    tab_id, pane = tab["tab"]["tab_id"], tab["root_pane"]["pane_id"]
-    try:
-        time.sleep(1)
-        herdr_json("agent", "start", f"spec-{spec}", "--kind", "claude", "--pane", pane,
-                   "--timeout", "90000", "--", "-n", f"drive-spec-{spec}",
-                   *(["--resume", session] if session else []))
-        herdr_json("agent", "prompt", f"spec-{spec}", f"/drive-spec {spec}")
-    except Exception:
-        run(["herdr", "tab", "close", tab_id])
-        raise
-    return tab_id, pane
-
-
 def cmd_launch(specs, dirs, force):
     root = repo_root(dirs[0])
     rows = {r["spec"]: r for r in snapshot(dirs[:1])}
     files = read_status_files(dirs[:1])
     for spec in specs:
         row, data = rows.get(spec, {}), files.get(spec, {})
-        active = row.get("herdr") in ("working", "blocked") or row.get("session") == "busy"
-        if active or (row.get("session") and not row.get("pane")):
-            print(f"{spec} already running in {row.get('pane') or 'a Claude session outside herdr'}")
+        if is_live(row) or (row.get("session") and not row.get("pane")):
+            print(f"{spec} already running in {row.get('pane') or 'a Claude session with no pane'}")
             continue
         if row.get("pane") and row.get("attention") == "ASK":
             print(f"{spec} waiting on its question in {row['pane']}: dispatch open {spec}")
@@ -383,11 +354,11 @@ def cmd_launch(specs, dirs, force):
                 # command the run left in `next`, rather than a second session in a new tab.
                 nxt = data.get("next") or ""
                 prompt = nxt if data.get("state") in ("halted", "paused") and nxt.startswith("/") else f"/drive-spec {spec}"
-                herdr_json("agent", "prompt", row["pane"], prompt)
+                MUX.prompt(row["pane"], prompt)
                 was_queued = dequeue(spec, root)
                 print(f"{spec} resumed in {row['pane']} with {prompt}{' from the queue' if was_queued else ''}")
                 continue
-            tab_id, pane = start(spec, root)
+            tab_id, pane = MUX.open_tab(spec, root)
         except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
             print(f"{spec} failed to start: {e}")
             continue
@@ -423,7 +394,7 @@ def recover_plan(dirs):
         except (KeyError, ValueError):
             pass
         if state == "running":
-            if r["herdr"] in ("working", "blocked") or r["session"] == "busy":
+            if is_live(r):
                 continue
             if r["pane"]:
                 plan.append((n, "resume", f"interrupted at {r['step']} {when}; session back in {r['pane']}"))
@@ -457,17 +428,17 @@ def cmd_recover(dirs, actions):
             if action == "leave":
                 print(f"{n} left alone")
             elif action == "resume" and row.get("pane"):
-                herdr_json("agent", "prompt", row["pane"], f"/drive-spec {n}")
+                MUX.prompt(row["pane"], f"/drive-spec {n}")
                 print(f"{n} resumed in {row['pane']}")
             elif action == "resume" and data.get("session_id"):
-                tab_id, pane = start(n, root, data["session_id"])
+                tab_id, pane = MUX.open_tab(n, root, data["session_id"])
                 print(f"{n} resumed in tab {tab_id} (pane {pane})")
             elif action in ("resume", "restart") and row.get("pane"):
-                herdr_json("agent", "prompt", row["pane"], "/clear", "--wait", "--timeout", "30000")
-                herdr_json("agent", "prompt", row["pane"], f"/drive-spec {n}")
+                MUX.prompt(row["pane"], "/clear", wait=True)
+                MUX.prompt(row["pane"], f"/drive-spec {n}")
                 print(f"{n} restarted fresh in {row['pane']}")
             elif action in ("resume", "restart"):
-                tab_id, pane = start(n, root)
+                tab_id, pane = MUX.open_tab(n, root)
                 print(f"{n} restarted in tab {tab_id} (pane {pane})")
             else:
                 print(f"{n} unknown action {action!r}: use resume, restart or leave")
@@ -522,6 +493,10 @@ class StatusWatch:
             if ready or time.monotonic() >= deadline or self.stamp() != self.seen:
                 return ready
 
+    def changed(self, ready):
+        """Whether a status file changed, given what the last `wait` returned."""
+        return self.fd in ready if self.fd is not None else self.stamp() != self.seen
+
     def drain(self):
         if self.fd is None:
             self.seen = self.stamp()
@@ -533,14 +508,83 @@ class StatusWatch:
             pass
 
 
+class Herdr:
+    """The multiplexer interface, over herdr's CLI and socket. Pane rows: id, label, cwd, title, state
+    (working, blocked, idle, done or None), tab, and session (the Claude session id) where known."""
+    name = "herdr"
+
+    def panes(self):
+        try:
+            agents = json.loads(run(["herdr", "agent", "list"]) or "{}").get("result", {}).get("agents", [])
+        except ValueError:
+            return []
+        return [{"id": a.get("pane_id"), "label": a.get("name"), "cwd": a.get("cwd"),
+                 "title": a.get("terminal_title_stripped"), "state": a.get("agent_status"), "tab": a.get("tab_id"),
+                 "session": (a.get("agent_session") or {}).get("value")} for a in agents]
+
+    def call(self, *args):
+        out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=120)
+        if out.returncode != 0:
+            try:
+                message = json.loads(out.stderr)["error"]["message"]
+            except (ValueError, KeyError, TypeError):
+                message = out.stderr.strip() or f"exit {out.returncode}"
+            raise RuntimeError(f"herdr {args[0]} {args[1]}: {message}")
+        return json.loads(out.stdout or "{}").get("result", {})
+
+    def open_tab(self, spec, root, session=None):
+        """A new unfocused tab `spec-<n>` at root, running Claude session `drive-spec-<n>` on `/drive-spec <n>`:
+        its (tab, pane). A failure closes the tab and raises."""
+        workspace = os.environ.get("HERDR_WORKSPACE_ID")
+        if not workspace:
+            raise RuntimeError("not inside herdr (HERDR_WORKSPACE_ID unset)")
+        tab = self.call("tab", "create", "--workspace", workspace, "--cwd", root,
+                        "--label", f"spec-{spec}", "--no-focus")
+        tab_id, pane = tab["tab"]["tab_id"], tab["root_pane"]["pane_id"]
+        try:
+            time.sleep(1)
+            self.call("agent", "start", f"spec-{spec}", "--kind", "claude", "--pane", pane,
+                      "--timeout", "90000", "--", "-n", f"drive-spec-{spec}",
+                      *(["--resume", session] if session else []))
+            self.call("agent", "prompt", f"spec-{spec}", f"/drive-spec {spec}")
+        except Exception:
+            run(["herdr", "tab", "close", tab_id])
+            raise
+        return tab_id, pane
+
+    def prompt(self, pane, text, wait=False):
+        """Sends text to the pane's Claude; with wait, returns once it settles (30 s at most)."""
+        self.call("agent", "prompt", pane, text, *(["--wait", "--timeout", f"{SETTLE_SECONDS * 1000:.0f}"] if wait else []))
+
+    def focus(self, pane):
+        self.call("agent", "focus", pane)
+
+    def close_tab(self, tab):
+        self.call("tab", "close", tab)
+
+    def own_pane(self):
+        return os.environ.get("HERDR_PANE_ID")
+
+    def own_tab(self):
+        own = self.own_pane()
+        return next((p["tab"] for p in self.panes() if own and p["id"] == own), None)
+
+    def events(self):
+        return HerdrEvents(self)
+
+
 class HerdrEvents:
+    """Agent-state events from the herdr socket. `arm()` subscribes to the current panes, `sock` is selectable
+    while subscribed, and `drain()` reads what woke it: always worth a wake."""
     GLOBAL = ["pane.agent_detected", "pane.closed", "pane.exited", "pane.created"]
 
-    def __init__(self):
+    def __init__(self, mux):
+        self.mux = mux
         self.sock = None
         self.panes = None
 
-    def ensure(self, panes):
+    def arm(self):
+        panes = frozenset(p["id"] for p in self.mux.panes())
         if self.sock and panes == self.panes:
             return
         self.close()
@@ -565,11 +609,272 @@ class HerdrEvents:
             data = b""
         if not data:
             self.close()
+        return True
+
+    def wake_in(self):
+        return None
 
     def close(self):
         if self.sock:
             self.sock.close()
         self.sock, self.panes = None, None
+
+
+class Rex:
+    """The multiplexer interface over the `rex` CLI. A Rex session is a herdr workspace, a window a tab, a block a
+    pane. Rex gives no Claude session id, so pane rows carry none."""
+    name = "rex"
+    STATES = ("working", "blocked", "idle", "done")
+
+    def json(self, *args):
+        try:
+            return json.loads(run(["rex", "--autostart=false", *args]) or "{}")
+        except ValueError:
+            return {}
+
+    def call(self, *args):
+        out = subprocess.run(["rex", "--autostart=false", *args], capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            message = out.stderr.strip().removeprefix("Error: ") or f"exit {out.returncode}"
+            raise RuntimeError(f"rex {' '.join(args[:2]) if args[0] in ('window', 'block') else args[0]}: {message}")
+        try:
+            return json.loads(out.stdout or "{}")
+        except ValueError:
+            return {}
+
+    def panes(self):
+        rows = []
+        for s in self.json("ls", "--json").get("sessions", []):
+            view = self.json("window", "ls", "-s", s.get("session_id", ""), "--json")
+            for w in view.get("windows", []):
+                for block in (b for layer in w.get("layers", []) for b in layer.get("blocks", [])):
+                    if block.get("creator_name") == "com.superlogical.terminal":
+                        row = self.pane(block, w)
+                        if row:
+                            rows.append(row)
+        return rows
+
+    def record(self, block):
+        """The root `claude-code` record of the block's `program_status`, or None when no Claude reports there."""
+        records = self.json("block", "call", "-b", block, "program_status").get("records", [])
+        return next((r for r in records if r.get("effective_app") == "claude-code" and not r.get("id")), None)
+
+    def pane(self, block, window):
+        """The block's row, from its Claude's root record; None when no Claude runs there."""
+        b = block.get("block_id", "")
+        record = self.record(b)
+        if not record:
+            return None
+        state = record.get("state") if record.get("state") in self.STATES else "idle"
+        label = block.get("label") if spec_of(block.get("label")) else window.get("label") or block.get("label")
+        pwd = self.json("block", "call", "-b", b, "pwd").get("pwd")
+        cwd = unquote(urlparse(pwd).path) if pwd else \
+            (self.json("block", "call", "-b", b, "process").get("foreground") or {}).get("cwd")
+        return {"id": b, "label": label, "cwd": cwd, "title": self.json("block", "call", "-b", b, "title").get("title"),
+                "state": state, "tab": window.get("window_id"), "session": None}
+
+    def open_tab(self, spec, root, session=None):
+        """A new unfocused window `spec-<n>` at root in the caller's Rex session, running Claude session
+        `drive-spec-<n>`, sent `/drive-spec <n>` once its Claude reports a status: its (window, block). The command
+        runs in the Rex server's environment, whose PATH may lack `claude`: the caller's `claude`, by absolute path,
+        and its `CLAUDE_CONFIG_DIR` go with it. A failure closes the window and raises."""
+        rex_session = os.environ.get("REX_SESSION")
+        if not rex_session:
+            raise RuntimeError("not inside Rex (REX_SESSION unset)")
+        claude = [shutil.which("claude") or "claude", "-n", f"drive-spec-{spec}",
+                  *(["--resume", session] if session else [])]
+        config = os.environ.get("CLAUDE_CONFIG_DIR")
+        window = self.call("window", "new", "-s", rex_session, f"spec-{spec}", "-c", str(root), "--focus=false",
+                           "--json", "--", *(["env", f"CLAUDE_CONFIG_DIR={config}"] if config else []), *claude)
+        tab = window.get("window_id")
+        try:
+            if not tab or not window.get("block_ids"):
+                raise RuntimeError(f"rex window new: no window or block in {json.dumps(window)}")
+            pane = window["block_ids"][0]
+            deadline = time.monotonic() + READY_SECONDS
+            while not self.record(pane):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Claude not ready in spec-{spec} after {READY_SECONDS:g} s")
+                time.sleep(0.5)
+            self.prompt(pane, f"/drive-spec {spec}")
+        except Exception:
+            if tab:
+                run(["rex", "--autostart=false", "window", "close", tab])
+            raise
+        return tab, pane
+
+    def prompt(self, pane, text, wait=False):
+        """Types text into the block, then Enter; with wait, returns once its Claude has taken the prompt and is
+        idle again, raising when it is still working or blocked after `SETTLE_SECONDS`. A prompt that never moves
+        the record, as `/clear` may not, counts as taken at the deadline. Line breaks fold to spaces, so `rex send`
+        never types one as Enter and splits the prompt."""
+        text = re.sub(r"\s*[\r\n]+\s*", " ", text)
+        before = (self.record(pane) or {}).get("updated_at") if wait else None
+        self.call("send", "-b", pane, "--", text)
+        self.call("send-key", "-b", pane, "enter")
+        if not wait:
+            return
+        deadline = time.monotonic() + SETTLE_SECONDS
+        moved = False
+        while True:
+            record = self.record(pane) or {}
+            state = record.get("state") if record.get("state") in self.STATES else "idle"
+            moved = moved or state == "working" or record.get("updated_at") != before
+            settled = state in ("idle", "done")
+            if moved and settled:
+                return
+            if time.monotonic() >= deadline:
+                if not settled:
+                    raise RuntimeError(f"rex: {pane} still {state} after {SETTLE_SECONDS:g} s")
+                return
+            time.sleep(0.5)
+
+    def window_of(self, block):
+        """The (session, window) holding the block, in any Rex session; (None, None) when none does."""
+        for s in self.json("ls", "--json").get("sessions", []):
+            view = self.json("window", "ls", "-s", s.get("session_id", ""), "--json")
+            for w in view.get("windows", []):
+                if any(b.get("block_id") == block for layer in w.get("layers", []) for b in layer.get("blocks", [])):
+                    return s.get("session_id"), w.get("window_id")
+        return None, None
+
+    def focus(self, pane):
+        """Makes the block's window active in its session, then focuses the block."""
+        session, window = self.window_of(pane)
+        if not window:
+            raise RuntimeError(f"rex: no window holds {pane}")
+        self.call("window", "focus", "-s", session, window)
+        self.call("block", "focus", "-s", session, pane)
+
+    def close_tab(self, tab):
+        self.call("window", "close", tab)
+
+    def own_pane(self):
+        return os.environ.get("REX_BLOCK")
+
+    def own_tab(self):
+        return self.window_of(self.own_pane())[1] if self.own_pane() else None
+
+    def events(self):
+        return RexEvents()
+
+
+class RexEvents:
+    """Rex events as wake hints: a `rex events` child whose stdout is `sock`. Every wake re-reads the snapshot, so
+    which events arrive doesn't matter, except a CLI client's connect and disconnect: every `rex` call prints them,
+    the snapshot's own included, so waking on them would loop. A stream that ends or can't start is restarted by
+    `arm()` after a backoff (1 s, doubling to the tick, reset once a stream delivers); `close()` stops it."""
+    COMMAND = ["rex", "--autostart=false", "events", "--all", "--json"]
+    CLIENT = ("client_joined", "client_left", "client_connected", "client_disconnected")
+
+    def __init__(self):
+        self.proc, self.sock = None, None
+        self.backoff, self.retry_at = 1.0, 0.0
+        self.partial = b""
+
+    def arm(self):
+        if self.proc or time.monotonic() < self.retry_at:
+            return
+        self.retry_at = time.monotonic() + self.backoff
+        self.backoff = min(self.backoff * 2, TICK_SECONDS)
+        try:
+            self.proc = subprocess.Popen(self.COMMAND, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+            self.sock = self.proc.stdout
+        except OSError:
+            self.proc = None
+
+    def wake_in(self):
+        """Seconds until a dead stream may restart; None while one runs."""
+        return None if self.proc else max(0.0, self.retry_at - time.monotonic())
+
+    def drain(self):
+        """Reads what woke it: whether any complete line is worth a wake. An ended stream is."""
+        try:
+            data = os.read(self.sock.fileno(), 65536)
+        except OSError:
+            data = b""
+        if not data:
+            self.close()
+            return True
+        self.backoff = 1.0
+        *lines, self.partial = (self.partial + data).split(b"\n")
+        return any(line.strip() and not self.client(line) for line in lines)
+
+    def client(self, line):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        if event.get("type") == "session_event":
+            event = (event.get("payload") or {}).get("event") or {}
+        return event.get("type") in self.CLIENT
+
+    def close(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc.stdout.close()
+        self.proc, self.sock, self.partial = None, None, b""
+
+
+class NoMux:
+    """Neither herdr nor Rex: no panes, and every pane command refused."""
+    name = None
+
+    def panes(self):
+        return []
+
+    def events(self):
+        return NoEvents()
+
+    def own_pane(self):
+        return None
+
+    def own_tab(self):
+        return None
+
+
+class NoEvents:
+    sock = None
+
+    def arm(self):
+        pass
+
+    def wake_in(self):
+        return None
+
+    def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+
+MUXES = {"herdr": Herdr, "rex": Rex}
+PRESENT = {"herdr": "HERDR_ENV", "rex": "REX_SESSION"}
+PANE_COMMANDS = ("launch", "open", "answer", "ack")
+MUX = NoMux()
+
+
+def pick_mux():
+    """`DISPATCH_MUX`, else herdr inside herdr (even inside Rex), else Rex inside Rex, else none. Returns the
+    backend and why pane commands must refuse, or None when they may run."""
+    forced = os.environ.get("DISPATCH_MUX")
+    if forced:
+        if forced not in MUXES:
+            sys.exit(f"dispatch: DISPATCH_MUX={forced} is not a multiplexer: use herdr or rex")
+        absent = None if os.environ.get(PRESENT[forced]) else \
+            f"DISPATCH_MUX={forced} but not inside {'herdr' if forced == 'herdr' else 'Rex'} ({PRESENT[forced]} unset)"
+        return MUXES[forced](), absent
+    for name in ("herdr", "rex"):
+        if os.environ.get(PRESENT[name]):
+            return MUXES[name](), None
+    return NoMux(), "not inside herdr or Rex"
 
 
 def git(root, *args):
@@ -705,35 +1010,46 @@ def cmd_watch(dirs):
     signal.signal(signal.SIGTERM, on_term)
     take_watch()
     notify = StatusWatch(dirs)
-    herdr = HerdrEvents()
+    events = MUX.events()
     try:
         reported = json.loads(REPORTED.read_text())
     except (OSError, ValueError):
         reported = {}
     last_fetch = 0.0
-    while True:
-        if time.monotonic() - last_fetch >= FETCH_SECONDS:
-            last_fetch = time.monotonic()
-            for a in check_merges(dirs)[0]:
-                print(a, flush=True)
-        rows = snapshot(dirs)
-        herdr.ensure(frozenset(a["pane_id"] for a in herdr_agents()))
-        current = {r["spec"]: list(attention_key(r)) for r in rows}
-        for r in rows:
-            n = r["spec"]
-            if current[n] != reported.get(n, [None, None]):
-                print(line(r) if r["attention"] else f"{n} ok {line(r).split(' ', 1)[1]}", flush=True)
-        for n in reported.keys() - current.keys():
-            print(f"{n} gone from view", flush=True)
-        if current != reported:
-            reported = current
-            save_json(REPORTED, reported)
+    try:
+        while True:
+            if time.monotonic() - last_fetch >= FETCH_SECONDS:
+                last_fetch = time.monotonic()
+                for a in check_merges(dirs)[0]:
+                    print(a, flush=True)
+            rows = snapshot(dirs)
+            events.arm()
+            current = {r["spec"]: list(attention_key(r)) for r in rows}
+            for r in rows:
+                n = r["spec"]
+                if current[n] != reported.get(n, [None, None]):
+                    print(line(r) if r["attention"] else f"{n} ok {line(r).split(' ', 1)[1]}", flush=True)
+            for n in reported.keys() - current.keys():
+                print(f"{n} gone from view", flush=True)
+            if current != reported:
+                reported = current
+                save_json(REPORTED, reported)
 
-        ready = notify.wait([herdr.sock] if herdr.sock else [], TICK_SECONDS)
-        time.sleep(0.5)
-        notify.drain()
-        if herdr.sock in ready:
-            herdr.drain()
+            tick = time.monotonic() + TICK_SECONDS
+            while True:
+                retry = events.wake_in()
+                left = max(0.0, tick - time.monotonic())
+                ready = notify.wait([events.sock] if events.sock else [], left if retry is None else min(left, retry))
+                woke = events.sock is not None and events.sock in ready
+                if woke and not events.drain() and not notify.changed(ready) and time.monotonic() < tick:
+                    continue
+                break
+            time.sleep(0.5)
+            notify.drain()
+            if events.sock and select.select([events.sock], [], [], 0)[0]:
+                events.drain()
+    finally:
+        events.close()
 
 
 def cmd_answer(spec, text, dirs):
@@ -746,11 +1062,11 @@ def cmd_answer(spec, text, dirs):
         sys.exit(f"{spec} not answered: it is not waiting on a question ({data.get('state')})")
     if not row["pane"]:
         sys.exit(f"{spec} not answered: no pane holds its session; recover it first")
-    if row["herdr"] in ("working", "blocked") or row["session"] == "busy":
-        sys.exit(f"{spec} not answered: it is {row['herdr'] if row['herdr'] in ('working', 'blocked') else 'busy'}; send it once it settles")
+    if is_live(row):
+        sys.exit(f"{spec} not answered: it is {row['mux'] if row['mux'] in ('working', 'blocked') else 'busy'}; send it once it settles")
     prompt = f"The operator's answer to your question ({question}): {text}"
     try:
-        herdr_json("agent", "prompt", row["pane"], prompt)
+        MUX.prompt(row["pane"], prompt)
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
         sys.exit(f"{spec} not answered: {e}")
     print(f"{spec} answered in {row['pane']}: {question} → {text}")
@@ -761,7 +1077,7 @@ def cmd_open(spec, dirs):
     if not row or not row["pane"]:
         sys.exit(f"{spec} not opened: no pane holds its session; recover it first")
     try:
-        herdr_json("agent", "focus", row["pane"])
+        MUX.focus(row["pane"])
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
         sys.exit(f"{spec} not opened: {e}")
     print(f"{spec} opened in {row['pane']}")
@@ -782,12 +1098,12 @@ def cmd_ack(spec, dirs):
     if data.get("state") != "done" or not pane:
         print(f"{spec} acked" + ("; pane kept, not done" if pane else ""))
         return
-    if row["herdr"] in ("working", "blocked") or row["session"] == "busy" or pane == os.environ.get("HERDR_PANE_ID"):
+    tab = row["tab"]
+    if is_live(row) or pane == MUX.own_pane() or (tab and tab == MUX.own_tab()):
         print(f"{spec} acked; pane {pane} kept, still active")
         return
-    tab = next((a.get("tab_id") for a in herdr_agents() if a.get("pane_id") == pane), None)
     try:
-        herdr_json("tab", "close", tab)
+        MUX.close_tab(tab)
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, TypeError) as e:
         print(f"{spec} acked; tab not closed: {e}")
         return
@@ -809,7 +1125,7 @@ def main():
     an = sub.add_parser("answer", help="send the operator's answer to a spec waiting on its question")
     an.add_argument("spec")
     an.add_argument("text", nargs="+")
-    lp = sub.add_parser("launch", help="start drive-specs in new herdr tabs, or queue them under pressure")
+    lp = sub.add_parser("launch", help="start drive-specs in new tabs, or queue them under pressure")
     lp.add_argument("specs", nargs="+")
     lp.add_argument("--force", action="store_true", help="start even under pressure")
     sub.add_parser("admit", help="show pressure and whether a launch would start or queue")
@@ -820,6 +1136,10 @@ def main():
     u.add_argument("spec")
     args = p.parse_args()
 
+    global MUX
+    MUX, refusal = pick_mux()
+    if refusal and (args.cmd in PANE_COMMANDS or (args.cmd == "recover" and args.do)):
+        sys.exit(f"dispatch {args.cmd} refused: {refusal}")
     dirs = [status_dir(r) for r in (args.repo or ["."])]
     if args.cmd == "status":
         cmd_status(dirs, args.json)
