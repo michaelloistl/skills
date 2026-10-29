@@ -21,7 +21,7 @@ A spec is joined across three sources: its status file, its pane (by the pane id
 
 ## Tests
 
-`test_dispatch.py` runs the script as a subprocess in a throwaway git repo, with fake `herdr`, `rex` and `claude` first on `PATH` answering from per-test JSON fixtures and logging their calls. The `status`, `launch`, `open`, `answer` and `ack` scenarios run inside both multiplexers, from equivalent fixtures, expecting the same lines:
+`test_dispatch.py` runs the script as a subprocess in a throwaway git repo, with fake `herdr`, `rex` and `claude` first on `PATH` answering from per-test JSON fixtures and logging their calls. Every scenario runs inside both multiplexers, from equivalent fixtures, expecting the same lines:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/engineering/dispatch
