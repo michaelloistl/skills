@@ -70,12 +70,22 @@ elif args == ["ls", "--json"]:
     print(json.dumps({"sessions": [{"session_id": s["session_id"], "label": s["label"]} for s in sessions]}))
 elif args[:3] == ["window", "ls", "-s"]:
     print(json.dumps(next((s for s in sessions if s["session_id"] == args[3]), {"windows": []})))
+elif args[:2] == ["send", "-b"]:
+    open(os.path.join(fix, f"{args[2]}-since-send"), "w").write("0")
+    print("{}")
 elif args[:3] == ["block", "call", "-b"]:
     block = state.get("blocks", {}).get(args[3])
     if block is None:
         sys.stderr.write(f"Error: block target {args[3]!r} not found\n")
         sys.exit(3)
-    print(json.dumps(block.get(args[4], {})))
+    polls = os.path.join(fix, f"{args[3]}-since-send")
+    if args[4] == "program_status" and "after_send" in block and os.path.exists(polls):
+        # After a send, the block's Claude reports the records of `after_send` in turn, the last one for good.
+        n = int(open(polls).read())
+        open(polls, "w").write(str(n + 1))
+        print(json.dumps({"records": block["after_send"][min(n, len(block["after_send"]) - 1)]}))
+    else:
+        print(json.dumps(block.get(args[4], {})))
 else:
     print("{}")
 '''
@@ -754,14 +764,32 @@ class RexAck(Ack):
 
 
 class Recover(DispatchCase):
+    """Every `recover` scenario, inside herdr; `RexRecover` runs them inside Rex."""
+    prompt_verb = "agent prompt"
+
+    def started(self, *claude_args):
+        return Launch.started(self, *claude_args)
+
+    def prompted(self, pane, text):
+        return Launch.prompted(self, pane, text)
+
+    def cleared(self, pane):
+        return [f"agent prompt {pane} /clear --wait --timeout 30000"]
+
+    def settles(self, pane, *states):
+        """The pane's Claude goes through states after the next prompt; herdr's `--wait` does this itself."""
+
+    def fail_prompt(self, message):
+        self.herdr({"fail": {"agent prompt": message}})
+
     def test_proposes_an_action_per_spec(self):
-        self.spec(10, herdr_pane="p1")
+        self.spec(10, pane="p1")
         self.pane()
         self.spec(11, session_id="S1")
         self.spec(12)
         self.spec(13, state="waiting", question="q?", question_blocking=True)
         self.spec(14, state="halted", summary="red.")
-        self.spec(15, herdr_pane="p2")
+        self.spec(15, pane="p2")
         self.pane("p2", status="working", name="spec-15")
         self.assertEqual(self.ok("recover"), [
             "10 RESUME? interrupted at build 0m ago; session back in p1",
@@ -770,6 +798,13 @@ class Recover(DispatchCase):
             "13 LEAVE? waiting on your answer in its pane",
             "14 LEAVE? halted at build: red.",
         ])
+
+    def test_says_a_run_was_cut_off_by_the_reboot(self):
+        self.spec(session_id="S1", updated_at="2000-01-01T00:00:00Z")
+        out = self.ok("recover")
+        self.assertEqual(len(out), 1)
+        self.assertRegex(out[0], r"^10 RESUME\? interrupted at build \d+d ago, before the reboot; "
+                                 r"reopen its session in a new tab$")
 
     def test_nothing_to_recover(self):
         self.assertEqual(self.ok("recover"), ["nothing to recover"])
@@ -780,42 +815,86 @@ class Recover(DispatchCase):
         self.assertEqual(self.calls(), [])
 
     def test_resume_in_its_pane(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
         self.assertEqual(self.ok("recover", "--do", "#10=resume"), ["10 resumed in p1"])
-        self.assertEqual(self.calls(), ["agent prompt p1 /drive-spec 10"])
+        self.assertEqual(self.calls(), self.prompted("p1", "/drive-spec 10"))
 
     def test_resume_reopens_its_session_in_a_new_tab(self):
         self.spec(session_id="S1")
         self.assertEqual(self.ok("recover", "--do", "10=resume"), ["10 resumed in tab T9 (pane p9)"])
-        self.assertEqual(self.calls(), [
-            f"tab create --workspace W1 --cwd {self.repo} --label spec-10 --no-focus",
-            "agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10 --resume S1",
-            "agent prompt spec-10 /drive-spec 10",
-        ])
+        self.assertEqual(self.calls(), self.started("--resume", "S1"))
 
     def test_restart_clears_its_pane(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
+        self.settles("p1", "working", "idle")
         self.assertEqual(self.ok("recover", "--do", "10=restart"), ["10 restarted fresh in p1"])
-        self.assertEqual(self.calls(), ["agent prompt p1 /clear --wait --timeout 30000",
-                                        "agent prompt p1 /drive-spec 10"])
+        self.assertEqual(self.calls(), [*self.cleared("p1"), *self.prompted("p1", "/drive-spec 10")])
 
     def test_restart_in_a_new_tab(self):
         self.spec(session_id="S1")
         self.assertEqual(self.ok("recover", "--do", "10=restart"), ["10 restarted in tab T9 (pane p9)"])
-        self.assertEqual(self.calls()[1], "agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10")
+        self.assertEqual(self.calls(), self.started())
 
     def test_reports_a_failed_action(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane()
-        self.herdr({"fail": {"agent prompt": "pane gone"}})
-        self.assertEqual(self.ok("recover", "--do", "10=resume"), ["10 resume failed: herdr agent prompt: pane gone"])
+        self.fail_prompt("pane gone")
+        self.assertEqual(self.ok("recover", "--do", "10=resume"),
+                         [f"10 resume failed: {self.mux} {self.prompt_verb}: pane gone"])
 
     def test_an_unknown_action(self):
         self.spec()
         self.assertEqual(self.ok("recover", "--do", "10=poke"),
                          ["10 unknown action 'poke': use resume, restart or leave"])
+
+    def test_a_restart_whose_clear_never_settles_fails(self):
+        self.spec(pane="p1")
+        self.pane()
+        self.herdr({"fail": {"agent prompt p1 /clear": "timed out after 30000 ms"}})
+        self.assertEqual(self.ok("recover", "--do", "10=restart"),
+                         ["10 restart failed: herdr agent prompt: timed out after 30000 ms"])
+        self.assertNotIn("agent prompt p1 /drive-spec 10", self.calls())
+
+
+class RexRecover(Recover):
+    mux = "rex"
+    prompt_verb = "send"
+
+    def started(self, *claude_args):
+        return RexLaunch.started(self, *claude_args)
+
+    def prompted(self, pane, text):
+        return RexLaunch.prompted(self, pane, text)
+
+    def cleared(self, pane):
+        return self.prompted(pane, "/clear")
+
+    def settles(self, pane, *states):
+        self.blocks[pane]["after_send"] = [[{"state": s, "effective_app": "claude-code"}] for s in states]
+        self.rex()
+
+    def fail_prompt(self, message):
+        (self.tmp / "rex.json").write_text(json.dumps({"sessions": list(self.rex_sessions.values()),
+                                                       "blocks": self.blocks, "fail": {"send ": message}}))
+
+    def test_restart_waits_for_its_claude_to_settle_after_clear(self):
+        self.spec(pane="p1")
+        self.pane()
+        self.settles("p1", "idle", "working", "working", "idle")
+        self.assertEqual(self.ok("recover", "--do", "10=restart"), ["10 restarted fresh in p1"])
+        log = self.logged()
+        clear, drive = log.index("send-key -b p1 enter"), log.index("send -b p1 -- /drive-spec 10")
+        self.assertEqual(log[clear + 1:drive].count("block call -b p1 program_status"), 4)
+
+    def test_a_restart_whose_clear_never_settles_fails(self):
+        self.spec(pane="p1")
+        self.pane()
+        self.settles("p1", "working")
+        self.assertEqual(self.ok("recover", "--do", "10=restart", DISPATCH_SETTLE_SECONDS="1"),
+                         ["10 restart failed: rex: p1 still working after 1 s"])
+        self.assertEqual(self.calls(), self.cleared("p1"))
 
 
 class Watch(DispatchCase):

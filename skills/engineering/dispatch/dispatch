@@ -31,7 +31,7 @@ STALL_SECONDS = 15 * 60
 TICK_SECONDS = 60
 POLL_SECONDS = 1.0
 READY_SECONDS = float(os.environ.get("DISPATCH_READY_SECONDS", 90))
-SETTLE_SECONDS = 30
+SETTLE_SECONDS = float(os.environ.get("DISPATCH_SETTLE_SECONDS", 30))
 TITLE = re.compile(r"\b(?:drive-spec|spec)[- ](\d+)\b")
 
 ORDER = ["DIALOG", "ASK", "HALT", "STALL", "GONE", "PAUSE", "PR"]
@@ -549,7 +549,7 @@ class Herdr:
 
     def prompt(self, pane, text, wait=False):
         """Sends text to the pane's Claude; with wait, returns once it settles (30 s at most)."""
-        self.call("agent", "prompt", pane, text, *(["--wait", "--timeout", "30000"] if wait else []))
+        self.call("agent", "prompt", pane, text, *(["--wait", "--timeout", f"{SETTLE_SECONDS * 1000:.0f}"] if wait else []))
 
     def focus(self, pane):
         self.call("agent", "focus", pane)
@@ -694,8 +694,9 @@ class Rex:
         return tab, pane
 
     def prompt(self, pane, text, wait=False):
-        """Types text into the block, then Enter; with wait, returns once its Claude has taken the prompt and left
-        `working` (30 s at most)."""
+        """Types text into the block, then Enter; with wait, returns once its Claude has taken the prompt and is
+        idle again, raising when it is still working or blocked after `SETTLE_SECONDS`. A prompt that never moves
+        the record, as `/clear` may not, counts as taken at the deadline."""
         before = (self.record(pane) or {}).get("updated_at") if wait else None
         self.call("send", "-b", pane, "--", text)
         self.call("send-key", "-b", pane, "enter")
@@ -705,12 +706,14 @@ class Rex:
         moved = False
         while True:
             record = self.record(pane) or {}
-            moved = moved or record.get("state") == "working" or record.get("updated_at") != before
-            if moved and record.get("state") != "working":
+            state = record.get("state") if record.get("state") in self.STATES else "idle"
+            moved = moved or state == "working" or record.get("updated_at") != before
+            settled = state in ("idle", "done")
+            if moved and settled:
                 return
             if time.monotonic() >= deadline:
-                if record.get("state") == "working":
-                    raise RuntimeError(f"rex: {pane} still working after {SETTLE_SECONDS} s")
+                if not settled:
+                    raise RuntimeError(f"rex: {pane} still {state} after {SETTLE_SECONDS:g} s")
                 return
             time.sleep(0.5)
 
