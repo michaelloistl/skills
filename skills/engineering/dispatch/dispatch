@@ -7,6 +7,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -492,6 +493,10 @@ class StatusWatch:
             if ready or time.monotonic() >= deadline or self.stamp() != self.seen:
                 return ready
 
+    def changed(self, ready):
+        """Whether a status file changed, given what the last `wait` returned."""
+        return self.fd in ready if self.fd is not None else self.stamp() != self.seen
+
     def drain(self):
         if self.fd is None:
             self.seen = self.stamp()
@@ -570,7 +575,7 @@ class Herdr:
 
 class HerdrEvents:
     """Agent-state events from the herdr socket. `arm()` subscribes to the current panes, `sock` is selectable
-    while subscribed, and `drain()` reads what woke it."""
+    while subscribed, and `drain()` reads what woke it: always worth a wake."""
     GLOBAL = ["pane.agent_detected", "pane.closed", "pane.exited", "pane.created"]
 
     def __init__(self, mux):
@@ -604,6 +609,7 @@ class HerdrEvents:
             data = b""
         if not data:
             self.close()
+        return True
 
     def wake_in(self):
         return None
@@ -670,12 +676,13 @@ class Rex:
     def open_tab(self, spec, root, session=None):
         """A new unfocused window `spec-<n>` at root in the caller's Rex session, running Claude session
         `drive-spec-<n>`, sent `/drive-spec <n>` once its Claude reports a status: its (window, block). The command
-        runs in the Rex server's environment, so the caller's `CLAUDE_CONFIG_DIR` goes with it. A failure closes
-        the window and raises."""
+        runs in the Rex server's environment, whose PATH may lack `claude`: the caller's `claude`, by absolute path,
+        and its `CLAUDE_CONFIG_DIR` go with it. A failure closes the window and raises."""
         rex_session = os.environ.get("REX_SESSION")
         if not rex_session:
             raise RuntimeError("not inside Rex (REX_SESSION unset)")
-        claude = ["claude", "-n", f"drive-spec-{spec}", *(["--resume", session] if session else [])]
+        claude = [shutil.which("claude") or "claude", "-n", f"drive-spec-{spec}",
+                  *(["--resume", session] if session else [])]
         config = os.environ.get("CLAUDE_CONFIG_DIR")
         window = self.call("window", "new", "-s", rex_session, f"spec-{spec}", "-c", str(root), "--focus=false",
                            "--json", "--", *(["env", f"CLAUDE_CONFIG_DIR={config}"] if config else []), *claude)
@@ -752,13 +759,16 @@ class Rex:
 
 class RexEvents:
     """Rex events as wake hints: a `rex events` child whose stdout is `sock`. Every wake re-reads the snapshot, so
-    which events arrive doesn't matter. A stream that ends or can't start is restarted by `arm()` after a backoff
-    (1 s, doubling to the tick, reset once a stream delivers); `close()` stops it."""
+    which events arrive doesn't matter, except a CLI client's connect and disconnect: every `rex` call prints them,
+    the snapshot's own included, so waking on them would loop. A stream that ends or can't start is restarted by
+    `arm()` after a backoff (1 s, doubling to the tick, reset once a stream delivers); `close()` stops it."""
     COMMAND = ["rex", "--autostart=false", "events", "--all", "--json"]
+    CLIENT = ("client_joined", "client_left", "client_connected", "client_disconnected")
 
     def __init__(self):
         self.proc, self.sock = None, None
         self.backoff, self.retry_at = 1.0, 0.0
+        self.partial = b""
 
     def arm(self):
         if self.proc or time.monotonic() < self.retry_at:
@@ -777,14 +787,26 @@ class RexEvents:
         return None if self.proc else max(0.0, self.retry_at - time.monotonic())
 
     def drain(self):
+        """Reads what woke it: whether any complete line is worth a wake. An ended stream is."""
         try:
             data = os.read(self.sock.fileno(), 65536)
         except OSError:
             data = b""
-        if data:
-            self.backoff = 1.0
-        else:
+        if not data:
             self.close()
+            return True
+        self.backoff = 1.0
+        *lines, self.partial = (self.partial + data).split(b"\n")
+        return any(line.strip() and not self.client(line) for line in lines)
+
+    def client(self, line):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        if event.get("type") == "session_event":
+            event = (event.get("payload") or {}).get("event") or {}
+        return event.get("type") in self.CLIENT
 
     def close(self):
         if self.proc:
@@ -795,7 +817,7 @@ class RexEvents:
                 self.proc.kill()
                 self.proc.wait()
             self.proc.stdout.close()
-        self.proc, self.sock = None, None
+        self.proc, self.sock, self.partial = None, None, b""
 
 
 class NoMux:
@@ -1011,12 +1033,18 @@ def cmd_watch(dirs):
                 reported = current
                 save_json(REPORTED, reported)
 
-            retry = events.wake_in()
-            ready = notify.wait([events.sock] if events.sock else [],
-                                TICK_SECONDS if retry is None else min(TICK_SECONDS, retry))
+            tick = time.monotonic() + TICK_SECONDS
+            while True:
+                retry = events.wake_in()
+                left = max(0.0, tick - time.monotonic())
+                ready = notify.wait([events.sock] if events.sock else [], left if retry is None else min(left, retry))
+                woke = events.sock is not None and events.sock in ready
+                if woke and not events.drain() and not notify.changed(ready) and time.monotonic() < tick:
+                    continue
+                break
             time.sleep(0.5)
             notify.drain()
-            if events.sock and events.sock in ready:
+            if events.sock and select.select([events.sock], [], [], 0)[0]:
                 events.drain()
     finally:
         events.close()

@@ -55,19 +55,31 @@ except OSError:
     state = {}
 sessions = state.get("sessions", [])
 if args[:1] == ["events"]:
-    # The event stream: logs its pid, exits at once under `"events": "exit"`, else prints one line once the file
-    # `event` appears and stays alive until `events-stop` appears (a cleanup), so an orphan outlives its watch.
+    # The event stream: logs its pid, exits at once under `"events": "exit"`, else prints, once each, what a CLI
+    # client's connect prints once the file `client-event` appears and a block's `program_status_changed` once
+    # `event` appears, in the shapes real `rex events --all --json` prints, and stays alive until `events-stop`
+    # appears (a cleanup) or its fixture dir goes, so an orphan outlives its watch but not its test.
     import time
     with open(os.path.join(fix, "events-pids"), "a") as f:
         f.write(f"{os.getpid()}\n")
     if state.get("events") == "exit":
         sys.exit(0)
-    sent = False
-    while not os.path.exists(os.path.join(fix, "events-stop")):
-        if not sent and os.path.exists(os.path.join(fix, "event")):
-            print(json.dumps({"type": "session_event", "payload": {"event": {"type": "program_status_changed"}}}),
-                  flush=True)
-            sent = True
+    def session_event(kind, payload):
+        return {"type": "session_event", "payload": {"session_id": "S1", "event": {"type": kind, "payload": payload}}}
+    lines = {
+        "client-event": [{"type": "client_joined", "payload": {"client": {"client_id": "c1"}}},
+                         session_event("client_connected", {"client_id": "c1"}),
+                         session_event("client_disconnected", {"client_id": "c1"}),
+                         {"type": "client_left", "payload": {"client_id": "c1"}}],
+        "event": [session_event("block_event", {"block_id": "p1", "name": "program_status_changed",
+                                                "payload": {"id": "", "record": {"state": "blocked"}}})],
+    }
+    sent = set()
+    while os.path.isdir(fix) and not os.path.exists(os.path.join(fix, "events-stop")):
+        for trigger, out in lines.items():
+            if trigger not in sent and os.path.exists(os.path.join(fix, trigger)):
+                print("\n".join(json.dumps(l) for l in out), flush=True)
+                sent.add(trigger)
         time.sleep(0.05)
     sys.exit(0)
 for prefix, message in state.get("fail", {}).items():
@@ -525,7 +537,7 @@ class RexLaunch(Launch):
 
     def started(self, *claude_args):
         return [f"window new -s S1 spec-10 -c {self.repo} --focus=false --json -- "
-                f"env CLAUDE_CONFIG_DIR={self.tmp / 'claude'} claude -n drive-spec-10{''.join(' ' + a for a in claude_args)}",
+                f"env CLAUDE_CONFIG_DIR={self.tmp / 'claude'} {self.tmp / 'bin' / 'claude'} -n drive-spec-10{''.join(' ' + a for a in claude_args)}",
                 *self.prompted("p9", "/drive-spec 10")]
 
     def prompted(self, pane, text):
@@ -549,7 +561,7 @@ class RexLaunch(Launch):
         self.env = env
         self.ok("launch", "10")
         self.assertEqual(self.calls()[0], f"window new -s S1 spec-10 -c {self.repo} --focus=false --json -- "
-                                          "claude -n drive-spec-10")
+                                          f"{self.tmp / 'bin' / 'claude'} -n drive-spec-10")
 
     def test_a_failed_start_closes_its_tab(self):
         self.write_rex(ready_after=None)
@@ -985,6 +997,19 @@ class RexWatch(Watch):
         (self.tmp / "event").touch()
         self.assertEqual(watch.next_line(within=10), "10 DIALOG dialog open in spec-10: dispatch open 10")
         self.assertIn("events --all --json", self.logged())
+
+    def test_a_clients_connect_does_not_wake_it(self):
+        # Every `rex` call, the watch's own included, prints client events: waking on them would loop.
+        self.spec(pane="p1")
+        self.pane(status="working")
+        watch = self.watch(DISPATCH_TICK_SECONDS="30")
+        self.wait_for_stream()
+        self.blocks["p1"]["program_status"]["records"][0]["state"] = "blocked"
+        self.rex()
+        (self.tmp / "client-event").touch()
+        self.assertIsNone(watch.next_line(within=4))
+        (self.tmp / "event").touch()
+        self.assertEqual(watch.next_line(within=10), "10 DIALOG dialog open in spec-10: dispatch open 10")
 
     def test_a_stream_that_ends_is_restarted_and_status_files_still_wake_it(self):
         (self.tmp / "rex.json").write_text(json.dumps({"sessions": list(self.rex_sessions.values()),
