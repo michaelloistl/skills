@@ -706,7 +706,9 @@ class Rex:
     def prompt(self, pane, text, wait=False):
         """Types text into the block, then Enter; with wait, returns once its Claude has taken the prompt and is
         idle again, raising when it is still working or blocked after `SETTLE_SECONDS`. A prompt that never moves
-        the record, as `/clear` may not, counts as taken at the deadline."""
+        the record, as `/clear` may not, counts as taken at the deadline. Line breaks fold to spaces, so `rex send`
+        never types one as Enter and splits the prompt."""
+        text = re.sub(r"\s*[\r\n]+\s*", " ", text)
         before = (self.record(pane) or {}).get("updated_at") if wait else None
         self.call("send", "-b", pane, "--", text)
         self.call("send-key", "-b", pane, "enter")

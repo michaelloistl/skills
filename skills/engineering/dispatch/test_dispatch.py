@@ -708,6 +708,12 @@ class RexAnswer(Answer):
     def prompted(self, pane, text):
         return [f"send -b {pane} -- {text}", f"send-key -b {pane} enter"]
 
+    def test_folds_a_multi_line_answer_into_one_prompt(self):
+        self.waiting()
+        self.ok("answer", "10", "yes,\r\nkeep it\n\nand the header")
+        self.assertEqual(self.calls(), self.prompted(
+            "p1", "The operator's answer to your question (keep CSV?): yes, keep it and the header"))
+
 
 class Ack(DispatchCase):
     """Every `ack` scenario, inside herdr; `RexAck` runs them inside Rex."""
