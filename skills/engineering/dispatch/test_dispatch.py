@@ -52,7 +52,21 @@ try:
 except OSError:
     state = {}
 sessions = state.get("sessions", [])
-if args == ["ls", "--json"]:
+for prefix, message in state.get("fail", {}).items():
+    if " ".join(args).startswith(prefix):
+        sys.stderr.write(f"Error: {message}\n")
+        sys.exit(1)
+if args[:2] == ["window", "new"]:
+    print(json.dumps({"window_id": "T9", "block_ids": ["p9"], "revision": 1}))
+elif args[:4] == ["block", "call", "-b", "p9"] and args[4] == "program_status":
+    # The new block's Claude reports its first record on poll `ready_after`, or never when that is null.
+    polls = os.path.join(fix, "p9-polls")
+    n = (int(open(polls).read()) if os.path.exists(polls) else 0) + 1
+    open(polls, "w").write(str(n))
+    ready = state.get("ready_after", 1)
+    records = [{"state": "idle", "effective_app": "claude-code"}] if ready is not None and n >= ready else []
+    print(json.dumps({"records": records}))
+elif args == ["ls", "--json"]:
     print(json.dumps({"sessions": [{"session_id": s["session_id"], "label": s["label"]} for s in sessions]}))
 elif args[:3] == ["window", "ls", "-s"]:
     print(json.dumps(next((s for s in sessions if s["session_id"] == args[3]), {"windows": []})))
@@ -185,11 +199,16 @@ class DispatchCase(unittest.TestCase):
         self.assertEqual(out.returncode, 1, out.stdout)
         return out.stderr.strip()
 
-    def calls(self):
-        """The fake herdr's calls, bar the listings every command makes."""
-        f = self.tmp / "herdr-calls"
+    def logged(self):
+        """Every call the fake multiplexer got, `--autostart=false` dropped."""
+        f = self.tmp / f"{self.mux}-calls"
         listed = [json.loads(c) for c in f.read_text().splitlines()] if f.exists() else []
-        return [" ".join(c) for c in listed if c[:2] != ["agent", "list"]]
+        return [" ".join(a for a in c if a != "--autostart=false") for c in listed]
+
+    def calls(self):
+        """The fake multiplexer's calls, bar the listings and block reads every command makes."""
+        listing = ("agent list",) if self.mux == "herdr" else ("ls ", "window ls ", "block call ")
+        return [c for c in self.logged() if not c.startswith(listing)]
 
     def saved(self, name):
         return json.loads((self.state_dir / name).read_text())
@@ -393,34 +412,52 @@ class Detection(DispatchCase):
 
 
 class Launch(DispatchCase):
+    """Every `launch` scenario, inside herdr; `RexLaunch` runs them inside Rex."""
+
+    def started(self, *claude_args):
+        return [f"tab create --workspace W1 --cwd {self.repo} --label spec-10 --no-focus",
+                f"agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10{''.join(' ' + a for a in claude_args)}",
+                "agent prompt spec-10 /drive-spec 10"]
+
+    def prompted(self, pane, text):
+        return [f"agent prompt {pane} {text}"]
+
     def test_starts_a_new_tab(self):
         self.assertEqual(self.ok("launch", "10"), ["10 started in tab T9 (pane p9)"])
-        self.assertEqual(self.calls(), [
-            f"tab create --workspace W1 --cwd {self.repo} --label spec-10 --no-focus",
-            "agent start spec-10 --kind claude --pane p9 --timeout 90000 -- -n drive-spec-10",
-            "agent prompt spec-10 /drive-spec 10",
-        ])
+        self.assertEqual(self.calls(), self.started())
 
     def test_skips_a_spec_already_running(self):
-        self.spec(herdr_pane="p1")
+        self.spec(pane="p1")
         self.pane(status="working")
         self.assertEqual(self.ok("launch", "10"), ["10 already running in p1"])
         self.assertEqual(self.calls(), [])
 
+    def test_skips_a_spec_blocked_on_a_dialog(self):
+        self.spec(pane="p1")
+        self.pane(status="blocked")
+        self.assertEqual(self.ok("launch", "10"), ["10 already running in p1"])
+        self.assertEqual(self.calls(), [])
+
     def test_resumes_an_idle_pane_with_the_runs_next_command(self):
-        self.spec(state="halted", summary="red.", next="/review-fix-pr 101", herdr_pane="p1")
+        self.spec(state="halted", summary="red.", next="/review-fix-pr 101", pane="p1")
         self.pane()
         self.assertEqual(self.ok("launch", "10"), ["10 resumed in p1 with /review-fix-pr 101"])
-        self.assertEqual(self.calls(), ["agent prompt p1 /review-fix-pr 101"])
+        self.assertEqual(self.calls(), self.prompted("p1", "/review-fix-pr 101"))
+
+    def test_resumes_an_interrupted_idle_pane_with_drive_spec(self):
+        self.spec(next="/review-fix-pr 101", pane="p1")
+        self.pane()
+        self.assertEqual(self.ok("launch", "10"), ["10 resumed in p1 with /drive-spec 10"])
+        self.assertEqual(self.calls(), self.prompted("p1", "/drive-spec 10"))
 
     def test_leaves_a_spec_waiting_on_its_question(self):
-        self.spec(state="waiting", question="keep CSV?", question_blocking=True, herdr_pane="p1")
+        self.spec(state="waiting", question="keep CSV?", question_blocking=True, pane="p1")
         self.pane()
         self.assertEqual(self.ok("launch", "10"), ["10 waiting on its question in p1: dispatch open 10"])
         self.assertEqual(self.calls(), [])
 
     def test_leaves_a_done_spec(self):
-        self.spec(state="done", herdr_pane="p1")
+        self.spec(state="done", pane="p1")
         self.pane()
         self.assertEqual(self.ok("launch", "10"), ["10 already done in p1"])
         self.assertEqual(self.calls(), [])
@@ -438,10 +475,63 @@ class Launch(DispatchCase):
                          ["10 started in tab T9 (pane p9) from the queue"])
         self.assertEqual(self.saved("queue.json"), [])
 
+    def test_a_start_dequeues_the_spec(self):
+        self.queue("10", "11")
+        self.assertEqual(self.ok("launch", "10"), ["10 started in tab T9 (pane p9) from the queue"])
+        self.assertEqual([q["spec"] for q in self.saved("queue.json")], ["11"])
+
     def test_a_failed_start_closes_its_tab(self):
         self.herdr({"fail": {"agent start": "claude did not start"}})
         self.assertEqual(self.ok("launch", "10"), ["10 failed to start: herdr agent start: claude did not start"])
         self.assertEqual(self.calls()[-1], "tab close T9")
+
+
+class RexLaunch(Launch):
+    mux = "rex"
+
+    def started(self, *claude_args):
+        return [f"window new -s S1 spec-10 -c {self.repo} --focus=false --json -- "
+                f"env CLAUDE_CONFIG_DIR={self.tmp / 'claude'} claude -n drive-spec-10{''.join(' ' + a for a in claude_args)}",
+                *self.prompted("p9", "/drive-spec 10")]
+
+    def prompted(self, pane, text):
+        return [f"send -b {pane} -- {text}", f"send-key -b {pane} enter"]
+
+    def write_rex(self, **extra):
+        (self.tmp / "rex.json").write_text(json.dumps(dict(extra, sessions=list(self.rex_sessions.values()),
+                                                           blocks=self.blocks)))
+
+    def test_sends_drive_spec_only_once_claude_reports_its_status(self):
+        self.write_rex(ready_after=3)
+        self.assertEqual(self.ok("launch", "10"), ["10 started in tab T9 (pane p9)"])
+        polls = [i for i, c in enumerate(self.logged()) if c == "block call -b p9 program_status"]
+        sent = self.logged().index("send -b p9 -- /drive-spec 10")
+        self.assertEqual(len(polls), 3)
+        self.assertLess(polls[-1], sent)
+
+    def test_without_a_config_dir_starts_claude_bare(self):
+        env = dict(self.env)
+        del env["CLAUDE_CONFIG_DIR"]
+        self.env = env
+        self.ok("launch", "10")
+        self.assertEqual(self.calls()[0], f"window new -s S1 spec-10 -c {self.repo} --focus=false --json -- "
+                                          "claude -n drive-spec-10")
+
+    def test_a_failed_start_closes_its_tab(self):
+        self.write_rex(ready_after=None)
+        self.assertEqual(self.ok("launch", "10", DISPATCH_READY_SECONDS="1"),
+                         ["10 failed to start: Claude not ready in spec-10 after 1 s"])
+        self.assertEqual(self.calls(), [self.started()[0], "window close T9"])
+
+    def test_a_failed_send_closes_its_tab(self):
+        self.write_rex(fail={"send ": "block not found"})
+        self.assertEqual(self.ok("launch", "10"), ["10 failed to start: rex send: block not found"])
+        self.assertEqual(self.calls()[-1], "window close T9")
+
+    def test_a_failed_window_closes_nothing(self):
+        self.write_rex(fail={"window new": "no such session"})
+        self.assertEqual(self.ok("launch", "10"), ["10 failed to start: rex window new: no such session"])
+        self.assertEqual(self.calls(), [self.started()[0]])
 
 
 class Open(DispatchCase):

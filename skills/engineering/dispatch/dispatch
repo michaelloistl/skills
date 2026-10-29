@@ -30,6 +30,8 @@ MAX_LOAD = float(os.environ.get("DISPATCH_MAX_LOAD", os.cpu_count() or 1))
 STALL_SECONDS = 15 * 60
 TICK_SECONDS = 60
 POLL_SECONDS = 1.0
+READY_SECONDS = float(os.environ.get("DISPATCH_READY_SECONDS", 90))
+SETTLE_SECONDS = 30
 TITLE = re.compile(r"\b(?:drive-spec|spec)[- ](\d+)\b")
 
 ORDER = ["DIALOG", "ASK", "HALT", "STALL", "GONE", "PAUSE", "PR"]
@@ -616,6 +618,16 @@ class Rex:
         except ValueError:
             return {}
 
+    def call(self, *args):
+        out = subprocess.run(["rex", "--autostart=false", *args], capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            message = out.stderr.strip().removeprefix("Error: ") or f"exit {out.returncode}"
+            raise RuntimeError(f"rex {' '.join(args[:2]) if args[0] in ('window', 'block') else args[0]}: {message}")
+        try:
+            return json.loads(out.stdout or "{}")
+        except ValueError:
+            return {}
+
     def panes(self):
         rows = []
         for s in self.json("ls", "--json").get("sessions", []):
@@ -628,12 +640,15 @@ class Rex:
                             rows.append(row)
         return rows
 
+    def record(self, block):
+        """The root `claude-code` record of the block's `program_status`, or None when no Claude reports there."""
+        records = self.json("block", "call", "-b", block, "program_status").get("records", [])
+        return next((r for r in records if r.get("effective_app") == "claude-code" and not r.get("id")), None)
+
     def pane(self, block, window):
-        """The block's row, from its Claude's root `program_status` record; None when no Claude runs there."""
+        """The block's row, from its Claude's root record; None when no Claude runs there."""
         b = block.get("block_id", "")
-        records = self.json("block", "call", "-b", b, "program_status").get("records", [])
-        claude = [r for r in records if r.get("effective_app") == "claude-code"]
-        record = next((r for r in claude if not r.get("id")), None)
+        record = self.record(b)
         if not record:
             return None
         state = record.get("state") if record.get("state") in self.STATES else "idle"
@@ -644,10 +659,60 @@ class Rex:
         return {"id": b, "label": label, "cwd": cwd, "title": self.json("block", "call", "-b", b, "title").get("title"),
                 "state": state, "tab": window.get("window_id"), "session": None}
 
+    def open_tab(self, spec, root, session=None):
+        """A new unfocused window `spec-<n>` at root in the caller's Rex session, running Claude session
+        `drive-spec-<n>`, sent `/drive-spec <n>` once its Claude reports a status: its (window, block). The command
+        runs in the Rex server's environment, so the caller's `CLAUDE_CONFIG_DIR` goes with it. A failure closes
+        the window and raises."""
+        rex_session = os.environ.get("REX_SESSION")
+        if not rex_session:
+            raise RuntimeError("not inside Rex (REX_SESSION unset)")
+        claude = ["claude", "-n", f"drive-spec-{spec}", *(["--resume", session] if session else [])]
+        config = os.environ.get("CLAUDE_CONFIG_DIR")
+        window = self.call("window", "new", "-s", rex_session, f"spec-{spec}", "-c", str(root), "--focus=false",
+                           "--json", "--", *(["env", f"CLAUDE_CONFIG_DIR={config}"] if config else []), *claude)
+        tab = window.get("window_id")
+        try:
+            if not tab or not window.get("block_ids"):
+                raise RuntimeError(f"rex window new: no window or block in {json.dumps(window)}")
+            pane = window["block_ids"][0]
+            deadline = time.monotonic() + READY_SECONDS
+            while not self.record(pane):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Claude not ready in spec-{spec} after {READY_SECONDS:g} s")
+                time.sleep(0.5)
+            self.prompt(pane, f"/drive-spec {spec}")
+        except Exception:
+            if tab:
+                run(["rex", "--autostart=false", "window", "close", tab])
+            raise
+        return tab, pane
+
+    def prompt(self, pane, text, wait=False):
+        """Types text into the block, then Enter; with wait, returns once its Claude has taken the prompt and left
+        `working` (30 s at most)."""
+        before = (self.record(pane) or {}).get("updated_at") if wait else None
+        self.call("send", "-b", pane, "--", text)
+        self.call("send-key", "-b", pane, "enter")
+        if not wait:
+            return
+        deadline = time.monotonic() + SETTLE_SECONDS
+        moved = False
+        while True:
+            record = self.record(pane) or {}
+            moved = moved or record.get("state") == "working" or record.get("updated_at") != before
+            if moved and record.get("state") != "working":
+                return
+            if time.monotonic() >= deadline:
+                if record.get("state") == "working":
+                    raise RuntimeError(f"rex: {pane} still working after {SETTLE_SECONDS} s")
+                return
+            time.sleep(0.5)
+
     def unbuilt(self, *_, **__):
         raise RuntimeError("not yet supported under Rex")
 
-    open_tab = prompt = focus = close_tab = unbuilt
+    focus = close_tab = unbuilt
 
     def own_pane(self):
         return os.environ.get("REX_BLOCK")
