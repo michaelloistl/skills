@@ -34,6 +34,8 @@ ln -sfn ~/.claude/statusline-command.sh ~/.claude-on/statusline-command.sh
 
 for d in ~/.claude ~/.claude-on; do
   sed -i "s#$MAC_HOME#$HOME#g" "$d/settings.json"
+  tmp=$(mktemp)
+  jq '.env.CLAUDE_CODE_SHELL = "/bin/bash"' "$d/settings.json" > "$tmp" && mv "$tmp" "$d/settings.json"
 done
 
 # settings.json only enables plugins; install them (and their marketplaces) per config

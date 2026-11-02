@@ -1482,7 +1482,8 @@ def run_started(run):
 
 COVERAGE_ITEM = re.compile(r"^\s*[-*]\s+(.*)$")
 COVERAGE_ARROW = re.compile(r"\s*(?:→|->)\s*")
-COVERAGE_SLICES = re.compile(r"(#\d+(?:\s*,\s*#\d+)*)(?:\s+\(.*\))?")
+COVERAGE_SLICE_NOTE = r"#\d+(?:\s+\([^()]*\))?"
+COVERAGE_SLICES = re.compile(rf"({COVERAGE_SLICE_NOTE}(?:\s*(?:,|\band\b|&)\s*{COVERAGE_SLICE_NOTE})*)(?:\s+\(.*\))?")
 COVERAGE_KEYWORD = re.compile(r"(unmapped|every slice)(?:\s+\(.*\))?", re.I)
 QUESTION_LINE = re.compile(r"^\s*[-*]\s+(Q\d+):\s*(.+?)\s*$")
 
@@ -1493,7 +1494,7 @@ def coverage_target(text):
         return ", ".join(re.findall(r"#\d+", m.group(1)))
     if m := COVERAGE_KEYWORD.fullmatch(text):
         return m.group(1).lower()
-    if text.lower().startswith("out of scope:"):
+    if text.lower().startswith(("out of scope:", "done on base:")):
         return text
     return None
 
@@ -1579,9 +1580,10 @@ def cmd_explored(spec):
         return CONFLICT
     pairs, bad = coverage(run)
     if bad:
-        raise Failed("coverage.md lines fit no form (`- <requirement> → #<m>`, `→ every slice`, `→ unmapped`, "
-                     "`→ out of scope: <the spec's words>`, each but the last with an optional trailing "
-                     "`(note)`): " + "; ".join(bad), REFUSE)
+        raise Failed("coverage.md lines fit no form (`- <requirement> → #<m>`, `→ #<m> (note) and #<k> (note)`, "
+                     "`→ every slice`, `→ unmapped`, `→ out of scope: <the spec's words>`, "
+                     "`→ done on base: <where>`, the first three with an optional trailing `(note)`): "
+                     + "; ".join(bad), REFUSE)
     if not pairs:
         raise Failed("coverage.md maps no requirement: every requirement in the spec gets a line", REFUSE)
     slices = {f"#{x['number']}" for x in plan["slices"]}

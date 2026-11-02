@@ -1656,6 +1656,15 @@ class Boundaries(DispatcherCase):
         self.run_ds("start", "10", "11")
         self.assertIn("build every requirement it maps to #11", (self.notes() / "brief-11.md").read_text())
 
+    def test_explored_reads_a_note_per_slice_and_work_done_on_base(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Sign-in and password pages → #12 (passwords) and #11 (sessions)\n"
+                           "- A prototype record → done on base: docs/dev/prototypes/export.md\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.run_ds("start", "10", "11")
+        self.assertIn("build every requirement it maps to #11", (self.notes() / "brief-11.md").read_text())
+
     def test_explored_waits_for_the_operator_questions(self):
         self.run_ds("gate", "10", GATE)
         self.write_explore("- Export → #11\n", questions="- Q1: Public or sign-in? Recommend public.\n")
