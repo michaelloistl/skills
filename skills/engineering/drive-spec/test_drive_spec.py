@@ -583,11 +583,19 @@ class Verify(Cli):
         self.assertEqual(self.gate_runs(), 2)
 
     def test_uncommitted_changes_refused(self):
-        (self.wt / "b.txt").write_text("b")
+        (self.wt / "a.txt").write_text("changed")
         out = self.run_ds("verify", "10", str(self.wt))
         self.assertEqual(out.returncode, 2)
         self.assertIn("uncommitted changes", out.stderr)
         self.assertEqual(self.gate_runs(), 0)
+
+    def test_untracked_files_are_verified_past_with_a_warning(self):
+        (self.wt / "b.txt").write_text("b")
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertRegex(out.stdout, r"^green [0-9a-f]{12}\n$")
+        self.assertIn("untracked", out.stderr)
+        self.assertIn("b.txt", out.stderr)
 
     def test_pinned_gate_wins_over_config(self):
         self.assertEqual(self.run_ds("gate", "10").stdout.strip(), GATE)
@@ -896,6 +904,12 @@ class Integrate(Cli):
     def test_dirty_worktree_refused(self):
         (self.wt / "a.txt").write_text("changed")
         self.assertEqual(self.run_ds("integrate", "10", "11", "--report", NONE).returncode, 2)
+
+    def test_untracked_files_refused(self):
+        (self.wt / "b.txt").write_text("b")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("uncommitted changes", out.stderr)
 
 
 class IntegratePending(Cli):
