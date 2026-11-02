@@ -8,6 +8,14 @@ Skills that take a spec or PR from build through review and QA to merge, with as
 The final check on a PR into base that either merges it or hands it to a human.
 _Avoid_: auto-merge step, approval bot
 
+**Verify gate**:
+The repo's test command that a commit must pass before drive-spec pushes or merges it.
+_Avoid_: CI, check
+
+**Gate verdict**:
+The verify gate's outcome for one commit: `green` or `red`.
+_Avoid_: bare "verdict", pass/fail
+
 **Risk tier**:
 The merge gate's verdict on a PR: `auto` (may merge without a human) or `human` (needs a person's approval).
 _Avoid_: risk level, low/medium/high
