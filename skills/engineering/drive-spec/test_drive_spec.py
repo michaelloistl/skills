@@ -1665,6 +1665,15 @@ class Boundaries(DispatcherCase):
         self.run_ds("start", "10", "11")
         self.assertIn("build every requirement it maps to #11", (self.notes() / "brief-11.md").read_text())
 
+    def test_explored_reads_an_issue_cited_in_a_note_as_the_note(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export → #11 (extends #9's export)\n"
+                           "- Import → #12 (reuses #11's parser)\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.run_ds("start", "10", "11")
+        self.assertNotIn("Import", (self.notes() / "brief-11.md").read_text())
+
     def test_explored_waits_for_the_operator_questions(self):
         self.run_ds("gate", "10", GATE)
         self.write_explore("- Export → #11\n", questions="- Q1: Public or sign-in? Recommend public.\n")
