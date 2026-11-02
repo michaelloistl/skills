@@ -234,8 +234,17 @@ def gh(*args):
     return sh(["gh", "api", *args])
 
 
-def dirty(wt):
-    return git(wt, "status", "--porcelain") != ""
+def dirty(wt, count_untracked=True):
+    """Whether the worktree holds changes no commit has; `count_untracked=False` leaves untracked files out."""
+    return git(wt, "status", "--porcelain", *([] if count_untracked else ["--untracked-files=no"])) != ""
+
+
+def warn_untracked(wt):
+    """Name the worktree's untracked files on stderr: the gate sees them, the commit lacks them."""
+    loose = git(wt, "ls-files", "--others", "--exclude-standard")
+    if loose:
+        print(f"drive-spec: warning: untracked files in {wt}, which the gate sees but the commit lacks:\n  "
+              + loose.replace("\n", "\n  "), file=sys.stderr)
 
 
 def now():
@@ -752,9 +761,10 @@ def verify(run, wt, gate=None, wait=None):
     """Run the gate on the worktree's HEAD, or attach to the run already on it, and report the verdict.
     True when green, False when red, None when `wait` minutes passed first: the gate runs on, detached."""
     wt = Path(wt).resolve()
-    if dirty(wt):
+    if dirty(wt, count_untracked=False):
         raise Failed(f"{wt} has uncommitted changes: commit them first, the verdict is recorded against a commit",
                      REFUSE)
+    warn_untracked(wt)
     head = git(wt, "rev-parse", "HEAD")
     gate = gate or run_gate_of(run)
     if not gate:
@@ -1690,8 +1700,9 @@ def spec_head(run, plan, push):
     wt = run.root / f"spec-{spec}"
     if not wt.is_dir():
         raise Failed(f"no spec worktree at {wt}: `drive-spec open {spec}`", REFUSE)
-    if dirty(wt):
+    if dirty(wt, count_untracked=False):
         raise Failed(f"{wt} has uncommitted changes: commit the fixes, then verify", REFUSE)
+    warn_untracked(wt)
     branch = plan["spec_branch"]
     on = git(wt, "branch", "--show-current")
     if on != branch:
