@@ -162,6 +162,7 @@ fi
 [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -C "$(whoami)@$(hostname)" -f ~/.ssh/id_ed25519
 
 # .zshenv is read by non-interactive ssh too (herdr machine, scripted ssh commands)
+# Claude's Bash tool sources it from bash too (CLAUDE_ENV_FILE): keep it bash-compatible
 grep -qs 'local/bin' ~/.zshenv || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshenv
 # mise shims: per-dir ruby/node for non-interactive shells (Zed remote server, ruby-lsp)
 grep -qs 'mise/shims' ~/.zshenv || echo 'export PATH="$HOME/.local/share/mise/shims:$PATH"' >> ~/.zshenv
