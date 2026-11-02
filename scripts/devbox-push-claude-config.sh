@@ -35,7 +35,8 @@ ln -sfn ~/.claude/statusline-command.sh ~/.claude-on/statusline-command.sh
 for d in ~/.claude ~/.claude-on; do
   sed -i "s#$MAC_HOME#$HOME#g" "$d/settings.json"
   tmp=$(mktemp)
-  jq '.env.CLAUDE_CODE_SHELL = "/bin/bash"' "$d/settings.json" > "$tmp" && mv "$tmp" "$d/settings.json"
+  # Bash tool runs bash; Claude Code resets its PATH to the launch PATH (bare under Rex), so source .zshenv per command
+  jq --arg env "$HOME/.zshenv" '.env.CLAUDE_CODE_SHELL = "/bin/bash" | .env.CLAUDE_ENV_FILE = $env' "$d/settings.json" > "$tmp" && mv "$tmp" "$d/settings.json"
 done
 
 # settings.json only enables plugins; install them (and their marketplaces) per config
