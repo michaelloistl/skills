@@ -1882,6 +1882,29 @@ class Boundaries(DispatcherCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-2.brief.md").exists())
 
+    def test_rounds_past_the_cap_go_on_while_their_findings_shrink(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 2}))
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+
+        def fixed_round(k, *findings):
+            self.run_ds("review", "10")
+            self.round_(k, *findings)
+            self.run_ds("review", "10")
+            self.commit(self.spec_wt, f"fix-{k}.txt", "x\n", f"Fix round {k}")
+            self.run_ds("verify", "10", str(self.spec_wt))
+            return self.run_ds("review", "10")
+
+        out = fixed_round(1, self.RULE, dict(self.RULE, finding="The total row is missing."))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = fixed_round(2, self.RULE)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue((self.notes() / "review" / "round-3.brief.md").exists())
+        out = fixed_round(3, self.RULE)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("round 3 raised 1 finding(s) to fix, no fewer than round 2", out.stderr)
+
     def test_a_merge_commit_with_a_verified_tree_needs_no_gate(self):
         self.run_ds("gate", "10", GATE)
         self.land_11()

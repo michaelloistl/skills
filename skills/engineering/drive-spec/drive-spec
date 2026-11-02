@@ -1785,10 +1785,13 @@ def cmd_review(spec):
             return 0
         cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
         answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
-        if k >= cap and rules and not answered:
-            raise Failed(f"{k} review rounds and round {k} still raised findings to fix: ask the operator whether to "
-                         f"go on (`drive-spec ask {spec} ...`); once answered, `drive-spec review {spec}` starts "
-                         "another round", REFUSE)
+        before = len(to_fix(read_round(run, k - 1, wt)["findings"])) if k > 1 else None
+        shrinking = before is not None and len(rules) < before
+        if k >= cap and rules and not answered and not shrinking:
+            than = f", no fewer than round {k - 1}" if before is not None else ""
+            raise Failed(f"{k} review rounds, and round {k} raised {len(rules)} finding(s) to fix{than}: ask the "
+                         f"operator whether to go on (`drive-spec ask {spec} ...`); once answered, "
+                         f"`drive-spec review {spec}` starts another round", REFUSE)
     k += 1
     (run.notes / "review").mkdir(parents=True, exist_ok=True)
     round_file(run, k, "meta.json").write_text(json.dumps({"head": head, "at": stamp()}))
