@@ -19,7 +19,7 @@ At every step boundary, and within step 6 at each dispatch, landing and halt. `s
 | `worktree` | `drive-spec plan <spec>`, only once `gate` has written `guard`, so a plan read outside a run writes nothing |
 | `preview` | `drive-spec open` |
 | `explore` | `drive-spec preview` (`paused` at `preview` with `--dry-run`); conflicts: `finish conflicts` |
-| `build` | `explored`, `start`, `land`, `halt`, `finish ceiling\|held` |
+| `build` | `explored`, `start`, `build`, `land`, `halt`, `finish ceiling\|held` |
 | `review` | `land` of the last slice, or `frontier` as it stops on `done` while the status still reads `build`; then `drive-spec review` at each round, fix and clean |
 | `confirm` | `drive-spec reviewed` |
 | `cleanup` | `drive-spec confirm` |
@@ -40,6 +40,16 @@ While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes
 | `done` | step 11 posted its QA comment with no failed scenario | `none` |
 
 `summary` in step 6 counts progress: `landed 3/7; building #2990, #2991`.
+
+## Agents
+
+`drive-spec build` keeps an `agents` map in the status file: one entry per slice with an agent running for it, keyed by the slice number as a string, removed once that slice lands.
+
+```json
+"agents": {"2990": {"role": "implementer", "pid": 4242, "log": "<notes>/logs/agent-2990-implementer.log", "session_id": "…", "started_at": "2026-11-03T09:12:00+00:00"}}
+```
+
+`role` is `implementer`. `pid` is the agent's process, detached in a session of its own. `log` is its stream, appended to on each launch: watch it to follow the slice live. `session_id` is the agent's session, read from the stream once it names it, `null` until then. `started_at` is when `build` launched it. `build` writes the whole map with `status.sh <spec> agents='<JSON>'`, and writes it again while it waits if another write dropped it.
 
 ## Questions
 

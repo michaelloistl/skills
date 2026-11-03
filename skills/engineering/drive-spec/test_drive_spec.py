@@ -1047,17 +1047,18 @@ class Brief(unittest.TestCase):
     def test_fills_every_placeholder(self):
         b = ds.brief(self.run_({"localOnly": {"label": "needs:desktop", "proof": "docs/proof.md"}}),
                      12, Path("/w/issue-12"), "main", True, True)
-        self.assertNotRegex(b, r"<[a-z][a-z ]*>|<If ")
+        self.assertNotRegex(b, r"<(?!report>)[a-z][a-z ]*>|<If ")
         for part in ["Worktree: /w/issue-12.", "gh api repos/acme/app/issues/12", "Spec: #10",
                      "git log --oneline origin/main..HEAD", "/n/issue-12.md", "drive-spec verify 10 /w/issue-12",
-                     "carry on.", "carries `needs:desktop`", "`docs/proof.md`"]:
+                     "carry on.", "carries `needs:desktop`", "`docs/proof.md`", "`proof` is one line"]:
             self.assertIn(part, b)
 
     def test_drops_conditions_that_do_not_hold(self):
         b = ds.brief(self.run_({}), 12, Path("/w/issue-12"), "main", False, False)
         self.assertNotIn("carry on", b)
         self.assertNotIn("prove it", b)
-        self.assertNotRegex(b, r"<[a-z][a-z ]*>|<If ")
+        self.assertIn("`proof` is `null`.", b)
+        self.assertNotRegex(b, r"<(?!report>)[a-z][a-z ]*>|<If ")
 
 
 class Frontier(Cli):
@@ -1144,6 +1145,156 @@ class Start(Cli):
         out = self.run_ds("start", "10", "11")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.git(self.wt, "rev-parse", "HEAD"), head)
+
+
+FAKE_AGENT = r"""
+import json, os, re, subprocess, sys, time
+
+fix, wt = os.environ["FIX"], os.getcwd()
+m = re.fullmatch(r"issue-(\d+)", os.path.basename(wt)).group(1)
+with open(os.path.join(fix, f"agent-{m}.json"), "w") as f:
+    json.dump({"argv": sys.argv[1:], "stdin": sys.stdin.read(), "detached": os.getsid(0) == os.getpid()}, f)
+print(json.dumps({"type": "system", "subtype": "init", "session_id": f"sess-{m}"}), flush=True)
+while os.path.exists(os.path.join(fix, f"hold-{m}")) and not os.path.exists(os.path.join(fix, "go")):
+    time.sleep(0.05)
+with open(f"work-{m}.txt", "w") as f:
+    f.write(m + "\n")
+subprocess.run(["git", "add", "-A"], check=True)
+subprocess.run(["git", "commit", "-q", "-m", f"Build #{m}"], check=True)
+line = subprocess.run([os.environ["DRIVE_SPEC"], "verify", "10", wt, "--wait-minutes", "9"], capture_output=True,
+                      text=True).stdout.strip().splitlines()[-1]
+sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+report = {"sha": sha, "verdict": "green", "verdictLine": line, "deviations": [f"kept the old flag for #{m}"],
+          "unverified": [f"the toast for #{m} shows only in a running app", "the second line"], "proof": None}
+print(json.dumps({"type": "result", "subtype": "success", "session_id": f"sess-{m}",
+                  "result": f"Built #{m}.\n\n<report>{json.dumps(report)}</report>"}), flush=True)
+"""
+
+
+class Build(Cli):
+    """`drive-spec build` drives a sequential run: start, an agent per slice, integrate, land, to done."""
+
+    def setUp(self):
+        super().setUp()
+        agent = self.tmp / "bin" / "claude"
+        agent.write_text(f"#!{sys.executable}\n{FAKE_AGENT}")
+        agent.chmod(0o755)
+        self.env["DRIVE_SPEC"] = str(SCRIPT)
+
+    def agent(self, m):
+        return json.loads((self.tmp / f"agent-{m}.json").read_text())
+
+    def test_drives_two_slices_to_done(self):
+        (self.tmp / "hold-11").write_text("")
+        proc = subprocess.Popen([str(SCRIPT), "build", "10", "--sequential"], cwd=self.repo, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        notes = self.repo / ".git" / "drive-spec" / "spec-10"
+        log = notes / "logs" / "agent-11-implementer.log"
+        for _ in range(400):
+            entry = (self.status_file().get("agents") or {}).get("11") if (
+                self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").exists() else None
+            if entry and entry.get("session_id"):
+                break
+            time.sleep(0.05)
+        else:
+            proc.kill()
+            self.fail(f"no agent recorded for #11: {proc.communicate()}")
+        self.assertEqual({k: entry[k] for k in ("role", "log", "session_id")},
+                         {"role": "implementer", "log": str(log), "session_id": "sess-11"})
+        self.assertTrue(entry["started_at"])
+        os.kill(entry["pid"], 0)
+        (self.tmp / "go").write_text("")
+        out, err = proc.communicate(timeout=120)
+        self.assertEqual(proc.returncode, 0, out + err)
+
+        events = [re.sub(r" pid \d+", " pid N", re.sub(r"green [0-9a-f]{12}.*", "green SHA", x))
+                  for x in out.splitlines()]
+        self.assertEqual(events, [
+            f"started #11: implementer pid N, log {log}",
+            "reported #11: green SHA",
+            "integrated #11: merged #100",
+            "landed #11",
+            f"started #12: implementer pid N, log {notes / 'logs' / 'agent-12-implementer.log'}",
+            "reported #12: green SHA",
+            "integrated #12: merged #102",
+            "landed #12",
+            "stop: done"])
+
+        for m in (11, 12):
+            a = self.agent(m)
+            self.assertEqual(a["argv"][-1], f"Read {notes / f'brief-{m}.md'} and follow it.")
+            self.assertEqual(a["argv"][:2], ["-p", "--allowedTools"])
+            self.assertEqual((a["stdin"], a["detached"]), ("", True))
+        st = self.gh_state()
+        self.assertEqual([st["issues"][n]["state"] for n in ("11", "12")], ["closed", "closed"])
+        slice_prs = [p for p in st["pulls"] if p["base"] == "agent/local-spec-10-export"]
+        self.assertEqual([(p["head"], p["state"]) for p in slice_prs],
+                         [("agent/issue-11-serializer", "closed"), ("agent/issue-12-wire-the-route", "closed")])
+        for m, p in zip((11, 12), slice_prs):
+            self.assertIn(f"\n\nUnverified:\nthe toast for #{m} shows only in a running app\nthe second line\n\n"
+                          f"Deviations:\nkept the old flag for #{m}", p["body"])
+        self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:work-12.txt"), "12")
+        status = self.status_file()
+        self.assertEqual((status["step"], status["agents"]), ("review", {}))
+
+    def test_brief_asks_for_the_report_block(self):
+        self.assertEqual(self.run_ds("start", "10", "11").returncode, 0)
+        brief = (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text()
+        self.assertIn('<report>{"sha": ', brief)
+        self.assertIn("the last thing in", brief)
+
+    def test_missing_agent_refused_before_any_slice_starts(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "agent": ["no-such-agent", "-p"]}))
+        out = self.run_ds("build", "10")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("`no-such-agent`", out.stderr)
+        self.assertEqual(out.stdout, "")
+        self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").exists())
+
+
+class Report(unittest.TestCase):
+    """The report block an implementer ends with, parsed and checked with the standard library."""
+
+    GOOD = {"sha": "a" * 40, "verdict": "green", "verdictLine": "green aaaaaaaaaaaa", "deviations": [],
+            "unverified": ["x"], "proof": None}
+
+    def parse(self, text, local=False):
+        return ds.parse_report(text, local, Path("/n/agent.log"))
+
+    def test_the_last_block_parses(self):
+        self.assertEqual(self.parse(f"done\n<report>{json.dumps(self.GOOD)}</report>\n"), self.GOOD)
+
+    def test_text_form_for_integrate(self):
+        self.assertEqual(ds.report_text(dict(self.GOOD, deviations=["a", "b"])),
+                         "Deviations:\na\nb\nUnverified:\nx")
+        self.assertEqual(ds.report_text(dict(self.GOOD, unverified=[], proof="ran it")),
+                         "Deviations:\nnone\nUnverified:\nnone\nProof:\nran it")
+
+    def test_refusals(self):
+        bad = [
+            "no block",
+            f"<report>{json.dumps(self.GOOD)}</report> and more after",
+            "<report>{not json}</report>",
+            f"<report>{json.dumps({k: v for k, v in self.GOOD.items() if k != 'unverified'})}</report>",
+            f"<report>{json.dumps(dict(self.GOOD, verdict='amber'))}</report>",
+            f"<report>{json.dumps(dict(self.GOOD, deviations='none'))}</report>",
+            f"<report>{json.dumps(dict(self.GOOD, unverified=[1]))}</report>",
+            f"<report>{json.dumps(dict(self.GOOD, proof='ran it'))}</report>",
+        ]
+        for text in bad:
+            with self.subTest(text=text), self.assertRaises(ds.Failed) as e:
+                self.parse(text)
+            self.assertIn("/n/agent.log", str(e.exception))
+
+    def test_example_config_holds_the_default_agent(self):
+        example = json.loads(SCRIPT.with_name("drive-spec.example.json").read_text())
+        self.assertEqual(example["agent"], ds.DEFAULT_AGENT)
+
+    def test_proof_required_on_a_local_only_slice(self):
+        with self.assertRaises(ds.Failed):
+            self.parse(f"<report>{json.dumps(self.GOOD)}</report>", local=True)
+        good = dict(self.GOOD, proof="ran it")
+        self.assertEqual(self.parse(f"<report>{json.dumps(good)}</report>", local=True), good)
 
 
 class Finish(Cli):
