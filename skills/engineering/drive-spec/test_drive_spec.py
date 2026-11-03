@@ -1227,7 +1227,8 @@ if "--resume" in sys.argv:
     result(session, block(head(), "green", verify()) if mode == "malformed" else "I have nothing more to add.")
     sys.exit(0)
 with open(os.path.join(fix, f"agent-{m}.json"), "w") as f:
-    json.dump({"argv": sys.argv[1:], "stdin": sys.stdin.read(), "detached": os.getsid(0) == os.getpid()}, f)
+    json.dump({"argv": sys.argv[1:], "stdin": sys.stdin.read(), "detached": os.getsid(0) == os.getpid(),
+               "env": sorted(os.environ)}, f)
 with open(os.path.join(fix, f"spawns-{m}"), "a") as f:
     f.write(f"{os.getpid()}\n")
 print(json.dumps({"type": "system", "subtype": "init", "session_id": f"sess-{m}"}), flush=True)
@@ -1307,6 +1308,8 @@ class Build(BuildCase):
         return json.loads((self.tmp / f"agent-{m}.json").read_text())
 
     def test_drives_two_slices_to_done(self):
+        self.env.update(HERDR_ENV="1", HERDR_PANE_ID="p1", HERDR_SOCKET_PATH="/tmp/herdr.sock", REX_BLOCK="block:1",
+                        CLAUDE_CODE_SESSION_ID="orchestrator", CLAUDE_CODE_MESSAGING_TOKEN="t", CLAUDE_EFFORT="high")
         (self.tmp / "hold-11").write_text("")
         proc = subprocess.Popen([str(SCRIPT), "build", "10", "--sequential"], cwd=self.repo, env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1345,8 +1348,12 @@ class Build(BuildCase):
         for m in (11, 12):
             a = self.agent(m)
             self.assertEqual(a["argv"][-1], f"Read {notes / f'brief-{m}.md'} and follow it.")
-            self.assertEqual(a["argv"][:2], ["-p", "--allowedTools"])
+            self.assertEqual(a["argv"][:-1], ds.DEFAULT_AGENT[1:])
             self.assertEqual((a["stdin"], a["detached"]), ("", True))
+            self.assertEqual([k for k in a["env"] if k.startswith(("HERDR_", "REX_"))], [])
+            self.assertNotIn("CLAUDE_CODE_SESSION_ID", a["env"])
+            self.assertNotIn("CLAUDE_CODE_MESSAGING_TOKEN", a["env"])
+            self.assertIn("CLAUDE_EFFORT", a["env"])
         st = self.gh_state()
         self.assertEqual([st["issues"][n]["state"] for n in ("11", "12")], ["closed", "closed"])
         slice_prs = [p for p in st["pulls"] if p["base"] == "agent/local-spec-10-export"]
@@ -1448,7 +1455,7 @@ class Build(BuildCase):
         self.assertRegex(lines[2], r"^reported #11: green [0-9a-f]{12} \(already verified\)$")
         self.assertEqual(lines[3:5], ["integrated #11: merged #100", "landed #11"])
         [argv] = self.resumes(11)
-        self.assertEqual(argv[:2], ["-p", "--allowedTools"])
+        self.assertEqual(argv[:-3], ds.DEFAULT_AGENT[1:])
         self.assertEqual(argv[-3:-1], ["--resume", "sess-11"])
         self.assertIn("Reply with that block only", argv[-1])
         self.assertIn(str(self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md"), argv[-1])

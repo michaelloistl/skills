@@ -1427,11 +1427,10 @@ def cmd_start(spec, m):
 
 # build
 
-# Claude Code in print mode, streaming JSON events to the log. It edits files and runs any Bash command unasked, and
-# denies anything else that would prompt: nobody is there to answer. `--allowedTools` takes a list, so it goes before
-# the other flags, never last, where it would swallow the prompt.
-DEFAULT_AGENT = ["claude", "-p", "--allowedTools", "Bash", "--verbose", "--output-format", "stream-json",
-                 "--permission-mode", "acceptEdits", "--permission-prompts", "none"]
+# Claude Code in print mode, streaming JSON events to the log. Auto mode's classifier approves each call, as it does
+# for the operator's own session, and anything that would still prompt is denied: nobody is there to answer.
+DEFAULT_AGENT = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
+                 "--permission-prompts", "none"]
 # The same agent resuming its session, `{session}` replaced by the session id, and the prompt appended last.
 DEFAULT_AGENT_RESUME = [*DEFAULT_AGENT, "--resume", "{session}"]
 RESUME_PROMPT = ("Your last response did not end with a valid report block: {why}. Reply with that block only, "
@@ -1482,6 +1481,18 @@ def write_agents(run, table):
     run.status(agents=json.dumps(table, sort_keys=True))
 
 
+# What the agent must not inherit from the session that runs `build`: the multiplexer pane, which its SessionStart
+# hooks would claim for its own session, and that session's identity and messaging channel.
+AGENT_ENV_DROP_PREFIXES = ("HERDR_", "REX_")
+AGENT_ENV_DROP = {"CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_SOCKET",
+                  "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_PID", "CLAUDE_ENV_FILE"}
+
+
+def agent_env():
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(AGENT_ENV_DROP_PREFIXES) and k not in AGENT_ENV_DROP}
+
+
 def launch(run, m, role, wt, brief_path, argv=None, prompt=None):
     """The agent, detached in its own session in the slice worktree, stdin closed, its stream appended to its log."""
     logs = run.notes / "logs"
@@ -1489,7 +1500,8 @@ def launch(run, m, role, wt, brief_path, argv=None, prompt=None):
     log = logs / f"agent-{m}-{role}.log"
     with open(log, "a") as out:
         proc = subprocess.Popen([*(argv or agent_argv(run)), prompt or f"Read {brief_path} and follow it."], cwd=wt,
-                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=agent_env())
     return proc, log
 
 
