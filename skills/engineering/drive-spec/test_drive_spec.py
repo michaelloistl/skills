@@ -1883,6 +1883,8 @@ class Finish(Cli):
         out = self.run_ds("finish", "10", "done")
         self.assertEqual(out.returncode, 2)
         self.assertIn("no `qa-pr done` comment on PR #101 names", out.stderr)
+        self.assertIn("`drive-spec qa 10`, then hand the prompt it prints to a QA subagent", out.stderr)
+        self.assertNotIn("/qa-pr", out.stderr)
         self.qa_done(failed=1)
         self.assertIn("failed", self.run_ds("finish", "10", "done").stderr)
 
@@ -2222,10 +2224,13 @@ class Cleanup(DispatcherCase):
         self.assertIn("`/review-fix-pr 101`, then `drive-spec qa 10`", self.run_ds("next", "10").stdout)
         out = self.run_ds("qa", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout, "next: /qa-pr 101\n")
+        qa_skill = Path(SCRIPT).resolve().parent.parent / "qa-pr" / "SKILL.md"
+        prompt = f"Read {qa_skill} and follow it for `/qa-pr 101`. Report back the comment URL, its first line, and each failed scenario's title."
+        self.assertEqual(out.stdout, f"next: a QA subagent with the prompt `{prompt}`; then `drive-spec finish 10 done`\n")
         r = self.row()
         self.assertEqual((r["step"], r["state"]), ("qa-pr", "running"))
-        self.assertIn("`/qa-pr 101`, then `drive-spec finish 10 done`", self.run_ds("next", "10").stdout)
+        self.assertIn(f"a QA subagent with the prompt `{prompt}`, then `drive-spec finish 10 done`",
+                      self.run_ds("next", "10").stdout)
 
     def test_qa_off_points_at_finish(self):
         self.finish_slices()
@@ -2448,7 +2453,8 @@ class Boundaries(DispatcherCase):
 
     RULE = {"kind": "rule", "rule": "spec #10: Export to CSV", "path": "README", "line": 1,
             "finding": "No CSV export."}
-    CALL = {"kind": "judgement", "path": "README", "line": 1, "finding": "Rename ExportJob."}
+    CALL = {"kind": "judgement", "path": "README", "line": 1, "finding": "Rename ExportJob.",
+            "recommend": "Keep the name."}
 
     def test_review_rounds_run_to_clean(self):
         self.run_ds("gate", "10", GATE)
@@ -2491,7 +2497,23 @@ class Boundaries(DispatcherCase):
         self.assertTrue(self.status_file()["summary"].startswith("review left 1 finding(s) open after 2 round(s)"))
         self.assertEqual(self.run_ds("confirm", "10").returncode, 0)
         self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith(
-            "\n\nLeft from review:\n- `README:1`: Rename ExportJob."))
+            "\n\nLeft from review:\n- `README:1`: Rename ExportJob. Recommend: Keep the name."))
+
+    def test_the_left_list_holds_only_the_last_rounds_judgement_calls(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE, self.CALL)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(2)
+        self.assertIn("review clean at round 2", self.run_ds("review", "10").stdout)
+        out = self.run_ds("reviewed", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(self.status_file()["summary"].startswith("review clean after 2 round(s)"))
+        self.assertFalse((self.notes() / "left.md").exists())
 
     def diverge(self, base_only):
         work = self.tmp / "outside"
@@ -2575,8 +2597,28 @@ class Boundaries(DispatcherCase):
         err = self.run_ds("review", "10").stderr
         for fault in ("finding 1: a rule finding quotes no rule", "finding 2: NOPE.md is no file",
                       "finding 3: no file gone.rb", "finding 4: kind is not rule, bug or judgement",
-                      "finding 5: a bug finding says not how it fails"):
+                      "finding 5: a bug finding says not how it fails",
+                      "finding 3: a judgement call recommends nothing"):
             self.assertIn(fault, err)
+
+    def test_an_earlier_round_is_not_sent_back(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(2, self.RULE)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "fix-2.txt", "x\n", "Fix round 2")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.round_(1, self.RULE, {"kind": "judgement", "path": "README", "line": 1, "finding": "Rename it."})
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue((self.notes() / "review" / "round-3.brief.md").exists())
 
     def test_a_round_is_read_against_the_head_it_reviewed(self):
         self.run_ds("gate", "10", GATE)

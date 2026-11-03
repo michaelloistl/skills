@@ -2104,6 +2104,8 @@ def read_round(run, k, wt):
                 faults.append(f"finding {n}: {source[0].strip()} is no file, spec, slice or decisions.md")
         if x["kind"] == "bug" and not str(x.get("fails") or "").strip():
             faults.append(f"finding {n}: a bug finding says not how it fails (`fails`)")
+        if x["kind"] == "judgement" and not str(x.get("recommend") or "").strip():
+            faults.append(f"finding {n}: a judgement call recommends nothing (`recommend`)")
     if faults:
         raise Failed(f"{f} does not fit REVIEWER.md: " + "; ".join(faults)
                      + ". Send the round's reviewer back to fix it", REFUSE)
@@ -2119,16 +2121,9 @@ def to_fix(findings):
     return [x for x in findings if x["kind"] in ("rule", "bug")]
 
 
-def judgement_calls(run, wt):
-    seen, out = set(), []
-    for k in review_rounds(run):
-        if round_file(run, k, "json").is_file():
-            for x in read_round(run, k, wt)["findings"]:
-                key = (x.get("path"), " ".join(x["finding"].split()).lower())
-                if x["kind"] == "judgement" and key not in seen:
-                    seen.add(key)
-                    out.append(f"- {where(x)}: {' '.join(x['finding'].split())}")
-    return out
+def judgement_calls(round_):
+    return [f"- {where(x)}: {' '.join(x['finding'].split())} Recommend: {' '.join(x['recommend'].split())}"
+            for x in round_["findings"] if x["kind"] == "judgement"]
 
 
 def spec_head(run, plan, push):
@@ -2233,7 +2228,7 @@ def cmd_review(spec):
             return 0
         cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
         answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
-        before = len(to_fix(read_round(run, k - 1, wt)["findings"])) if k > 1 else None
+        before = len(to_fix(json.loads(round_file(run, k - 1, "json").read_text())["findings"])) if k > 1 else None
         shrinking = before is not None and len(rules) < before
         if k >= cap and rules and not answered and not shrinking:
             than = f", no fewer than round {k - 1}" if before is not None else ""
@@ -2275,7 +2270,7 @@ def cmd_reviewed(spec, left):
     if last["head"] != head or to_fix(last["findings"]):
         raise Failed(f"round {ks[-1]} is not a clean review of {head[:12]}: `drive-spec review {spec}`", REFUSE)
     kept = run.notes / "left.md"
-    lines = judgement_calls(run, wt) + ([left.strip()] if left and left.strip() else [])
+    lines = judgement_calls(last) + ([left.strip()] if left and left.strip() else [])
     if lines:
         kept.write_text("\n".join(lines) + "\n")
     else:
@@ -2393,6 +2388,10 @@ def cmd_cleanup(spec):
     return 0
 
 
+def qa_prompt(pr):
+    return f"Read {Path(__file__).resolve().parent.parent / 'qa-pr' / 'SKILL.md'} and follow it for `/qa-pr {pr}`. Report back the comment URL, its first line, and each failed scenario's title."
+
+
 def cmd_qa(spec):
     run = Run(spec)
     plan = checked_plan(run)
@@ -2405,9 +2404,9 @@ def cmd_qa(spec):
         print(f"next: drive-spec finish {spec} done (qa off in .claude/drive-spec.json)")
         return 0
     run.status(step="qa-pr", state="running", summary=f"running QA on PR #{spec_pr['number']}",
-               next=f"/qa-pr {spec_pr['number']}, then drive-spec finish done", branch=plan["spec_branch"],
-               pr_url=spec_pr["url"])
-    print(f"next: /qa-pr {spec_pr['number']}")
+               next=f"a QA subagent runs /qa-pr {spec_pr['number']}, then drive-spec finish done",
+               branch=plan["spec_branch"], pr_url=spec_pr["url"])
+    print(f"next: a QA subagent with the prompt `{qa_prompt(spec_pr['number'])}`; then `drive-spec finish {spec} done`")
     return 0
 
 
@@ -2508,7 +2507,7 @@ def next_step(run, status):
         if run.config.get("qa") is False:
             return step, f"`drive-spec finish {spec} done`"
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
-        return step, f"`/qa-pr {pr}`, then `drive-spec finish {spec} done`"
+        return step, f"a QA subagent with the prompt `{qa_prompt(pr)}`, then `drive-spec finish {spec} done`"
     if step == "build":
         flags = (" --sequential" if status.get("sequential") is True else "") + \
             (f" --max {status['max']}" if status.get("max") is not None else "")
@@ -2538,7 +2537,7 @@ def qa_passed(run, spec_pr):
                 if b.startswith(f"qa-pr done at {head}:")]
     if not verdicts:
         raise Failed(f"not done: no `qa-pr done` comment on PR #{n} names {head}: `drive-spec qa {run.spec}`, "
-                     f"then `/qa-pr {n}`", REFUSE)
+                     "then hand the prompt it prints to a QA subagent", REFUSE)
     if not re.search(r"\b0 failed\b", verdicts[-1]):
         raise Failed(f"not done: {verdicts[-1]} Halt the run on the failed scenarios", REFUSE)
 
@@ -2691,10 +2690,10 @@ def main():
     rw.add_argument("spec")
     rv = sub.add_parser("reviewed", help="end of review: a clean last round on the pushed, green spec branch")
     rv.add_argument("spec")
-    rv.add_argument("--left", help="more for the left list, beyond the rounds' judgement calls; `-` for stdin")
+    rv.add_argument("--left", help="more for the left list, beyond the last round's judgement calls; `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
-    qa = sub.add_parser("qa", help="step 11: mark QA of the spec PR begun and print the /qa-pr command")
+    qa = sub.add_parser("qa", help="step 11: mark QA of the spec PR begun and print the QA subagent's prompt")
     qa.add_argument("spec")
     ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
     ak.add_argument("spec")
