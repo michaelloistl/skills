@@ -28,7 +28,7 @@ TIMED_OUT = 124
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 HEARTBEAT_SECONDS = float(os.environ.get("DRIVE_SPEC_HEARTBEAT_SECONDS", 300))
 SPEC_MOVES = 5
-REFUSE, CONFLICT, RED, INBOX, PENDING = 2, 3, 4, 5, 6
+REFUSE, CONFLICT, RED, INBOX, PENDING, PAUSED = 2, 3, 4, 5, 6, 7
 LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
 
 
@@ -1651,19 +1651,19 @@ def cmd_build(spec, sequential, max_slices, wait=None):
     deadline = None if wait is None else time.monotonic() + wait * 60
     beat = Heartbeat(run)
     procs = {}  # the agents this call launched: polled, as `alive` reads an unwaited child as running
+    ask = True  # whether `frontier` may have new lines: on the first pass and after each landing
     while True:
         if inbox(run):
             return INBOX
         table = agents(run)
-        ready = running = None
+        running = []
         for key, entry in sorted(table.items(), key=lambda kv: kv[1].get("started_at") or ""):
-            m, log = int(key), entry["log"]
+            m, log = int(key), entry.get("log")
             if "report" in entry:
-                ready = ready or m
                 continue
             proc = procs.get(m)
             if proc.poll() is None if proc else adopted(entry, run.notes / f"brief-{m}.md"):
-                running = running or m
+                running.append(m)
                 if not entry.get("session_id"):
                     entry["session_id"] = session_of(log)
                 continue
@@ -1674,7 +1674,7 @@ def cmd_build(spec, sequential, max_slices, wait=None):
                 procs[m], log = launch_implementer(run, spec, m, table, restarts=1)
                 print(f"restarted #{m}: its implementer died without a report; implementer pid {procs[m].pid}, "
                       f"log {log}", flush=True)
-                running = running or m
+                running.append(m)
                 continue
             try:
                 rep = checked_report(run, m, run.root / f"issue-{m}", log)
@@ -1686,51 +1686,63 @@ def cmd_build(spec, sequential, max_slices, wait=None):
                 procs[m] = resume_for_report(run, m, entry, str(e))
                 write_agents(run, table)
                 print(f"resumed #{m}: {e}; implementer pid {procs[m].pid}, asked for its report only", flush=True)
-                running = running or m
+                running.append(m)
                 continue
             except Failed as e:
                 return halt(run, table, m, str(e))
             print(f"reported #{m}: {rep['verdictLine']}", flush=True)
             if rep["verdict"] != "green":
                 return halt(run, table, m, f"its implementer reported red: {rep['verdictLine']}")
+            # Finish order is the log's last write: right for an agent that ended while no `build` watched it too.
             entry["report"] = report_text(rep)
+            entry["finished_at"] = datetime.fromtimestamp(os.path.getmtime(log), timezone.utc).isoformat()
             write_agents(run, table)
-            ready = ready or m
-        if ready:
-            code = integrate_and_land(run, ready, table[str(ready)]["report"], deadline, table)
+        queue = sorted((k for k, e in table.items() if "report" in e),
+                       key=lambda k: table[k].get("finished_at") or table[k].get("started_at") or "")
+        if queue:
+            m = int(queue[0])
+            code = integrate_and_land(run, m, table[queue[0]]["report"], deadline, table)
             if code:
                 return code
-            table.pop(str(ready), None)
+            table.pop(queue[0], None)
             write_agents(run, table)
+            ask = True
             continue
-        if running:
-            if run.current().get("agents") != table:
-                write_agents(run, table)
-            if deadline is not None and time.monotonic() >= deadline:
-                print(f"running #{running}: its implementer is still at work after {wait:g} minutes; run this same "
-                      "command again to keep waiting", flush=True)
-                return PENDING
-            beat.beat()
-            time.sleep(max(POLL_SECONDS, 0.1))
+        if ask:
+            ask = False
+            f = frontier(run, [int(k) for k in table], sequential, max_slices)
+            if f["stop"] == "done":
+                print("stop: done")
+                return 0
+            if f["stop"]:
+                print(render_picks(f), flush=True)
+                quietly(finish, run, f["stop"])
+                return PAUSED
+            for p in f["picks"]:
+                m = p["number"]
+                if p["action"] == "integrate":
+                    quietly(cmd_start, spec, m)
+                    table[str(m)] = {"role": "integrate", "pr": p["pr"], "report": None, "finished_at": stamp()}
+                    write_agents(run, table)
+                    print(f"queued #{m}: PR #{p['pr']} is already open", flush=True)
+                    continue
+                procs[m], log = launch_implementer(run, spec, m, table)
+                print(f"started #{m}: implementer pid {procs[m].pid}, log {log}", flush=True)
+            if f["picks"]:
+                continue
+        if not running:
+            ask = True
             continue
-        f = frontier(run, [int(k) for k in table], sequential, max_slices)
-        if f["stop"] == "done":
-            print("stop: done")
-            return 0
-        if f["stop"]:
-            raise Failed(f"{render_picks(f)}: end the run with `drive-spec finish {spec} {f['stop']}`")
-        if not f["picks"]:
-            print(render_picks(f))
+        if run.current().get("agents") != table:
+            write_agents(run, table)
+        if deadline is not None and time.monotonic() >= deadline:
+            names = ", ".join(f"#{m}" for m in running)
+            who = "its implementer is" if len(running) == 1 else "their implementers are"
+            print(f"running {names}: {who} still at work after {wait:g} minutes; run this same command again to "
+                  "keep waiting", flush=True)
             return PENDING
-        p = f["picks"][0]
-        m = p["number"]
-        if p["action"] == "integrate":
-            code = integrate_and_land(run, m, None, deadline, table)
-            if code:
-                return code
-            continue
-        procs[m], log = launch_implementer(run, spec, m, table)
-        print(f"started #{m}: implementer pid {procs[m].pid}, log {log}", flush=True)
+        beat.beat()
+        time.sleep(max(POLL_SECONDS, 0.1))
 
 
 # open, confirm, cleanup

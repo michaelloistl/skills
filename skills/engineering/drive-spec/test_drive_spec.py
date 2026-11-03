@@ -1152,6 +1152,7 @@ import json, os, re, subprocess, sys, time
 
 fix, wt = os.environ["FIX"], os.getcwd()
 m = re.fullmatch(r"issue-(\d+)", os.path.basename(wt)).group(1)
+proof = "proved it on the desktop" if os.path.exists(os.path.join(fix, f"proof-{m}")) else None
 mode_file = os.path.join(fix, f"mode-{m}")
 mode = open(mode_file).read().strip() if os.path.exists(mode_file) else "green"
 
@@ -1178,7 +1179,7 @@ def result(session, text):
 
 def block(sha, verdict, line):
     return "<report>" + json.dumps({"sha": sha, "verdict": verdict, "verdictLine": line, "deviations": [],
-                                    "unverified": [], "proof": None}) + "</report>"
+                                    "unverified": [], "proof": proof}) + "</report>"
 
 
 if "--resume" in sys.argv:
@@ -1193,7 +1194,8 @@ with open(os.path.join(fix, f"agent-{m}.json"), "w") as f:
 with open(os.path.join(fix, f"spawns-{m}"), "a") as f:
     f.write(f"{os.getpid()}\n")
 print(json.dumps({"type": "system", "subtype": "init", "session_id": f"sess-{m}"}), flush=True)
-while os.path.exists(os.path.join(fix, f"hold-{m}")) and not os.path.exists(os.path.join(fix, "go")):
+while os.path.exists(os.path.join(fix, f"hold-{m}")) and not any(
+        os.path.exists(os.path.join(fix, go)) for go in ("go", f"go-{m}")):
     time.sleep(0.05)
 die = os.path.join(fix, f"die-{m}")
 if os.path.exists(die):
@@ -1223,14 +1225,14 @@ if mode != "green" and mode != "bodied":
     result(f"sess-{m}", text or f"Built it.\n\n{block(sha, verdict, line)}")
     sys.exit(0)
 report = {"sha": sha, "verdict": "green", "verdictLine": line, "deviations": [f"kept the old flag for #{m}"],
-          "unverified": [f"the toast for #{m} shows only in a running app", "the second line"], "proof": None}
+          "unverified": [f"the toast for #{m} shows only in a running app", "the second line"], "proof": proof}
 print(json.dumps({"type": "result", "subtype": "success", "session_id": f"sess-{m}",
                   "result": f"Built #{m}.\n\n<report>{json.dumps(report)}</report>"}), flush=True)
 """
 
 
-class Build(Cli):
-    """`drive-spec build` drives a sequential run: start, an agent per slice, integrate, land, to done."""
+class BuildCase(Cli):
+    """`Cli` with the fake agent on the PATH as `claude`."""
 
     def setUp(self):
         super().setUp()
@@ -1238,6 +1240,20 @@ class Build(Cli):
         agent.write_text(f"#!{sys.executable}\n{FAKE_AGENT}")
         agent.chmod(0o755)
         self.env["DRIVE_SPEC"] = str(SCRIPT)
+
+    def spawns(self, m):
+        f = self.tmp / f"spawns-{m}"
+        return f.read_text().split() if f.exists() else []
+
+    def mode(self, m, mode):
+        (self.tmp / f"mode-{m}").write_text(mode)
+
+    def log(self, m):
+        return str(self.repo / ".git" / "drive-spec" / "spec-10" / "logs" / f"agent-{m}-implementer.log")
+
+
+class Build(BuildCase):
+    """`drive-spec build` drives a sequential run: start, an agent per slice, integrate, land, to done."""
 
     def agent(self, m):
         return json.loads((self.tmp / f"agent-{m}.json").read_text())
@@ -1294,10 +1310,6 @@ class Build(Cli):
         self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:work-12.txt"), "12")
         status = self.status_file()
         self.assertEqual((status["step"], status["agents"]), ("review", {}))
-
-    def spawns(self, m):
-        f = self.tmp / f"spawns-{m}"
-        return f.read_text().split() if f.exists() else []
 
     def agent_entry(self, m):
         for _ in range(400):
@@ -1360,9 +1372,6 @@ class Build(Cli):
         self.assertRegex(self.git(self.repo, "show", "origin/agent/local-spec-10-export:partial-11.txt"), r"^11 \d+$")
         self.assertEqual(self.gh_state()["issues"]["11"]["state"], "closed")
 
-    def mode(self, m, mode):
-        (self.tmp / f"mode-{m}").write_text(mode)
-
     def resumes(self, m):
         f = self.tmp / f"resumes-{m}"
         return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
@@ -1380,9 +1389,6 @@ class Build(Cli):
         st = self.status_file()
         self.assertEqual((st["state"], st["step"], st["agents"]), ("halted", "build", {}))
         return halted
-
-    def log(self, m):
-        return str(self.repo / ".git" / "drive-spec" / "spec-10" / "logs" / f"agent-{m}-implementer.log")
 
     def test_a_malformed_report_resumes_the_session_once_for_the_block(self):
         self.mode(11, "malformed")
@@ -1481,6 +1487,122 @@ class Build(Cli):
         self.assertIn("`no-such-agent`", out.stderr)
         self.assertEqual(out.stdout, "")
         self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").exists())
+
+
+class ParallelBuild(BuildCase):
+    """`drive-spec build` in parallel: an agent per frontier line, integration in finish order, the run's endings."""
+
+    def add_13(self, labels=()):
+        self.edit_state(lambda st: st["issues"].update(
+            {"13": self.issue(13, "Add the button", "## Parent\n\n#10\n", labels)}))
+
+    def finished(self, m):
+        """Wait until the slice's agent has written its response."""
+        for _ in range(600):
+            if '"type": "result"' in (Path(self.log(m)).read_text() if Path(self.log(m)).exists() else ""):
+                return
+            time.sleep(0.05)
+        self.fail(f"#{m}'s agent never finished")
+
+    def events(self, out):
+        return [re.sub(r" pid \d+, log .*", "", re.sub(r": green [0-9a-f]{12}.*", "", x)) for x in out.splitlines()]
+
+    def test_slices_finishing_out_of_order_integrate_in_finish_order(self):
+        self.add_13()
+        for m in (11, 13):
+            (self.tmp / f"hold-{m}").write_text("")
+        first = self.run_ds("build", "10", "--wait-minutes", "0.02")
+        self.assertEqual(first.returncode, 6, first.stdout + first.stderr)
+        self.assertEqual(self.events(first.stdout)[:2], ["started #11: implementer", "started #13: implementer"])
+        self.assertIn("running #11, #13: their implementers are still at work", first.stdout)
+        (self.tmp / "go-13").write_text("")
+        self.finished(13)
+        time.sleep(0.05)
+        (self.tmp / "go-11").write_text("")
+        self.finished(11)
+        out = self.run_ds("build", "10")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.events(out.stdout), [
+            "reported #11", "reported #13",
+            "integrated #13: merged #100", "landed #13",
+            "integrated #11: merged #102", "landed #11",
+            "started #12: implementer", "reported #12", "integrated #12: merged #103", "landed #12",
+            "stop: done"])
+        merged = sorted((p["merged_at"], p["head"]) for p in self.gh_state()["pulls"] if p["merged_at"])
+        self.assertEqual([h for _, h in merged][:3], ["agent/issue-13-add-the-button", "agent/issue-11-serializer",
+                                                      "agent/issue-12-wire-the-route"])
+        landed = [json.loads(x)["slice"] for x in
+                  (self.repo / ".git" / "drive-spec" / "spec-10" / "landed.jsonl").read_text().splitlines()]
+        self.assertEqual(landed, [13, 11, 12])
+        self.assertEqual([len(self.spawns(m)) for m in (11, 12, 13)], [1, 1, 1])
+
+    def test_sequential_keeps_it_to_one_agent(self):
+        self.add_13()
+        (self.tmp / "hold-11").write_text("")
+        out = self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02")
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertEqual(self.spawns(13), [])
+
+    def test_max_lands_that_many_then_finishes_at_the_ceiling(self):
+        self.add_13()
+        self.run_ds("gate", "10", GATE)
+        out = self.run_ds("build", "10", "--max", "1")
+        self.assertEqual(out.returncode, 7, out.stdout + out.stderr)
+        self.assertEqual(self.events(out.stdout), [
+            "started #11: implementer", "reported #11", "integrated #11: merged #100", "landed #11",
+            "stop: ceiling, 1 landed this run"])
+        self.assertEqual((self.spawns(12), self.spawns(13)), ([], []))
+        st = self.status_file()
+        self.assertEqual((st["state"], st["step"]), ("paused", "build"))
+        self.assertIn("drive-spec paused at maxSlices: 1 of 3 slices landed.", st["summary"])
+        self.assertTrue(self.comments(10)[-1].startswith("drive-spec paused at maxSlices"))
+
+    def test_an_integrate_line_is_queued_without_an_agent(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": HELD_GATE}))
+        out = self.run_ds("integrate", "10", "11", "--report", NONE, "--wait-minutes", "0.001")
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        wait_for_pid(self.tmp / "held.pid")
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("build", "10")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.events(out.stdout)[:3],
+                         ["queued #11: PR #100 is already open", "integrated #11: merged #100", "landed #11"])
+        self.assertNotIn("started #11", out.stdout)
+        self.assertEqual((self.spawns(11), len(self.spawns(12))), ([], 1))
+
+    def local_only(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"verify": GATE, "localOnly": {"label": "needs:desktop", "proof": "PROOF.md"}}))
+        self.edit_state(lambda st: st["issues"]["11"]["labels"].append("needs:desktop"))
+        self.add_13(["needs:desktop"])
+        for m in (11, 13):
+            (self.tmp / f"proof-{m}").write_text("")
+
+    def test_one_local_only_slice_at_a_time(self):
+        self.local_only()
+        (self.tmp / "hold-11").write_text("")
+        first = self.run_ds("build", "10", "--wait-minutes", "0.02")
+        self.assertEqual(first.returncode, 6, first.stdout + first.stderr)
+        self.assertEqual(self.events(first.stdout)[0], "started #11: implementer")
+        self.assertNotIn("#13", first.stdout)
+        self.assertEqual(self.spawns(13), [])
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("build", "10")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        events = self.events(out.stdout)
+        self.assertLess(events.index("landed #11"), events.index("started #13: implementer"))
+        self.assertEqual(len(self.spawns(13)), 1)
+
+    def test_a_cloud_session_starts_no_local_only_slice_and_finishes_held(self):
+        self.local_only()
+        self.env["CLAUDE_CODE_REMOTE"] = "true"
+        out = self.run_ds("build", "10")
+        self.assertEqual(out.returncode, 7, out.stdout + out.stderr)
+        self.assertEqual(out.stdout, "stop: held, only held slices and those they block remain: #11, #13\n")
+        self.assertEqual((self.spawns(11), self.spawns(12), self.spawns(13)), ([], [], []))
+        st = self.status_file()
+        self.assertEqual((st["state"], st["step"]), ("paused", "build"))
+        self.assertIn("only held slices remain (#11, #13)", st["summary"])
 
 
 class Report(unittest.TestCase):
