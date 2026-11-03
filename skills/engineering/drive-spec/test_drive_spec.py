@@ -1883,6 +1883,8 @@ class Finish(Cli):
         out = self.run_ds("finish", "10", "done")
         self.assertEqual(out.returncode, 2)
         self.assertIn("no `qa-pr done` comment on PR #101 names", out.stderr)
+        self.assertIn("`drive-spec qa 10`, then hand the prompt it prints to a QA subagent", out.stderr)
+        self.assertNotIn("/qa-pr", out.stderr)
         self.qa_done(failed=1)
         self.assertIn("failed", self.run_ds("finish", "10", "done").stderr)
 
@@ -2666,6 +2668,25 @@ class Boundaries(DispatcherCase):
                       "finding 5: a bug finding says not how it fails",
                       "finding 3: a judgement call recommends nothing"):
             self.assertIn(fault, err)
+
+    def test_an_earlier_round_is_not_sent_back(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(2, self.RULE)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "fix-2.txt", "x\n", "Fix round 2")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.round_(1, self.RULE, {"kind": "judgement", "path": "README", "line": 1, "finding": "Rename it."})
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue((self.notes() / "review" / "round-3.brief.md").exists())
 
     def test_a_round_is_read_against_the_head_it_reviewed(self):
         self.run_ds("gate", "10", GATE)
