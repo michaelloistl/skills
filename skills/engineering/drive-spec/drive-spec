@@ -2,8 +2,10 @@
 """drive-spec: the deterministic half of a drive-spec run. See README.md."""
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -1254,10 +1256,8 @@ def render_picks(f):
     return "\n".join(lines)
 
 
-def cmd_frontier(spec, running, sequential, max_slices, as_json):
-    run = Run(spec)
-    if inbox(run):
-        return INBOX
+def frontier(run, running, sequential, max_slices):
+    """`pick` on the run's plan, in its mode and under its ceiling; refuses a slice carrying `agent:blocked`."""
     plan = checked_plan(run)
     parallel, max_slices = run.mode(sequential, max_slices)
     f = pick(plan, running, parallel, max_slices, landed_this_run(run) if max_slices is not None else 0,
@@ -1269,6 +1269,14 @@ def cmd_frontier(spec, running, sequential, max_slices, as_json):
         # The last slice closed outside `land` (closed by hand, or on a resume): mark review begun here.
         run.status(step="review", state="running", summary=f"{progress_summary(plan)}; reviewing the spec branch",
                    next="drive-spec reviewed once a review raises nothing new")
+    return f
+
+
+def cmd_frontier(spec, running, sequential, max_slices, as_json):
+    run = Run(spec)
+    if inbox(run):
+        return INBOX
+    f = frontier(run, running, sequential, max_slices)
     print(json.dumps(f, indent=2) if as_json else render_picks(f))
     return 0
 
@@ -1337,8 +1345,8 @@ def brief(run, m, wt, base, continuing, local_only):
     return fill("IMPLEMENTER.md", {
         "path": wt, "m": m, "repo": run.repo, "spec": run.spec, "base": f"origin/{base}", "notes": run.notes,
         "skill dir": Path(__file__).resolve().parent, "label": local.get("label", ""),
-        "proof": local.get("proof", "")}, {
-        "continuing": continuing, "localOnly": local_only, "decided": (run.notes / "decisions.md").is_file(),
+        "proof": local.get("proof", ""), "report": "<report>"}, {
+        "continuing": continuing, "localOnly": local_only, "notLocalOnly": not local_only, "decided": (run.notes / "decisions.md").is_file(),
         "covered": bool(owned_requirements(run, m))})
 
 
@@ -1410,6 +1418,199 @@ def cmd_start(spec, m):
                        brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"]))
     print(f"next: an implementer subagent with the prompt `Read {path} and follow it.`")
     return 0
+
+
+# build
+
+# Claude Code in print mode, streaming JSON events to the log. It edits files and runs any Bash command unasked, and
+# denies anything else that would prompt: nobody is there to answer. `--allowedTools` takes a list, so it goes before
+# the other flags, never last, where it would swallow the prompt.
+DEFAULT_AGENT = ["claude", "-p", "--allowedTools", "Bash", "--verbose", "--output-format", "stream-json",
+                 "--permission-mode", "acceptEdits", "--permission-prompts", "none"]
+REPORT = re.compile(r"<report>(.*?)</report>\s*\Z", re.S)
+REPORT_TYPES = {"sha": str, "verdict": str, "verdictLine": str, "deviations": list, "unverified": list}
+
+
+def agent_argv(run):
+    argv = run.config.get("agent", DEFAULT_AGENT)
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv)):
+        raise Failed(".claude/drive-spec.json: `agent` is the agent command as an argv list of strings", REFUSE)
+    return argv
+
+
+def quietly(fn, *args):
+    """A command run in-process with its output held back, as `build` prints one line per slice event: shown when
+    the command fails or exits non-zero, so its reason is not lost."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = fn(*args)
+    except Failed:
+        sys.stderr.write(buf.getvalue())
+        raise
+    if code:
+        sys.stdout.write(buf.getvalue())
+    return code, buf.getvalue()
+
+
+def agents(run):
+    """The status file's `agents` map: slice number, as a string, to the agent running for it."""
+    return dict(run.current().get("agents") or {})
+
+
+def write_agents(run, table):
+    run.status(agents=json.dumps(table, sort_keys=True))
+
+
+def launch(run, m, role, wt, brief_path):
+    """The agent, detached in its own session in the slice worktree, stdin closed, its stream appended to its log."""
+    logs = run.notes / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"agent-{m}-{role}.log"
+    with open(log, "a") as out:
+        proc = subprocess.Popen([*agent_argv(run), f"Read {brief_path} and follow it."], cwd=wt,
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    return proc, log
+
+
+def stream(log):
+    """The JSON events of an agent's stream-json log, skipping any line that is not one."""
+    try:
+        lines = Path(log).read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            out.append(e)
+    return out
+
+
+def session_of(log):
+    """The session id of the agent's last run in its log, from its `system` `init` event."""
+    ids = [e.get("session_id") for e in stream(log) if e.get("type") == "system" and e.get("subtype") == "init"]
+    return next((x for x in reversed(ids) if x), None)
+
+
+def await_agent(run, m, proc, table):
+    """Wait for an agent this call launched, recording its session id once its stream names it, and keeping its
+    entry in the status file, which a concurrent write may have dropped."""
+    beat = Heartbeat(run)
+    entry = table[str(m)]
+    while proc.poll() is None:
+        if not entry.get("session_id"):
+            entry["session_id"] = session_of(entry["log"])
+        if run.current().get("agents") != table:
+            write_agents(run, table)
+        beat.beat()
+        time.sleep(max(POLL_SECONDS, 0.1))
+    entry["session_id"] = entry.get("session_id") or session_of(entry["log"])
+
+
+def parse_report(text, local_only, log):
+    """The `<report>{...}</report>` block that ends an implementer's response, checked for form."""
+    def bad(why):
+        return Failed(f"the implementer's report {why}; log {log}")
+
+    m = REPORT.search((text or "").rstrip())
+    if not m:
+        raise bad("is missing: no <report>{...}</report> block ends its response")
+    try:
+        rep = json.loads(m.group(1))
+    except ValueError as e:
+        raise bad(f"is not JSON ({e})")
+    if not isinstance(rep, dict):
+        raise bad("is not a JSON object")
+    missing = [k for k in (*REPORT_TYPES, "proof") if k not in rep]
+    if missing:
+        raise bad(f"has no {', '.join(missing)}")
+    for k, t in REPORT_TYPES.items():
+        if not isinstance(rep[k], t) or t is list and not all(isinstance(x, str) for x in rep[k]):
+            raise bad(f"has `{k}` of the wrong type: {'a list of strings' if t is list else 'a string'} expected")
+    if rep["verdict"] not in ("green", "red"):
+        raise bad(f"has verdict {rep['verdict']!r}: green or red expected")
+    if local_only and not (isinstance(rep["proof"], str) and rep["proof"].strip()):
+        raise bad("has no `proof`: this slice is proved locally, and the proof's result goes in it")
+    if not local_only and rep["proof"] is not None:
+        raise bad("has a `proof`: null expected, as this slice needs no local proof")
+    return rep
+
+
+def checked_report(run, m, wt, log):
+    """The implementer's report, parsed from its log, with its SHA the worktree's HEAD and its verdict the one
+    `drive-spec verify` recorded for that commit."""
+    results = [e for e in stream(log) if e.get("type") == "result"]
+    local = (run.config.get("localOnly") or {}).get("label")
+    labels = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "[.labels[].name]"))
+    rep = parse_report(results[-1].get("result") if results else None, bool(local) and local in labels, log)
+    head = git(wt, "rev-parse", "HEAD")
+    if len(rep["sha"]) < 7 or not head.startswith(rep["sha"]):
+        raise Failed(f"#{m}: the report names {rep['sha'][:12] or 'no SHA'}, but {wt} is at {head[:12]}; log {log}")
+    gate = run_gate_of(run)
+    rec = record(run, head)
+    recorded = "green" if green(run, head, gate) else "red" if rec.get("gate") == gate and rec.get("exit") else None
+    if recorded != rep["verdict"]:
+        raise Failed(f"#{m}: the report says {rep['verdict']} for {head[:12]}, but `drive-spec verify` recorded "
+                     f"{recorded or 'no verdict'} for it; log {log}")
+    return rep
+
+
+def report_text(rep):
+    """A validated report in the text form `integrate --report` reads: one list item per line, `none` when empty."""
+    lines = ["Deviations:", *(rep["deviations"] or ["none"]), "Unverified:", *(rep["unverified"] or ["none"])]
+    if rep.get("proof"):
+        lines += ["Proof:", rep["proof"]]
+    return "\n".join(lines)
+
+
+def cmd_build(spec, sequential, max_slices):
+    run = Run(spec)
+    argv = agent_argv(run)
+    if not shutil.which(argv[0]):
+        raise Failed(f"the agent command `{argv[0]}` is not on PATH: install it, or set `agent` in "
+                     ".claude/drive-spec.json", REFUSE)
+    while True:
+        table = agents(run)
+        f = frontier(run, [int(k) for k in table], sequential, max_slices)
+        if f["stop"] == "done":
+            print("stop: done")
+            return 0
+        if f["stop"]:
+            raise Failed(f"{render_picks(f)}: end the run with `drive-spec finish {spec} {f['stop']}`")
+        if not f["picks"]:
+            print(render_picks(f))
+            return PENDING
+        p = f["picks"][0]
+        m = p["number"]
+        report = None
+        if p["action"] != "integrate":
+            quietly(cmd_start, spec, m)
+            wt = run.root / f"issue-{m}"
+            proc, log = launch(run, m, "implementer", wt, run.notes / f"brief-{m}.md")
+            table[str(m)] = {"role": "implementer", "pid": proc.pid, "log": str(log), "session_id": None,
+                             "started_at": stamp()}
+            write_agents(run, table)
+            print(f"started #{m}: implementer pid {proc.pid}, log {log}", flush=True)
+            await_agent(run, m, proc, table)
+            write_agents(run, table)
+            rep = checked_report(run, m, wt, log)
+            print(f"reported #{m}: {rep['verdictLine']}", flush=True)
+            if rep["verdict"] != "green":
+                return RED
+            report = report_text(rep)
+        code, out = quietly(cmd_integrate, spec, m, report)
+        if code:
+            return code
+        merged = re.search(r"^merged (#\d+)", out, re.M)
+        print(f"integrated #{m}: merged {merged.group(1) if merged else 'its PR'}", flush=True)
+        quietly(cmd_land, spec, m)
+        table.pop(str(m), None)
+        write_agents(run, table)
+        print(f"landed #{m}", flush=True)
 
 
 # open, confirm, cleanup
@@ -2220,6 +2421,11 @@ def main():
     st = sub.add_parser("start", help="open a frontier slice's worktree, label it, print the implementer brief")
     st.add_argument("spec")
     st.add_argument("slice")
+    bu = sub.add_parser("build", help="step 6: start each frontier slice, run its implementer agent, integrate and "
+                                      "land it, until the frontier stops; exit 0 at done")
+    bu.add_argument("spec")
+    bu.add_argument("--sequential", action="store_true")
+    bu.add_argument("--max", type=int, dest="max_slices", help="maxSlices; default from .claude/drive-spec.json")
     h = sub.add_parser("halt", help="halt the run on a red slice: label, comment, status comment, status")
     h.add_argument("spec")
     h.add_argument("slice")
@@ -2312,6 +2518,8 @@ def main():
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
         elif args.cmd == "start":
             code = cmd_start(spec, int(args.slice.lstrip("#")))
+        elif args.cmd == "build":
+            code = cmd_build(spec, args.sequential, args.max_slices)
         elif args.cmd == "halt":
             code = cmd_halt(spec, int(args.slice.lstrip("#")), " ".join(args.why).rstrip("."))
         elif args.cmd == "finish":

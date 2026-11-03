@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: status.sh <spec> [key=value ...] | status.sh <spec> --inbox | status.sh <spec> --touch
+# Usage: status.sh <spec> [key=value ...] (agents=<JSON object>) | status.sh <spec> --inbox | status.sh <spec> --touch
 set -u
 
 spec=${1:-}
@@ -28,6 +28,10 @@ write() {
     case "$key" in
       step|state|summary|next|pr_url|branch|base|question) ;;
       question_blocking) value=$([ "$value" = true ] && echo true || echo false) ;;
+      agents)
+        updates=$(jq -c --argjson v "$value" '.agents = $v' <<<"$updates") ||
+          { echo "status.sh: agents is not JSON" >&2; return 1; }
+        continue ;;
       *) echo "status.sh: unknown key $key" >&2; continue ;;
     esac
     updates=$(jq -c --arg k "$key" --arg v "$value" \
