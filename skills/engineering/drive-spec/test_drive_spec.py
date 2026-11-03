@@ -213,6 +213,9 @@ def touch(n):
 
 
 out = None
+if "/".join(parts) in st.get("fail_once", []):
+    st["fail_once"].remove("/".join(parts))
+    die(f"HTTP 502 Bad Gateway ({path})")
 if method == "GET" and parts == []:
     out = {"default_branch": "main"}
 elif parts == ["issues"] and method == "GET":
@@ -1240,6 +1243,9 @@ if os.path.exists(die):
         os.remove(die)
     commit(f"partial-{m}.txt", f"Start #{m}")
     sys.exit(1)
+if mode == "red-ungated":
+    result(f"sess-{m}", f"I could not get the gate to run.\n\n{block(head(), 'red', 'red: the gate would not start')}")
+    sys.exit(0)
 if mode == "red":
     open("RED", "w").close()
 with open(f"work-{m}.txt", "w") as f:
@@ -1284,6 +1290,14 @@ class BuildCase(Cli):
 
     def log(self, m):
         return str(self.repo / ".git" / "drive-spec" / "spec-10" / "logs" / f"agent-{m}-implementer.log")
+
+    def finished(self, m):
+        """Wait until the slice's agent has written its response."""
+        for _ in range(600):
+            if '"type": "result"' in (Path(self.log(m)).read_text() if Path(self.log(m)).exists() else ""):
+                return
+            time.sleep(0.05)
+        self.fail(f"#{m}'s agent never finished")
 
 
 class Build(BuildCase):
@@ -1466,6 +1480,48 @@ class Build(BuildCase):
         self.assertRegex(halted, r"reported red: red [0-9a-f]{12}: exit 1; log ")
         self.assertEqual((self.resumes(11), self.gh_state()["pulls"]), ([], []))
 
+    def test_a_red_report_the_gate_never_recorded_halts_quoting_its_verdict_line(self):
+        self.mode(11, "red-ungated")
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertIn("reported #11: red: the gate would not start\n", out.stdout)
+        self.assert_halted(out, 11, "its implementer reported red: red: the gate would not start")
+        self.assertEqual((self.resumes(11), self.gh_state()["pulls"]), ([], []))
+
+    def test_a_failed_tracker_call_while_checking_a_report_fails_without_halting(self):
+        (self.tmp / "hold-11").write_text("")
+        self.assertEqual(self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02").returncode, 6)
+        (self.tmp / "go").write_text("")
+        self.finished(11)
+        self.edit_state(lambda st: st.update(fail_once=["issues/11"]))
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("HTTP 502 Bad Gateway", out.stderr)
+        self.assertNotIn("halted", out.stdout)
+        self.assertEqual((self.gh_state()["issues"]["11"]["labels"], self.comments(11)), (["agent:in-progress"], []))
+        self.assertEqual((self.status_file()["state"], list(self.status_file()["agents"])), ("running", ["11"]))
+        again = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(again.stdout.splitlines()[1:3], ["integrated #11: merged #100", "landed #11"])
+
+    def test_an_integrate_gate_outlasting_the_wait_points_at_build_again(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": (
+            'echo run >> "$COUNTER"; if [ -f SLOW ]; then while [ ! -f "$FIX/go-gate" ]; do sleep 0.05; done; fi; '
+            'test ! -f RED')}))
+        (self.tmp / "hold-11").write_text("")
+        self.assertEqual(self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02").returncode, 6)
+        (self.tmp / "go").write_text("")
+        self.finished(11)
+        self.advance_spec("SLOW", "")
+        out = self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.05")
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertNotIn("drive-spec integrate", out.stdout)
+        self.assertEqual(out.stdout.splitlines()[-1], f"integrating #11: a gate still runs in {self.wt}; run this same "
+                                                      "command again to keep waiting")
+        (self.tmp / "go-gate").write_text("")
+        done = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.splitlines()[:2], ["integrated #11: merged #100", "landed #11"])
+
     def test_a_report_sha_not_at_head_halts(self):
         self.mode(11, "behind")
         out = self.run_ds("build", "10", "--sequential")
@@ -1587,14 +1643,6 @@ class ParallelBuild(BuildCase):
     def add_13(self, labels=()):
         self.edit_state(lambda st: st["issues"].update(
             {"13": self.issue(13, "Add the button", "## Parent\n\n#10\n", labels)}))
-
-    def finished(self, m):
-        """Wait until the slice's agent has written its response."""
-        for _ in range(600):
-            if '"type": "result"' in (Path(self.log(m)).read_text() if Path(self.log(m)).exists() else ""):
-                return
-            time.sleep(0.05)
-        self.fail(f"#{m}'s agent never finished")
 
     def events(self, out):
         return [re.sub(r" pid \d+, log .*", "", re.sub(r": green [0-9a-f]{12}.*", "", x)) for x in out.splitlines()]

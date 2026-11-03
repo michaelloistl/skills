@@ -1520,6 +1520,10 @@ class BadReport(Failed):
     """A report missing or malformed: the agent is asked for it once more."""
 
 
+class Mismatch(Failed):
+    """A green report the worktree contradicts: its SHA not HEAD, or a verdict `drive-spec verify` never recorded."""
+
+
 def parse_report(text, local_only, log):
     """The `<report>{...}</report>` block that ends an implementer's response, checked for form."""
     def bad(why):
@@ -1550,20 +1554,22 @@ def parse_report(text, local_only, log):
 
 
 def checked_report(run, m, wt, log):
-    """The implementer's report, parsed from its log, with its SHA the worktree's HEAD and its verdict the one
-    `drive-spec verify` recorded for that commit."""
+    """The implementer's report, parsed from its log; a green one with its SHA the worktree's HEAD and green the
+    verdict `drive-spec verify` recorded for that commit. A red one halts the slice whatever the gate recorded."""
     results = [e for e in stream(log) if e.get("type") == "result"]
     local = (run.config.get("localOnly") or {}).get("label")
     labels = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "[.labels[].name]"))
     rep = parse_report(results[-1].get("result") if results else None, bool(local) and local in labels, log)
+    if rep["verdict"] != "green":
+        return rep
     head = git(wt, "rev-parse", "HEAD")
     if len(rep["sha"]) < 7 or not head.startswith(rep["sha"]):
-        raise Failed(f"#{m}: the report names {rep['sha'][:12] or 'no SHA'}, but {wt} is at {head[:12]}; log {log}")
+        raise Mismatch(f"#{m}: the report names {rep['sha'][:12] or 'no SHA'}, but {wt} is at {head[:12]}; log {log}")
     gate = run_gate_of(run)
     rec = record(run, head)
     recorded = "green" if green(run, head, gate) else "red" if rec.get("gate") == gate and rec.get("exit") else None
     if recorded != rep["verdict"]:
-        raise Failed(f"#{m}: the report says {rep['verdict']} for {head[:12]}, but `drive-spec verify` recorded "
+        raise Mismatch(f"#{m}: the report says {rep['verdict']} for {head[:12]}, but `drive-spec verify` recorded "
                      f"{recorded or 'no verdict'} for it; log {log}")
     return rep
 
@@ -1659,12 +1665,12 @@ def halt(run, table, m, why):
 
 def integrate_and_land(run, m, report, deadline, table, procs):
     """`integrate` the slice with what time is left, then `land` it once merged; integrate's exit code otherwise,
-    6 included: the next `build` runs integrate again, which picks up where it stopped. Red (4) and a refusal (2)
+    6 included, with a line of its own: the next `build` runs integrate again, which picks up where it stopped. Red (4) and a refusal (2)
     halt the slice with the reason integrate gave. A conflict (3) launches the slice's one merger, and returns 0
     with the slice out of the queue until the merger is done; a conflict after it halts the slice."""
     left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
     try:
-        code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED, CONFLICT))
+        code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED, CONFLICT, PENDING))
     except Failed as e:
         if e.code != REFUSE:
             raise
@@ -1678,6 +1684,9 @@ def integrate_and_land(run, m, report, deadline, table, procs):
             return halt(run, table, m, f"a second conflict after its merger: {files}")
         procs[m] = launch_merger(run, m, table, out)
         return CONFLICT
+    if code == PENDING:
+        print(f"integrating #{m}: a gate still runs in {run.root / f'issue-{m}'}; run this same command again to "
+              "keep waiting", flush=True)
     if code:
         return code
     merged = re.search(r"^merged (#\d+)", out, re.M)
@@ -1742,7 +1751,7 @@ def cmd_build(spec, sequential, max_slices, wait=None):
                 print(f"resumed #{m}: {e}; implementer pid {procs[m].pid}, asked for its report only", flush=True)
                 running.append(m)
                 continue
-            except Failed as e:
+            except Mismatch as e:
                 return halt(run, table, m, str(e))
             print(f"reported #{m}: {rep['verdictLine']}", flush=True)
             if rep["verdict"] != "green":

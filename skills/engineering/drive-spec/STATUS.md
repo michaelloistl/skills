@@ -10,7 +10,7 @@ One JSON file per spec, read by a dispatcher that watches every run on the machi
 
 ## When
 
-At every step boundary, and within step 6 at each agent launch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
+At every step boundary, and within step 6 at each agent launch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists. The one partial write is `build`'s `agents` map (Agents): it replaces the map alone, and every other key stays as the last full write left it.
 
 | Step in progress | Written by |
 |---|---|
@@ -54,7 +54,7 @@ While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes
 The map is how a `build` resumes another's work. On entry, and on each pass, `build` reads it and treats each entry by what it finds:
 
 - **Live.** The PID runs and its command still names the slice's brief (the merger's for a merger), so a reused PID is not mistaken for it: `build` adopts the agent and waits for it. It never launches a second agent on that slice.
-- **Reported.** A `report` key holds the validated report in `integrate`'s `--report` text form, and `finished_at` the last write to the agent's log: the slice waits for, or is part way through, `integrate`, which the next pass runs again. The queue is integrated one slice at a time in `finished_at` order, each landed before the next. The report is read once.
+- **Reported.** A `report` key holds the validated report in `integrate`'s `--report` text form, and `finished_at` the last write to the agent's log: the slice waits for, or is part way through, `integrate`, which the next pass runs again. The queue is integrated one slice at a time in `finished_at` order, each landed before the next. A merger still at work holds the queue, so the slices behind it keep their order. The report is read once.
 - **Finished, report missing or malformed.** `build` resumes the session once through `agentResume`, asking for the report block only: the entry gains `resumed: true`, with the new PID, and the resumed run appends to the same log. Still missing or malformed after that, the slice halts.
 - **Died.** The PID is gone and the log's last run has no `result` event: the agent ended without a response. `build` restarts it once, through `start` on the same worktree and branch, so its commits are kept and the brief says to carry on; the entry gains `restarts: 1`, with the new PID. A second death halts the slice.
 
