@@ -1350,6 +1350,11 @@ def brief(run, m, wt, base, continuing, local_only):
         "covered": bool(owned_requirements(run, m))})
 
 
+def merger_brief(run, m, wt, merge, files):
+    return fill("MERGER.md", {"path": wt, "m": m, "repo": run.repo, "spec": run.spec, "merge": merge,
+                              "files": ", ".join(files), "skill dir": Path(__file__).resolve().parent})
+
+
 def write_brief(run, name, text):
     run.notes.mkdir(parents=True, exist_ok=True)
     path = run.notes / name
@@ -1608,6 +1613,40 @@ def resume_for_report(run, m, entry, why):
     return proc
 
 
+def brief_path_of(run, m, entry):
+    """The brief an agent was prompted with: the merger's, or the implementer's."""
+    return run.notes / (f"brief-merge-{m}.md" if entry.get("role") == "merger" else f"brief-{m}.md")
+
+
+def launch_merger(run, m, table, out):
+    """The merger agent for a slice `integrate` found conflicting, from the MERGER brief, recorded in the `agents`
+    map in place of the slice's queue entry, which it keeps the finish time of."""
+    merge = re.search(r"`(git merge [0-9a-f]+)`", out).group(1)
+    files = re.search(r"^conflict merging .*?: (.*)$", out, re.M).group(1).split(", ")
+    wt = run.root / f"issue-{m}"
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = write_brief(run, f"brief-merge-{m}.md", merger_brief(run, m, wt, merge, files))
+    proc, log = launch(run, m, "merger", wt, path)
+    table[str(m)] = {"role": "merger", "pid": proc.pid, "log": str(log), "session_id": None, "started_at": stamp(),
+                     "target": merge.split()[-1], "finished_at": table.get(str(m), {}).get("finished_at")}
+    write_agents(run, table)
+    print(f"conflict #{m}: {', '.join(files)}; merger pid {proc.pid}, log {log}", flush=True)
+    return proc
+
+
+def unresolved(run, m, entry):
+    """Why the merger's slice worktree does not hold a finished merge of its target, or None when it does."""
+    wt = run.root / f"issue-{m}"
+    if Path(git(wt, "rev-parse", "--absolute-git-dir"), "MERGE_HEAD").exists():
+        return "a merge is in progress"
+    if dirty(wt):
+        return "it left uncommitted changes"
+    if subprocess.run(["git", "-C", str(wt), "merge-base", "--is-ancestor", entry["target"], "HEAD"],
+                      capture_output=True).returncode:
+        return f"HEAD does not contain {entry['target'][:12]}"
+    return None
+
+
 def halt(run, table, m, why):
     """The slice halted through `halt`, its agent dropped from the map: exit 4, as `build` ends the run there."""
     why = why.rstrip(".")
@@ -1618,13 +1657,14 @@ def halt(run, table, m, why):
     return RED
 
 
-def integrate_and_land(run, m, report, deadline, table):
+def integrate_and_land(run, m, report, deadline, table, procs):
     """`integrate` the slice with what time is left, then `land` it once merged; integrate's exit code otherwise,
     6 included: the next `build` runs integrate again, which picks up where it stopped. Red (4) and a refusal (2)
-    halt the slice with the reason integrate gave."""
+    halt the slice with the reason integrate gave. A conflict (3) launches the slice's one merger, and returns 0
+    with the slice out of the queue until the merger is done; a conflict after it halts the slice."""
     left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
     try:
-        code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED,))
+        code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED, CONFLICT))
     except Failed as e:
         if e.code != REFUSE:
             raise
@@ -1632,6 +1672,12 @@ def integrate_and_land(run, m, report, deadline, table):
     if code == RED:
         lines = out.strip().splitlines()
         return halt(run, table, m, f"integrate: {lines[-1] if lines else 'red on the spec branch'}")
+    if code == CONFLICT:
+        if table.get(str(m), {}).get("role") == "merger":
+            files = re.search(r"^conflict merging .*", out, re.M).group(0)
+            return halt(run, table, m, f"a second conflict after its merger: {files}")
+        procs[m] = launch_merger(run, m, table, out)
+        return CONFLICT
     if code:
         return code
     merged = re.search(r"^merged (#\d+)", out, re.M)
@@ -1662,12 +1708,20 @@ def cmd_build(spec, sequential, max_slices, wait=None):
             if "report" in entry:
                 continue
             proc = procs.get(m)
-            if proc.poll() is None if proc else adopted(entry, run.notes / f"brief-{m}.md"):
+            if proc.poll() is None if proc else adopted(entry, brief_path_of(run, m, entry)):
                 running.append(m)
                 if not entry.get("session_id"):
                     entry["session_id"] = session_of(log)
                 continue
             entry["session_id"] = entry.get("session_id") or session_of(log)
+            if entry.get("role") == "merger":
+                why = unresolved(run, m, entry)
+                if why:
+                    return halt(run, table, m, f"its merger exited without resolving the conflict: {why}; log {log}")
+                entry["report"] = None
+                write_agents(run, table)
+                print(f"resolved #{m}: its merger merged {entry['target'][:12]}", flush=True)
+                continue
             if died(log):
                 if entry.get("restarts"):
                     return halt(run, table, m, f"its implementer died again without a report; log {log}")
@@ -1699,9 +1753,12 @@ def cmd_build(spec, sequential, max_slices, wait=None):
             write_agents(run, table)
         queue = sorted((k for k, e in table.items() if "report" in e),
                        key=lambda k: table[k].get("finished_at") or table[k].get("started_at") or "")
-        if queue:
+        merging = any(e.get("role") == "merger" and "report" not in e for e in table.values())
+        if queue and not merging:  # a merger holds the queue, so the slices behind it keep their finish order
             m = int(queue[0])
-            code = integrate_and_land(run, m, table[queue[0]]["report"], deadline, table)
+            code = integrate_and_land(run, m, table[queue[0]]["report"], deadline, table, procs)
+            if code == CONFLICT:
+                continue
             if code:
                 return code
             table.pop(queue[0], None)
@@ -1737,7 +1794,9 @@ def cmd_build(spec, sequential, max_slices, wait=None):
             write_agents(run, table)
         if deadline is not None and time.monotonic() >= deadline:
             names = ", ".join(f"#{m}" for m in running)
-            who = "its implementer is" if len(running) == 1 else "their implementers are"
+            roles = {table.get(str(m), {}).get("role", "implementer") for m in running}
+            role = roles.pop() if len(roles) == 1 else "agent"
+            who = f"its {role} is" if len(running) == 1 else f"their {role}s are"
             print(f"running {names}: {who} still at work after {wait:g} minutes; run this same command again to "
                   "keep waiting", flush=True)
             return PENDING

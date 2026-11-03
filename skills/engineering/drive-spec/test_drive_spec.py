@@ -1060,6 +1060,13 @@ class Brief(unittest.TestCase):
         self.assertIn("`proof` is `null`.", b)
         self.assertNotRegex(b, r"<(?!report>)[a-z][a-z ]*>|<If ")
 
+    def test_merger_brief_fills_every_placeholder(self):
+        b = ds.merger_brief(self.run_({}), 12, Path("/w/issue-12"), "git merge abc123", ["a.txt", "b.txt"])
+        self.assertNotRegex(b, r"<[a-z][a-z ]*>|<If ")
+        for part in ["Worktree: /w/issue-12,", "gh api repos/acme/app/issues/12", "spec #10",
+                     "`git merge abc123`", "conflicted in: a.txt, b.txt", "drive-spec verify 10 /w/issue-12"]:
+            self.assertIn(part, b)
+
 
 class Frontier(Cli):
     def test_text(self):
@@ -1182,6 +1189,33 @@ def block(sha, verdict, line):
                                     "unverified": [], "proof": proof}) + "</report>"
 
 
+if "brief-merge-" in sys.argv[-1]:
+    with open(os.path.join(fix, f"merges-{m}"), "a") as f:
+        f.write(f"{os.getpid()}\n")
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": f"sess-merge-{m}"}), flush=True)
+    while os.path.exists(os.path.join(fix, f"hold-merge-{m}")) and not os.path.exists(os.path.join(fix, "go")):
+        time.sleep(0.05)
+    brief = open(re.fullmatch(r"Read (.*) and follow it\.", sys.argv[-1]).group(1)).read()
+    merge = re.search(r"`(git merge [0-9a-f]{40})`", brief).group(1)
+    how = open(os.path.join(fix, f"merger-{m}")).read().strip() if os.path.exists(os.path.join(fix, f"merger-{m}")) \
+        else "resolve"
+    subprocess.run(merge.split(), capture_output=True)
+    if how == "leave":
+        result(f"sess-merge-{m}", "I could not resolve a.txt.")
+        sys.exit(0)
+    with open("a.txt", "w") as f:
+        f.write("both\n")
+    subprocess.run(["git", "commit", "-q", "--no-edit", "-a"], check=True)
+    if how == "again":
+        other = os.path.join(fix, f"again-{m}")
+        subprocess.run(["git", "clone", "-q", "-b", "agent/local-spec-10-export",
+                        json.load(open(os.path.join(fix, "gh.json")))["origin"], other], check=True)
+        with open(os.path.join(other, "a.txt"), "w") as f:
+            f.write("again\n")
+        subprocess.run(["git", "-C", other, "commit", "-qam", "Change a.txt again"], check=True)
+        subprocess.run(["git", "-C", other, "push", "-q", "origin", "agent/local-spec-10-export"], check=True)
+    result(f"sess-merge-{m}", "Merged it.")
+    sys.exit(0)
 if "--resume" in sys.argv:
     session = sys.argv[sys.argv.index("--resume") + 1]
     with open(os.path.join(fix, f"resumes-{m}"), "a") as f:
@@ -1479,6 +1513,64 @@ class Build(BuildCase):
         brief = (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text()
         self.assertIn('<report>{"sha": ', brief)
         self.assertIn("the last thing in", brief)
+
+    def merges(self, m):
+        f = self.tmp / f"merges-{m}"
+        return f.read_text().split() if f.exists() else []
+
+    def test_a_conflict_goes_to_a_merger_then_integrates_and_lands(self):
+        self.advance_spec("a.txt", "theirs\n")
+        target = self.origin_sha("agent/local-spec-10-export")
+        (self.tmp / "hold-merge-11").write_text("")
+        proc = subprocess.Popen([str(SCRIPT), "build", "10", "--sequential"], cwd=self.repo, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        notes = self.repo / ".git" / "drive-spec" / "spec-10"
+        for _ in range(600):
+            entry = (self.status_file().get("agents") or {}).get("11") if (
+                self.repo / ".git" / "drive-spec" / "status" / "spec-10.json").exists() else None
+            if entry and entry.get("role") == "merger" and self.merges(11):
+                break
+            time.sleep(0.05)
+        else:
+            proc.kill()
+            self.fail(f"no merger recorded for #11: {proc.communicate()}")
+        self.assertEqual(entry["log"], str(notes / "logs" / "agent-11-merger.log"))
+        self.assertEqual(entry["pid"], int(self.merges(11)[0]))
+        brief = (notes / "brief-merge-11.md").read_text()
+        for part in [f"Worktree: {self.wt}", f"`git merge {target}`", "conflicted in: a.txt",
+                     f"drive-spec verify 10 {self.wt} --wait-minutes 9", "gh api repos/"]:
+            self.assertIn(part, brief)
+        self.assertNotRegex(brief, r"<[a-z][a-z ]*>|<If ")
+        (self.tmp / "go").write_text("")
+        out, err = proc.communicate(timeout=120)
+        self.assertEqual(proc.returncode, 0, out + err)
+        lines = [re.sub(r" pid \d+", " pid N", x) for x in out.splitlines()]
+        self.assertEqual(lines[2:6], [
+            f"conflict #11: a.txt; merger pid N, log {notes / 'logs' / 'agent-11-merger.log'}",
+            f"resolved #11: its merger merged {target[:12]}",
+            "integrated #11: merged #100", "landed #11"])
+        self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:a.txt"), "both")
+        self.assertEqual((len(self.spawns(11)), len(self.merges(11))), (1, 1))
+        self.assertEqual(self.gh_state()["issues"]["11"]["state"], "closed")
+
+    def test_a_merger_that_leaves_the_conflict_halts(self):
+        self.advance_spec("a.txt", "theirs\n")
+        (self.tmp / "merger-11").write_text("leave")
+        out = self.run_ds("build", "10", "--sequential")
+        log = str(self.repo / ".git" / "drive-spec" / "spec-10" / "logs" / "agent-11-merger.log")
+        self.assert_halted(out, 11, "its merger exited without resolving the conflict", "a merge is in progress",
+                           f"log {log}")
+        self.assertEqual(len(self.merges(11)), 1)
+        self.assertEqual([p["state"] for p in self.gh_state()["pulls"]], ["open"])
+
+    def test_a_second_conflict_after_the_merger_halts(self):
+        self.advance_spec("a.txt", "theirs\n")
+        (self.tmp / "merger-11").write_text("again")
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertIn("resolved #11", out.stdout)
+        self.assert_halted(out, 11, "a second conflict after its merger", "a.txt")
+        self.assertEqual(len(self.merges(11)), 1)
+        self.assertEqual([p["state"] for p in self.gh_state()["pulls"]], ["open"])
 
     def test_missing_agent_refused_before_any_slice_starts(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "agent": ["no-such-agent", "-p"]}))
