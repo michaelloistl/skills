@@ -2523,6 +2523,20 @@ class Boundaries(DispatcherCase):
         out = self.run_ds("settle", "10", *(["--change", ",".join(change)] if change else []))
         self.assertEqual(out.returncode, 0, out.stderr)
 
+    def test_a_review_between_answered_and_settle_keeps_the_answer(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.CALL)
+        self.run_ds("review", "10")
+        self.run_ds("ask", "10", (self.notes() / "review" / "round-1.left.md").read_text())
+        self.run_ds("answered", "10", "keep it")
+        self.assertEqual(self.run_ds("review", "10").returncode, 0)
+        out = self.run_ds("settle", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round 1: keep L1", out.stdout)
+
     def test_a_judgement_call_the_operator_changes_goes_to_a_fixer_then_a_new_round(self):
         call_2 = dict(self.CALL, finding="Split ExportJob.", recommend="Split it in two.")
         self.run_ds("gate", "10", GATE)

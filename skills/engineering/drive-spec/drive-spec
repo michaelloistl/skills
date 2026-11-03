@@ -2233,10 +2233,11 @@ def cmd_review(spec):
             settled = settlement(run, k)
             if settled is None:
                 question = round_file(run, k, "left.md")
-                question.write_text("Review left these judgement calls. For each: change or keep? (\"as recommended\" "
-                                    "takes each recommendation.)\n" + "\n".join(
-                                        f"L{n} {where(x)}: {flat(x['finding'])} Recommend: {flat(x['recommend'])}"
-                                        for n, x in enumerate(judgement_calls(data), 1)) + "\n")
+                if not question.is_file():
+                    question.write_text("Review left these judgement calls. For each: change or keep? (\"as "
+                                        "recommended\" takes each recommendation.)\n" + "\n".join(
+                                            f"L{n} {where(x)}: {flat(x['finding'])} Recommend: {flat(x['recommend'])}"
+                                            for n, x in enumerate(judgement_calls(data), 1)) + "\n")
                 run.status(step="review", state="running", summary=f"review round {k}: {calls} judgement call(s) "
                            "for the operator", next=f"drive-spec ask {spec}, then drive-spec settle {spec}",
                            branch=plan["spec_branch"])

@@ -37,5 +37,5 @@ A review finding that cites no written rule and shows no failure: a matter of ta
 _Avoid_: nit, suggestion, soft finding
 
 **Left list**:
-The judgement calls from a spec's last review round, each settled by the operator as **change** (fixed before QA) or **keep** (stays on the PR as decided).
+The judgement calls a spec's review rounds leave for the operator, each settled as **change** (fixed before QA) or **keep**; the kept calls across every round reach the spec PR as `Left from review:`.
 _Avoid_: open items, leftovers, "left from review" as a noun
