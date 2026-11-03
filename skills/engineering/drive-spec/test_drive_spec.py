@@ -1154,9 +1154,18 @@ fix, wt = os.environ["FIX"], os.getcwd()
 m = re.fullmatch(r"issue-(\d+)", os.path.basename(wt)).group(1)
 with open(os.path.join(fix, f"agent-{m}.json"), "w") as f:
     json.dump({"argv": sys.argv[1:], "stdin": sys.stdin.read(), "detached": os.getsid(0) == os.getpid()}, f)
+with open(os.path.join(fix, f"spawns-{m}"), "a") as f:
+    f.write(f"{os.getpid()}\n")
 print(json.dumps({"type": "system", "subtype": "init", "session_id": f"sess-{m}"}), flush=True)
 while os.path.exists(os.path.join(fix, f"hold-{m}")) and not os.path.exists(os.path.join(fix, "go")):
     time.sleep(0.05)
+if os.path.exists(os.path.join(fix, f"die-{m}")):
+    os.remove(os.path.join(fix, f"die-{m}"))
+    with open(f"partial-{m}.txt", "w") as f:
+        f.write(m + "\n")
+    subprocess.run(["git", "add", "-A"], check=True)
+    subprocess.run(["git", "commit", "-q", "-m", f"Start #{m}"], check=True)
+    sys.exit(1)
 with open(f"work-{m}.txt", "w") as f:
     f.write(m + "\n")
 subprocess.run(["git", "add", "-A"], check=True)
@@ -1236,6 +1245,81 @@ class Build(Cli):
         self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:work-12.txt"), "12")
         status = self.status_file()
         self.assertEqual((status["step"], status["agents"]), ("review", {}))
+
+    def spawns(self, m):
+        f = self.tmp / f"spawns-{m}"
+        return f.read_text().split() if f.exists() else []
+
+    def agent_entry(self, m):
+        for _ in range(400):
+            f = self.repo / ".git" / "drive-spec" / "status" / "spec-10.json"
+            entry = (self.status_file().get("agents") or {}).get(str(m)) if f.exists() else None
+            if entry and self.spawns(m):
+                return entry
+            time.sleep(0.05)
+        self.fail(f"no agent recorded for #{m}")
+
+    def test_wait_minutes_returns_6_then_a_second_build_adopts(self):
+        (self.tmp / "hold-11").write_text("")
+        out = self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02")
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertRegex(out.stdout, r"\Astarted #11: implementer pid \d+, log .*\n")
+        self.assertIn("running #11: its implementer is still at work after 0.02 minutes; run this same command "
+                      "again to keep waiting", out.stdout)
+        pid = self.agent_entry(11)["pid"]
+        os.kill(pid, 0)
+        again = self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02")
+        self.assertEqual(again.returncode, 6, again.stdout + again.stderr)
+        self.assertNotIn("started", again.stdout)
+        self.assertEqual((self.spawns(11), self.status_file()["agents"]["11"]["pid"]), ([str(pid)], pid))
+        (self.tmp / "go").write_text("")
+        done = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.splitlines()[:3],
+                         [f"reported #11: {self.agent_report_line(11)}", "integrated #11: merged #100", "landed #11"])
+        self.assertEqual((self.spawns(11), len(self.spawns(12))), ([str(pid)], 1))
+        self.assertEqual(self.gh_state()["issues"]["11"]["state"], "closed")
+
+    def agent_report_line(self, m):
+        log = self.repo / ".git" / "drive-spec" / "spec-10" / "logs" / f"agent-{m}-implementer.log"
+        result = [json.loads(x) for x in log.read_text().splitlines() if '"result"' in x][-1]["result"]
+        return json.loads(re.search(r"<report>(.*)</report>", result).group(1))["verdictLine"]
+
+    def test_a_stopped_build_leaves_its_agent_running_for_the_next(self):
+        (self.tmp / "hold-11").write_text("")
+        proc = subprocess.Popen([str(SCRIPT), "build", "10", "--sequential"], cwd=self.repo, env=self.env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pid = self.agent_entry(11)["pid"]
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=30)
+        os.kill(pid, 0)
+        self.assertEqual(self.status_file()["agents"]["11"]["pid"], pid)
+        again = self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02")
+        self.assertEqual(again.returncode, 6, again.stdout + again.stderr)
+        self.assertNotIn("started", again.stdout)
+        self.assertEqual(self.spawns(11), [str(pid)])
+
+    def test_a_dead_agent_is_restarted_once_on_its_branch(self):
+        (self.tmp / "die-11").write_text("")
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertRegex(lines[0], r"^started #11: implementer pid \d+")
+        self.assertRegex(lines[1], r"^restarted #11: its implementer died without a report; implementer pid \d+")
+        self.assertEqual(len(self.spawns(11)), 2)
+        self.assertIn("carry on", (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text())
+        self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:partial-11.txt"), "11")
+        self.assertEqual(self.gh_state()["issues"]["11"]["state"], "closed")
+
+    def test_inbox_notes_stop_it_before_anything_starts(self):
+        status = self.repo / ".git" / "drive-spec" / "status"
+        status.mkdir(parents=True, exist_ok=True)
+        (status / "spec-10.inbox.md").write_text("## main advanced: #5\nOverlaps your branch: none\n")
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(out.returncode, 5, out.stdout + out.stderr)
+        self.assertIn("main advanced: #5", out.stdout)
+        self.assertEqual(self.spawns(11), [])
+        self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").exists())
 
     def test_brief_asks_for_the_report_block(self):
         self.assertEqual(self.run_ds("start", "10", "11").returncode, 0)
@@ -2093,7 +2177,7 @@ class Boundaries(DispatcherCase):
         self.assertIn("the operator's answer to: Public or sign-in?", nxt())
         self.run_ds("answered", "10", "public")
         self.close_all()
-        self.assertEqual(nxt(), "step: build\nnext: `drive-spec frontier 10`\n")
+        self.assertEqual(nxt(), "step: build\nnext: `drive-spec build 10 --wait-minutes 9`\n")
         self.run_ds("frontier", "10")
         self.assertEqual(nxt(), "step: review\nnext: `drive-spec review 10`\n")
 
