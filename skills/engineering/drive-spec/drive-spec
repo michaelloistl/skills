@@ -2228,7 +2228,7 @@ def cmd_review(spec):
             return 0
         cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
         answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
-        before = len(to_fix(read_round(run, k - 1, wt)["findings"])) if k > 1 else None
+        before = len(to_fix(json.loads(round_file(run, k - 1, "json").read_text())["findings"])) if k > 1 else None
         shrinking = before is not None and len(rules) < before
         if k >= cap and rules and not answered and not shrinking:
             than = f", no fewer than round {k - 1}" if before is not None else ""
@@ -2537,7 +2537,7 @@ def qa_passed(run, spec_pr):
                 if b.startswith(f"qa-pr done at {head}:")]
     if not verdicts:
         raise Failed(f"not done: no `qa-pr done` comment on PR #{n} names {head}: `drive-spec qa {run.spec}`, "
-                     f"then `/qa-pr {n}`", REFUSE)
+                     "then hand the prompt it prints to a QA subagent", REFUSE)
     if not re.search(r"\b0 failed\b", verdicts[-1]):
         raise Failed(f"not done: {verdicts[-1]} Halt the run on the failed scenarios", REFUSE)
 
@@ -2693,7 +2693,7 @@ def main():
     rv.add_argument("--left", help="more for the left list, beyond the last round's judgement calls; `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
-    qa = sub.add_parser("qa", help="step 11: mark QA of the spec PR begun and print the /qa-pr command")
+    qa = sub.add_parser("qa", help="step 11: mark QA of the spec PR begun and print the QA subagent's prompt")
     qa.add_argument("spec")
     ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
     ak.add_argument("spec")
