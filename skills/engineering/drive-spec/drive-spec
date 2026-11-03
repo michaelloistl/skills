@@ -1575,8 +1575,11 @@ def checked_report(run, m, wt, log):
 
 
 def report_text(rep):
-    """A validated report in the text form `integrate --report` reads: one list item per line, `none` when empty."""
-    lines = ["Deviations:", *(rep["deviations"] or ["none"]), "Unverified:", *(rep["unverified"] or ["none"])]
+    """A validated report in the text form `integrate --report` reads: one `- ` bullet per list item, so the PR body
+    renders each as its own, `none` when empty."""
+    def items(xs):
+        return [x if x.startswith("- ") else f"- {x}" for x in xs] or ["none"]
+    lines = ["Deviations:", *items(rep["deviations"]), "Unverified:", *items(rep["unverified"])]
     if rep.get("proof"):
         lines += ["Proof:", rep["proof"]]
     return "\n".join(lines)
@@ -1654,11 +1657,12 @@ def unresolved(run, m, entry):
 
 
 def halt(run, table, m, why):
-    """The slice halted through `halt`, its agent dropped from the map: exit 4, as `build` ends the run there."""
+    """The slice halted through `halt`, then its agent dropped from the map: exit 4, as `build` ends the run there.
+    A failed `halt` leaves the entry, so the next `build` comes to the same halt."""
     why = why.rstrip(".")
+    quietly(cmd_halt, run.spec, m, why)
     table.pop(str(m), None)
     write_agents(run, table)
-    quietly(cmd_halt, run.spec, m, why)
     print(f"halted #{m}: {why}", flush=True)
     return RED
 
@@ -1667,7 +1671,22 @@ def integrate_and_land(run, m, report, deadline, table, procs):
     """`integrate` the slice with what time is left, then `land` it once merged; integrate's exit code otherwise,
     6 included, with a line of its own: the next `build` runs integrate again, which picks up where it stopped. Red (4) and a refusal (2)
     halt the slice with the reason integrate gave. A conflict (3) launches the slice's one merger, and returns 0
-    with the slice out of the queue until the merger is done; a conflict after it halts the slice."""
+    with the slice out of the queue until the merger is done; a conflict after it halts the slice. The entry is
+    marked `merged` before `land`, so a `land` that fails is run again alone, not integrate."""
+    entry = table[str(m)]
+    if not entry.get("merged"):
+        code = integrate_slice(run, m, report, deadline, table, procs)
+        if code:
+            return code
+        entry["merged"] = True
+        write_agents(run, table)
+    quietly(cmd_land, run.spec, m)
+    print(f"landed #{m}", flush=True)
+    return 0
+
+
+def integrate_slice(run, m, report, deadline, table, procs):
+    """`integrate_and_land`'s integrate half: 0 once the slice PR merged."""
     left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
     try:
         code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED, CONFLICT, PENDING))
@@ -1691,8 +1710,6 @@ def integrate_and_land(run, m, report, deadline, table, procs):
         return code
     merged = re.search(r"^merged (#\d+)", out, re.M)
     print(f"integrated #{m}: merged {merged.group(1) if merged else 'its PR'}", flush=True)
-    quietly(cmd_land, run.spec, m)
-    print(f"landed #{m}", flush=True)
     return 0
 
 
@@ -1703,6 +1720,12 @@ def cmd_build(spec, sequential, max_slices, wait=None):
     if not shutil.which(argv[0]):
         raise Failed(f"the agent command `{argv[0]}` is not on PATH: install it, or set `agent` in "
                      ".claude/drive-spec.json", REFUSE)
+    run.notes.mkdir(parents=True, exist_ok=True)
+    lock = open(run.notes / "build.lock", "w")  # held to the call's end; not inherited by the agents it launches
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Failed(f"another `drive-spec build {spec}` is running: one build per spec at a time", REFUSE)
     deadline = None if wait is None else time.monotonic() + wait * 60
     beat = Heartbeat(run)
     procs = {}  # the agents this call launched: polled, as `alive` reads an unwaited child as running

@@ -1353,8 +1353,8 @@ class Build(BuildCase):
         self.assertEqual([(p["head"], p["state"]) for p in slice_prs],
                          [("agent/issue-11-serializer", "closed"), ("agent/issue-12-wire-the-route", "closed")])
         for m, p in zip((11, 12), slice_prs):
-            self.assertIn(f"\n\nUnverified:\nthe toast for #{m} shows only in a running app\nthe second line\n\n"
-                          f"Deviations:\nkept the old flag for #{m}", p["body"])
+            self.assertIn(f"\n\nUnverified:\n- the toast for #{m} shows only in a running app\n- the second line\n\n"
+                          f"Deviations:\n- kept the old flag for #{m}", p["body"])
         self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:work-12.txt"), "12")
         status = self.status_file()
         self.assertEqual((status["step"], status["agents"]), ("review", {}))
@@ -1522,6 +1522,46 @@ class Build(BuildCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(done.stdout.splitlines()[:2], ["integrated #11: merged #100", "landed #11"])
 
+    def test_a_failed_halt_keeps_the_slice_in_the_map_for_the_next_build(self):
+        self.mode(11, "red")
+        (self.tmp / "hold-11").write_text("")
+        self.assertEqual(self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02").returncode, 6)
+        (self.tmp / "go").write_text("")
+        self.finished(11)
+        self.edit_state(lambda st: st.update(fail_once=["issues/11/labels"]))
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertEqual(list(self.status_file()["agents"]), ["11"])
+        again = self.run_ds("build", "10", "--sequential")
+        self.assert_halted(again, 11, "its implementer reported red")
+        self.assertEqual(len(self.spawns(11)), 1)
+
+    def test_a_failed_land_runs_only_land_on_the_next_build(self):
+        (self.tmp / "hold-11").write_text("")
+        self.assertEqual(self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02").returncode, 6)
+        (self.tmp / "go").write_text("")
+        self.finished(11)
+        self.edit_state(lambda st: st.update(fail_once=["issues/11/comments"]))
+        out = self.run_ds("build", "10", "--sequential", "--wait-minutes", "0.02")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("integrated #11: merged #100", out.stdout)
+        self.assertTrue(self.status_file()["agents"]["11"]["merged"])
+        again = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(again.stdout.splitlines()[0], "landed #11")
+        self.assertEqual(len([p for p in self.gh_state()["pulls"] if p["head"].startswith("agent/issue-11-")]), 1)
+        self.assertEqual(self.gh_state()["issues"]["11"]["state"], "closed")
+
+    def test_a_second_build_on_the_spec_refuses_while_one_runs(self):
+        notes = self.repo / ".git" / "drive-spec" / "spec-10"
+        notes.mkdir(parents=True, exist_ok=True)
+        with open(notes / "build.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            out = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("another `drive-spec build 10` is running", out.stderr)
+        self.assertEqual(self.spawns(11), [])
+
     def test_a_report_sha_not_at_head_halts(self):
         self.mode(11, "behind")
         out = self.run_ds("build", "10", "--sequential")
@@ -1635,6 +1675,28 @@ class Build(BuildCase):
         self.assertIn("`no-such-agent`", out.stderr)
         self.assertEqual(out.stdout, "")
         self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").exists())
+
+
+class StatusLock(unittest.TestCase):
+    """`status.sh` read-modify-writes the status file under a lock, so concurrent writes never put back an old map."""
+
+    setUp, write = PaneRecord.setUp, PaneRecord.write
+
+    def test_a_write_waits_for_the_lock(self):
+        self.write()
+        status = self.repo / ".git" / "drive-spec" / "status"
+        with open(status / ".spec-10.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for args in (["step=review"], ["--touch"]):
+                proc = subprocess.Popen([str(SCRIPT.with_name("status.sh")), "10", *args], cwd=self.repo,
+                                        env=self.env)
+                time.sleep(0.5)
+                self.assertIsNone(proc.poll(), args)
+                self.assertEqual(json.loads((status / "spec-10.json").read_text())["step"], "build")
+                self.procs = getattr(self, "procs", []) + [proc]
+        for proc in self.procs:
+            self.assertEqual(proc.wait(timeout=30), 0)
+        self.assertEqual(json.loads((status / "spec-10.json").read_text())["step"], "review")
 
 
 class ParallelBuild(BuildCase):
@@ -1758,8 +1820,8 @@ class Report(unittest.TestCase):
         self.assertEqual(self.parse(f"done\n<report>{json.dumps(self.GOOD)}</report>\n"), self.GOOD)
 
     def test_text_form_for_integrate(self):
-        self.assertEqual(ds.report_text(dict(self.GOOD, deviations=["a", "b"])),
-                         "Deviations:\na\nb\nUnverified:\nx")
+        self.assertEqual(ds.report_text(dict(self.GOOD, deviations=["a", "- b"])),
+                         "Deviations:\n- a\n- b\nUnverified:\n- x")
         self.assertEqual(ds.report_text(dict(self.GOOD, unverified=[], proof="ran it")),
                          "Deviations:\nnone\nUnverified:\nnone\nProof:\nran it")
 

@@ -6,6 +6,20 @@ spec=${1:-}
 [ -n "$spec" ] || exit 0
 shift
 
+# A write and the --touch heartbeat each read, rewrite and rename the file: run them one at a time per spec,
+# so one never puts back what another just wrote. Re-runs this script holding an flock on .spec-<spec>.lock.
+if [ "${1:-}" != --inbox ] && [ -z "${DRIVE_SPEC_STATUS_LOCKED:-}" ] && command -v python3 >/dev/null; then
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    mkdir -p "$common/drive-spec/status" &&
+    DRIVE_SPEC_STATUS_LOCKED=1 exec python3 -c '
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.set_inheritable(fd, True)
+os.execv(sys.argv[2], sys.argv[2:])
+' "$common/drive-spec/status/.spec-$spec.lock" "$BASH" "$0" "$spec" "$@"
+fi
+
 write() {
   command -v jq >/dev/null || return 1
   local common dir file tmp now args
