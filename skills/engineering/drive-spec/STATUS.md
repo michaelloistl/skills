@@ -51,6 +51,14 @@ While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes
 
 `role` is `implementer`. `pid` is the agent's process, detached in a session of its own. `log` is its stream, appended to on each launch: watch it to follow the slice live. `session_id` is the agent's session, read from the stream once it names it, `null` until then. `started_at` is when `build` launched it. `build` writes the whole map with `status.sh <spec> agents='<JSON>'`, and writes it again while it waits if another write dropped it.
 
+The map is how a `build` resumes another's work. On entry, and on each pass, `build` reads it and treats each entry by what it finds:
+
+- **Live.** The PID runs and its command still names the slice's brief, so a reused PID is not mistaken for it: `build` adopts the agent and waits for it. It never launches a second agent on that slice.
+- **Reported.** A `report` key holds the validated report in `integrate`'s `--report` text form: the slice waits for, or is part way through, `integrate`, which the next pass runs again. The report is read once.
+- **Died.** The PID is gone and the log's last run has no `result` event: the agent ended without a response. `build` restarts it once, through `start` on the same worktree and branch, so its commits are kept and the brief says to carry on; the entry gains `restarts: 1`, with the new PID. A second death fails the slice.
+
+`build --wait-minutes N` returns exit 6 once N minutes pass with an agent still running, leaving the map as it is; so does a `build` stopped by a signal or a session ending. The next `build` adopts what it finds.
+
 ## Questions
 
 When the run needs the operator's decision to go on, ask it and end the turn:
@@ -71,7 +79,7 @@ A judgement call the run made on its own and the operator may want to revisit is
 
 ## Inbox
 
-The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step, and only once the spec branch exists: the end of `drive-spec open` (step 3), then the start of `preview`, `frontier` (before every pick, and before step 7), `integrate`, `confirm` and `cleanup`. Each reads it itself: with notes waiting, it prints them and exits 5, and runs again once the notes are handled. Notes that arrive before step 3 wait in the inbox for `open`; notes that arrive during steps 10 and 11 stay unread; once the run is `done`, the dispatcher stops writing notes and alerts the operator itself when base touches files the draft PR changes (from `branch`).
+The dispatcher leaves notes for the run in an inbox beside the status file. The run reads it at a **boundary** only, never mid-step, and only once the spec branch exists: the end of `drive-spec open` (step 3), then the start of `preview`, `frontier` (before every pick, and before step 7), each pass of `build`, `integrate`, `confirm` and `cleanup`. Each reads it itself: with notes waiting, it prints them and exits 5, and runs again once the notes are handled. Notes that arrive before step 3 wait in the inbox for `open`; notes that arrive during steps 10 and 11 stay unread; once the run is `done`, the dispatcher stops writing notes and alerts the operator itself when base touches files the draft PR changes (from `branch`).
 
 ```sh
 <skill dir>/status.sh <spec> --inbox

@@ -1496,21 +1496,6 @@ def session_of(log):
     return next((x for x in reversed(ids) if x), None)
 
 
-def await_agent(run, m, proc, table):
-    """Wait for an agent this call launched, recording its session id once its stream names it, and keeping its
-    entry in the status file, which a concurrent write may have dropped."""
-    beat = Heartbeat(run)
-    entry = table[str(m)]
-    while proc.poll() is None:
-        if not entry.get("session_id"):
-            entry["session_id"] = session_of(entry["log"])
-        if run.current().get("agents") != table:
-            write_agents(run, table)
-        beat.beat()
-        time.sleep(max(POLL_SECONDS, 0.1))
-    entry["session_id"] = entry.get("session_id") or session_of(entry["log"])
-
-
 def parse_report(text, local_only, log):
     """The `<report>{...}</report>` block that ends an implementer's response, checked for form."""
     def bad(why):
@@ -1567,14 +1552,106 @@ def report_text(rep):
     return "\n".join(lines)
 
 
-def cmd_build(spec, sequential, max_slices):
+def adopted(entry, brief_path):
+    """Whether an agent an earlier `build` launched still runs: its PID alive, and still the agent, whose command
+    names its brief, not a later process that reused the PID."""
+    pid = entry.get("pid")
+    if not isinstance(pid, int) or not alive(pid):
+        return False
+    proc = process_tree(cwds=False).get(pid)
+    return bool(proc) and proc[1] not in "ZX" and str(brief_path) in proc[3]
+
+
+def died(log):
+    """Whether the agent's last run in its log ended without a response: no `result` event after its last `init`."""
+    events = stream(log)
+    inits = [i for i, e in enumerate(events) if e.get("type") == "system" and e.get("subtype") == "init"]
+    return not any(e.get("type") == "result" for e in events[(inits[-1] if inits else 0):])
+
+
+def launch_implementer(run, spec, m, table, restarts=0):
+    """`start` the slice, then its implementer agent, recorded in the `agents` map."""
+    quietly(cmd_start, spec, m)
+    proc, log = launch(run, m, "implementer", run.root / f"issue-{m}", run.notes / f"brief-{m}.md")
+    table[str(m)] = {"role": "implementer", "pid": proc.pid, "log": str(log), "session_id": None,
+                     "started_at": stamp(), **({"restarts": restarts} if restarts else {})}
+    write_agents(run, table)
+    return proc, log
+
+
+def integrate_and_land(run, m, report, deadline):
+    """`integrate` the slice with what time is left, then `land` it once merged; integrate's exit code otherwise,
+    6 included: the next `build` runs integrate again, which picks up where it stopped."""
+    left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
+    code, out = quietly(cmd_integrate, run.spec, m, report, left)
+    if code:
+        return code
+    merged = re.search(r"^merged (#\d+)", out, re.M)
+    print(f"integrated #{m}: merged {merged.group(1) if merged else 'its PR'}", flush=True)
+    quietly(cmd_land, run.spec, m)
+    print(f"landed #{m}", flush=True)
+    return 0
+
+
+def cmd_build(spec, sequential, max_slices, wait=None):
     run = Run(spec)
     argv = agent_argv(run)
     if not shutil.which(argv[0]):
         raise Failed(f"the agent command `{argv[0]}` is not on PATH: install it, or set `agent` in "
                      ".claude/drive-spec.json", REFUSE)
+    deadline = None if wait is None else time.monotonic() + wait * 60
+    beat = Heartbeat(run)
+    procs = {}  # the agents this call launched: polled, as `alive` reads an unwaited child as running
     while True:
+        if inbox(run):
+            return INBOX
         table = agents(run)
+        ready = running = None
+        for key, entry in sorted(table.items(), key=lambda kv: kv[1].get("started_at") or ""):
+            m, log = int(key), entry["log"]
+            if "report" in entry:
+                ready = ready or m
+                continue
+            proc = procs.get(m)
+            if proc.poll() is None if proc else adopted(entry, run.notes / f"brief-{m}.md"):
+                running = running or m
+                if not entry.get("session_id"):
+                    entry["session_id"] = session_of(log)
+                continue
+            entry["session_id"] = entry.get("session_id") or session_of(log)
+            if died(log):
+                if entry.get("restarts"):
+                    raise Failed(f"#{m}: its implementer died again without a report; log {log}")
+                procs[m], log = launch_implementer(run, spec, m, table, restarts=1)
+                print(f"restarted #{m}: its implementer died without a report; implementer pid {procs[m].pid}, "
+                      f"log {log}", flush=True)
+                running = running or m
+                continue
+            rep = checked_report(run, m, run.root / f"issue-{m}", log)
+            print(f"reported #{m}: {rep['verdictLine']}", flush=True)
+            if rep["verdict"] != "green":
+                write_agents(run, table)
+                return RED
+            entry["report"] = report_text(rep)
+            write_agents(run, table)
+            ready = ready or m
+        if ready:
+            code = integrate_and_land(run, ready, table[str(ready)]["report"], deadline)
+            if code:
+                return code
+            table.pop(str(ready), None)
+            write_agents(run, table)
+            continue
+        if running:
+            if run.current().get("agents") != table:
+                write_agents(run, table)
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f"running #{running}: its implementer is still at work after {wait:g} minutes; run this same "
+                      "command again to keep waiting", flush=True)
+                return PENDING
+            beat.beat()
+            time.sleep(max(POLL_SECONDS, 0.1))
+            continue
         f = frontier(run, [int(k) for k in table], sequential, max_slices)
         if f["stop"] == "done":
             print("stop: done")
@@ -1586,31 +1663,13 @@ def cmd_build(spec, sequential, max_slices):
             return PENDING
         p = f["picks"][0]
         m = p["number"]
-        report = None
-        if p["action"] != "integrate":
-            quietly(cmd_start, spec, m)
-            wt = run.root / f"issue-{m}"
-            proc, log = launch(run, m, "implementer", wt, run.notes / f"brief-{m}.md")
-            table[str(m)] = {"role": "implementer", "pid": proc.pid, "log": str(log), "session_id": None,
-                             "started_at": stamp()}
-            write_agents(run, table)
-            print(f"started #{m}: implementer pid {proc.pid}, log {log}", flush=True)
-            await_agent(run, m, proc, table)
-            write_agents(run, table)
-            rep = checked_report(run, m, wt, log)
-            print(f"reported #{m}: {rep['verdictLine']}", flush=True)
-            if rep["verdict"] != "green":
-                return RED
-            report = report_text(rep)
-        code, out = quietly(cmd_integrate, spec, m, report)
-        if code:
-            return code
-        merged = re.search(r"^merged (#\d+)", out, re.M)
-        print(f"integrated #{m}: merged {merged.group(1) if merged else 'its PR'}", flush=True)
-        quietly(cmd_land, spec, m)
-        table.pop(str(m), None)
-        write_agents(run, table)
-        print(f"landed #{m}", flush=True)
+        if p["action"] == "integrate":
+            code = integrate_and_land(run, m, None, deadline)
+            if code:
+                return code
+            continue
+        procs[m], log = launch_implementer(run, spec, m, table)
+        print(f"started #{m}: implementer pid {procs[m].pid}, log {log}", flush=True)
 
 
 # open, confirm, cleanup
@@ -2242,7 +2301,7 @@ STEP_COMMANDS = {
     "guard": "drive-spec plan {spec}",
     "worktree": "drive-spec open {spec}",
     "preview": "drive-spec preview {spec}",
-    "build": "drive-spec frontier {spec}",
+    "build": "drive-spec build {spec} --wait-minutes 9",
     "review": "drive-spec review {spec}",
     "confirm": "drive-spec confirm {spec}",
     "cleanup": "drive-spec cleanup {spec}",
@@ -2426,6 +2485,8 @@ def main():
     bu.add_argument("spec")
     bu.add_argument("--sequential", action="store_true")
     bu.add_argument("--max", type=int, dest="max_slices", help="maxSlices; default from .claude/drive-spec.json")
+    bu.add_argument("--wait-minutes", type=float, dest="wait",
+                    help="return after this long, exit 6, while agents or gates run on; run again to pick up")
     h = sub.add_parser("halt", help="halt the run on a red slice: label, comment, status comment, status")
     h.add_argument("spec")
     h.add_argument("slice")
@@ -2519,7 +2580,7 @@ def main():
         elif args.cmd == "start":
             code = cmd_start(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "build":
-            code = cmd_build(spec, args.sequential, args.max_slices)
+            code = cmd_build(spec, args.sequential, args.max_slices, args.wait)
         elif args.cmd == "halt":
             code = cmd_halt(spec, int(args.slice.lstrip("#")), " ".join(args.why).rstrip("."))
         elif args.cmd == "finish":
