@@ -1895,6 +1895,9 @@ class Finish(Cli):
         out = self.run_ds("finish", "10", "done")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("drive-spec done: all 2 slices landed, review clean. Spec PR #101.", self.comments(10))
+        self.assertTrue(out.stdout.endswith("\nFollow-ups: start a fresh session (`/clear`) and name PR #101; "
+                                            "the PR holds the run.\n"))
+        self.assertNotIn("Follow-ups", self.comments(10)[0])
         st = self.status_file()
         self.assertEqual((st["state"], st["step"], st["next"]), ("done", "qa-pr", "none"))
 
@@ -1922,6 +1925,8 @@ class Finish(Cli):
                           "--resume", "/review-fix-pr 101")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.comments(10)[0], "drive-spec halted: fix pass red.\n`/review-fix-pr 101`")
+        self.assertTrue(out.stdout.endswith("\nFollow-ups: start a fresh session (`/clear`); `drive-spec next 10` "
+                                            "names what carries the run on.\n"))
 
     def test_refused(self):
         self.assertEqual(self.run_ds("finish", "10", "refused").returncode, 2)
@@ -2489,15 +2494,78 @@ class Boundaries(DispatcherCase):
                       (self.notes() / "review" / "round-2.brief.md").read_text())
         self.assertNotIn("is what changed since", (self.notes() / "review" / "round-1.brief.md").read_text())
         self.round_(2, self.CALL)
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        question = self.notes() / "review" / "round-2.left.md"
+        self.assertIn(f"round 2 left 1 judgement call(s) for the operator: ask them in one blocking "
+                      f"`drive-spec ask 10` with the question in {question}", out.stdout)
+        self.assertIn("L1 `README:1`: Rename ExportJob. Recommend: Keep the name.", question.read_text())
+        self.assertIn("are not settled", self.run_ds("reviewed", "10").stderr)
+        self.assertIn("the operator has not answered", self.run_ds("settle", "10").stderr)
+        self.run_ds("ask", "10", question.read_text())
+        self.assertIn("the operator has not answered", self.run_ds("settle", "10").stderr)
+        self.run_ds("answered", "10", "keep it")
+        self.assertIn("L2 is not one of round 2's judgement calls", self.run_ds("settle", "10", "--change", "L2").stderr)
+        out = self.run_ds("settle", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round 2: keep L1", out.stdout)
         self.assertIn("review clean at round 2", self.run_ds("review", "10").stdout)
         out = self.run_ds("reviewed", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         r = self.row()
         self.assertEqual((r["step"], r["pr_url"]), ("confirm", "https://github.com/acme/app/pull/101"))
-        self.assertTrue(self.status_file()["summary"].startswith("review left 1 finding(s) open after 2 round(s)"))
+        self.assertTrue(self.status_file()["summary"].startswith("review kept 1 judgement call(s) after 2 round(s)"))
         self.assertEqual(self.run_ds("confirm", "10").returncode, 0)
         self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith(
-            "\n\nLeft from review:\n- `README:1`: Rename ExportJob. Recommend: Keep the name."))
+            "\n\nLeft from review:\n- kept: `README:1`: Rename ExportJob."))
+
+    def settle(self, k, *change):
+        self.run_ds("ask", "10", (self.notes() / "review" / f"round-{k}.left.md").read_text())
+        self.run_ds("answered", "10", "as recommended")
+        out = self.run_ds("settle", "10", *(["--change", ",".join(change)] if change else []))
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_review_between_answered_and_settle_keeps_the_answer(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.CALL)
+        self.run_ds("review", "10")
+        self.run_ds("ask", "10", (self.notes() / "review" / "round-1.left.md").read_text())
+        self.run_ds("answered", "10", "keep it")
+        self.assertEqual(self.run_ds("review", "10").returncode, 0)
+        out = self.run_ds("settle", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round 1: keep L1", out.stdout)
+
+    def test_a_judgement_call_the_operator_changes_goes_to_a_fixer_then_a_new_round(self):
+        call_2 = dict(self.CALL, finding="Split ExportJob.", recommend="Split it in two.")
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.CALL, call_2)
+        self.run_ds("review", "10")
+        self.settle(1, "L2")
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        fix = self.notes() / "review" / "round-1.fix.md"
+        self.assertIn(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`", out.stdout)
+        self.assertIn("1. `README:1`: Split ExportJob.\n   Decided: change it, as the operator answered in "
+                      "`decisions.md` (recommended: Split it in two.)", fix.read_text())
+        self.assertNotIn("Rename ExportJob", fix.read_text())
+        self.assertIn("are not settled", self.run_ds("reviewed", "10").stderr)
+        self.commit(self.spec_wt, "split.rb", "x\n", "Split ExportJob")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.assertEqual(self.run_ds("review", "10").returncode, 0)
+        brief = (self.notes() / "review" / "round-2.brief.md").read_text()
+        self.assertIn("The operator kept these judgement calls; raise none of them again: `README:1`: Rename "
+                      "ExportJob.", brief)
+        self.round_(2)
+        self.assertIn("review clean at round 2", self.run_ds("review", "10").stdout)
+        self.assertEqual(self.run_ds("reviewed", "10").returncode, 0)
+        self.assertEqual((self.notes() / "left.md").read_text(), "- kept: `README:1`: Rename ExportJob.\n")
 
     def test_the_left_list_holds_only_the_last_rounds_judgement_calls(self):
         self.run_ds("gate", "10", GATE)
@@ -2652,28 +2720,51 @@ class Boundaries(DispatcherCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-2.brief.md").exists())
 
-    def test_rounds_past_the_cap_go_on_while_their_findings_shrink(self):
-        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 2}))
+    def fixed_round(self, k, *findings):
+        self.run_ds("review", "10")
+        self.round_(k, *findings)
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, f"fix-{k}.txt", "x\n", f"Fix round {k}")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        return self.run_ds("review", "10")
+
+    def test_rounds_go_on_while_their_findings_are_new(self):
         self.run_ds("gate", "10", GATE)
         self.close_all()
         self.run_ds("verify", "10", str(self.spec_wt))
-
-        def fixed_round(k, *findings):
-            self.run_ds("review", "10")
-            self.round_(k, *findings)
-            self.run_ds("review", "10")
-            self.commit(self.spec_wt, f"fix-{k}.txt", "x\n", f"Fix round {k}")
-            self.run_ds("verify", "10", str(self.spec_wt))
-            return self.run_ds("review", "10")
-
-        out = fixed_round(1, self.RULE, dict(self.RULE, finding="The total row is missing."))
+        self.assertEqual(self.fixed_round(1, self.RULE).returncode, 0)
+        out = self.fixed_round(2, dict(self.RULE, finding="The total row is missing."),
+                               dict(self.RULE, finding="The header row is missing."))
         self.assertEqual(out.returncode, 0, out.stderr)
-        out = fixed_round(2, self.RULE)
+        out = self.fixed_round(3, dict(self.RULE, finding="The footer is missing."),
+                               dict(self.RULE, finding="The date column is missing."))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue((self.notes() / "review" / "round-4.brief.md").exists())
+
+    def test_a_finding_raised_again_waits_for_the_operator(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.assertEqual(self.fixed_round(1, self.RULE).returncode, 0)
+        out = self.fixed_round(2, dict(self.RULE, again=True))
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("round 2 raised 1 finding(s) again: an earlier fix did not hold; ask the operator whether "
+                      "to go on", out.stderr)
+        self.run_ds("ask", "10", "Round 2 raised the CSV export again; go on?")
+        self.run_ds("answered", "10", "go on")
+        out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-3.brief.md").exists())
-        out = fixed_round(3, self.RULE)
-        self.assertEqual(out.returncode, 2)
-        self.assertIn("round 3 raised 1 finding(s) to fix, no fewer than round 2", out.stderr)
+
+    def test_again_is_for_a_rule_or_bug_finding_after_round_1(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, dict(self.RULE, again=True), dict(self.CALL, again=True))
+        err = self.run_ds("review", "10").stderr
+        self.assertIn("finding 1: `again` on round 1, which has no earlier round", err)
+        self.assertIn("finding 2: `again` on a judgement call", err)
 
     def test_a_merge_commit_with_a_verified_tree_needs_no_gate(self):
         self.run_ds("gate", "10", GATE)

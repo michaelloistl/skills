@@ -9,7 +9,7 @@ Worktree: <path>, on the spec branch. Every command runs there. Commits go on th
 
 Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at. <If decided: "The operator's answers during the run are in `<notes>/decisions.md`; a fix that would change what one decided is not yours to make: stop and report it instead. ">Match the repo's conventions and vocabulary.
 
-Round <k> raised these, each citing the written rule it breaks (`Rule:`) or how it fails (`Fails:`):
+Round <k> raised these, each citing the written rule it breaks (`Rule:`), how it fails (`Fails:`), or the operator's decision to change it (`Decided:`):
 
 <findings>
 

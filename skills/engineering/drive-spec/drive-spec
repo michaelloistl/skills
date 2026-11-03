@@ -2057,7 +2057,7 @@ def cmd_explored(spec):
     return 0
 
 
-REVIEW_ROUNDS = 3
+REVIEW_ROUNDS = 6
 SOURCE = re.compile(r"spec #\d+|#\d+|decisions\.md|coverage\.md")
 
 
@@ -2104,6 +2104,10 @@ def read_round(run, k, wt):
                 faults.append(f"finding {n}: {source[0].strip()} is no file, spec, slice or decisions.md")
         if x["kind"] == "bug" and not str(x.get("fails") or "").strip():
             faults.append(f"finding {n}: a bug finding says not how it fails (`fails`)")
+        if x.get("again") and x["kind"] == "judgement":
+            faults.append(f"finding {n}: `again` on a judgement call")
+        elif x.get("again") and k == 1:
+            faults.append(f"finding {n}: `again` on round 1, which has no earlier round")
         if x["kind"] == "judgement" and not str(x.get("recommend") or "").strip():
             faults.append(f"finding {n}: a judgement call recommends nothing (`recommend`)")
     if faults:
@@ -2122,8 +2126,27 @@ def to_fix(findings):
 
 
 def judgement_calls(round_):
-    return [f"- {where(x)}: {' '.join(x['finding'].split())} Recommend: {' '.join(x['recommend'].split())}"
-            for x in round_["findings"] if x["kind"] == "judgement"]
+    return [x for x in round_["findings"] if x["kind"] == "judgement"]
+
+
+def flat(text):
+    return " ".join(str(text).split())
+
+
+def settlement(run, k):
+    f = round_file(run, k, "settled.json")
+    return json.loads(f.read_text()) if f.is_file() else None
+
+
+def kept_calls(run):
+    return [c for k in review_rounds(run) for c in (settlement(run, k) or {}).get("kept", [])]
+
+
+def unsettled(run, k, round_):
+    """Round k's judgement calls still waiting on the operator, or on a fixer for those they chose to change."""
+    calls = judgement_calls(round_)
+    settled = settlement(run, k)
+    return bool(calls) and (settled is None or bool(settled["change"]))
 
 
 def spec_head(run, plan, push):
@@ -2206,15 +2229,49 @@ def cmd_review(spec):
         data = read_round(run, k, wt)
         rules = to_fix(data["findings"])
         calls = len(data["findings"]) - len(rules)
+        if data["head"] == head and not rules and calls:
+            settled = settlement(run, k)
+            if settled is None:
+                question = round_file(run, k, "left.md")
+                if not question.is_file():
+                    question.write_text("Review left these judgement calls. For each: change or keep? (\"as "
+                                        "recommended\" takes each recommendation.)\n" + "\n".join(
+                                            f"L{n} {where(x)}: {flat(x['finding'])} Recommend: {flat(x['recommend'])}"
+                                            for n, x in enumerate(judgement_calls(data), 1)) + "\n")
+                run.status(step="review", state="running", summary=f"review round {k}: {calls} judgement call(s) "
+                           "for the operator", next=f"drive-spec ask {spec}, then drive-spec settle {spec}",
+                           branch=plan["spec_branch"])
+                print(f"round {k} left {calls} judgement call(s) for the operator: ask them in one blocking "
+                      f"`drive-spec ask {spec}` with the question in {question}; once answered, "
+                      f"`drive-spec settle {spec} --change L<n>,…` (the rest are kept), then "
+                      f"`drive-spec review {spec}` again")
+                return 0
+            change = [judgement_calls(data)[int(c[1:]) - 1] for c in settled["change"]]
+            if change:
+                fix = round_file(run, k, "fix.md")
+                if not fix.is_file():
+                    findings = "\n".join(f"{n}. {where(x)}: {flat(x['finding'])}\n   Decided: change it, as the "
+                                         f"operator answered in `decisions.md` (recommended: {flat(x['recommend'])})"
+                                         for n, x in enumerate(change, 1))
+                    fix.write_text(fill("REVIEW-FIXER.md", {
+                        "path": wt, "spec": spec, "repo": run.repo, "notes": run.notes, "k": k, "findings": findings,
+                        "skill dir": Path(__file__).resolve().parent}, {"decided": decided}) + "\n")
+                run.status(step="review", state="running", summary=f"review round {k}: {len(change)} judgement "
+                           "call(s) to change, fixing", next=f"drive-spec review {spec} once the fixes are green",
+                           branch=plan["spec_branch"])
+                print(f"round {k}: the operator changes {len(change)} judgement call(s)")
+                print(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`; then "
+                      f"`drive-spec review {spec}` again")
+                return 0
         if data["head"] == head and not rules:
             run.status(step="review", state="running", summary=f"review clean at round {k}, {calls} judgement "
-                       f"call(s) this round", next=f"drive-spec reviewed {spec}", branch=plan["spec_branch"])
+                       f"call(s) kept this round", next=f"drive-spec reviewed {spec}", branch=plan["spec_branch"])
             print(f"review clean at round {k}: next `drive-spec reviewed {spec}`")
             return 0
         if data["head"] == head:
             fix = round_file(run, k, "fix.md")
             if not fix.is_file():
-                findings = "\n".join(f"{n}. {where(x)}: {' '.join(x['finding'].split())}\n   "
+                findings = "\n".join(f"{n}. {where(x)}: {flat(x['finding'])}\n   "
                                      + (f"Rule: {x['rule']}" if x["kind"] == "rule" else f"Fails: {x['fails']}")
                                      for n, x in enumerate(rules, 1))
                 fix.write_text(fill("REVIEW-FIXER.md", {
@@ -2228,13 +2285,14 @@ def cmd_review(spec):
             return 0
         cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
         answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
-        before = len(to_fix(json.loads(round_file(run, k - 1, "json").read_text())["findings"])) if k > 1 else None
-        shrinking = before is not None and len(rules) < before
-        if k >= cap and rules and not answered and not shrinking:
-            than = f", no fewer than round {k - 1}" if before is not None else ""
-            raise Failed(f"{k} review rounds, and round {k} raised {len(rules)} finding(s) to fix{than}: ask the "
-                         f"operator whether to go on (`drive-spec ask {spec} ...`); once answered, "
-                         f"`drive-spec review {spec}` starts another round", REFUSE)
+        again = [x for x in rules if x.get("again")]
+        then = f"once answered, `drive-spec review {spec}` starts another round"
+        if again and not answered:
+            raise Failed(f"round {k} raised {len(again)} finding(s) again: an earlier fix did not hold; ask the "
+                         f"operator whether to go on (`drive-spec ask {spec} ...`); {then}", REFUSE)
+        if k >= cap and rules and not answered:
+            raise Failed(f"round {k} is the last of reviewRounds ({cap}), and it raised {len(rules)} finding(s) to "
+                         f"fix: ask the operator whether to go on (`drive-spec ask {spec} ...`); {then}", REFUSE)
     k += 1
     (run.notes / "review").mkdir(parents=True, exist_ok=True)
     round_file(run, k, "meta.json").write_text(json.dumps({"head": head, "at": stamp()}))
@@ -2245,13 +2303,50 @@ def cmd_review(spec):
         "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
         "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
         "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
-        "out": round_file(run, k, "json")}, {
-        "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier)}) + "\n")
+        "out": round_file(run, k, "json"), "kept": "; ".join(c.removeprefix("- kept: ") for c in kept_calls(run))}, {
+        "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier),
+        "kept": bool(kept_calls(run))}) + "\n")
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
                next=f"drive-spec review {spec} once the reviewer writes its findings", branch=plan["spec_branch"])
     print(f"brief: {brief_path}")
     print(f"next: a reviewer subagent with the prompt `Read {brief_path} and follow it.`; then "
           f"`drive-spec review {spec}` again")
+    return 0
+
+
+def cmd_settle(spec, change):
+    run = Run(spec)
+    plan = checked_plan(run)
+    wt, head = spec_head(run, plan, push=False)
+    ks = review_rounds(run)
+    k = ks[-1] if ks else 0
+    if not k or not round_file(run, k, "json").is_file():
+        raise Failed(f"no finished review round: `drive-spec review {spec}`", REFUSE)
+    data = read_round(run, k, wt)
+    if data["head"] != head or to_fix(data["findings"]):
+        raise Failed(f"round {k} is not a clean review of {head[:12]}: `drive-spec review {spec}`", REFUSE)
+    calls = judgement_calls(data)
+    question = round_file(run, k, "left.md")
+    if not calls or not question.is_file():
+        raise Failed(f"round {k} left no judgement calls to settle: `drive-spec review {spec}`", REFUSE)
+    if settlement(run, k):
+        raise Failed(f"round {k} is already settled: `drive-spec review {spec}`", REFUSE)
+    decisions = run.notes / "decisions.md"
+    if run.current().get("question") or not decisions.is_file() or \
+            decisions.stat().st_mtime <= question.stat().st_mtime:
+        raise Failed(f"the operator has not answered round {k}'s judgement calls: `drive-spec ask {spec}` the "
+                     f"question in {question}, then `drive-spec answered {spec}` with their answer", REFUSE)
+    ids = [c.strip().upper() for c in (change or "").split(",") if c.strip()]
+    known = [f"L{n}" for n in range(1, len(calls) + 1)]
+    wrong = [c for c in ids if c not in known]
+    if wrong:
+        raise Failed(f"{', '.join(wrong)} is not one of round {k}'s judgement calls ({', '.join(known)})", REFUSE)
+    keep = [c for c in known if c not in ids]
+    round_file(run, k, "settled.json").write_text(json.dumps({
+        "change": ids, "keep": keep,
+        "kept": [f"- kept: {where(calls[int(c[1:]) - 1])}: {flat(calls[int(c[1:]) - 1]['finding'])}" for c in keep]}))
+    print(f"round {k}: " + "; ".join(x for x in (ids and "change " + ", ".join(ids), keep and "keep " + ", ".join(keep))
+                                      if x) + f"; next `drive-spec review {spec}`")
     return 0
 
 
@@ -2269,14 +2364,18 @@ def cmd_reviewed(spec, left):
     last = read_round(run, ks[-1], wt)
     if last["head"] != head or to_fix(last["findings"]):
         raise Failed(f"round {ks[-1]} is not a clean review of {head[:12]}: `drive-spec review {spec}`", REFUSE)
+    if unsettled(run, ks[-1], last):
+        raise Failed(f"round {ks[-1]}'s judgement calls are not settled: `drive-spec review {spec}`", REFUSE)
     kept = run.notes / "left.md"
-    lines = judgement_calls(last) + ([left.strip()] if left and left.strip() else [])
+    calls = kept_calls(run)
+    lines = calls + ([left.strip()] if left and left.strip() else [])
     if lines:
         kept.write_text("\n".join(lines) + "\n")
     else:
         kept.unlink(missing_ok=True)
     spec_pr = spec_pr_of(run, run.base(), branch)
-    summary = (f"review left {len(lines)} finding(s) open" if lines else "review clean") + \
+    summary = (f"review kept {len(calls)} judgement call(s)" if calls else
+               "review left notes" if lines else "review clean") + \
         f" after {len(ks)} round(s) at {head[:12]}"
     run.status(step="confirm", state="running", summary=summary, next="drive-spec confirm",
                branch=branch, **({"pr_url": spec_pr["url"]} if spec_pr else {}))
@@ -2603,6 +2702,10 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=Non
     run.status(step=step or default_step, state=state, summary=first,
                next="none" if outcome == "done" else resume, question="", **known)
     print(body)
+    if outcome == "done":
+        print(f"\nFollow-ups: start a fresh session (`/clear`) and name PR #{spec_pr['number']}; the PR holds the run.")
+    elif outcome == "halted":
+        print(f"\nFollow-ups: start a fresh session (`/clear`); `drive-spec next {spec}` names what carries the run on.")
     return 0
 
 
@@ -2688,9 +2791,13 @@ def main():
     nx.add_argument("spec")
     rw = sub.add_parser("review", help="step 7: the next review round's brief, its fixer's brief, or clean")
     rw.add_argument("spec")
+    se = sub.add_parser("settle", help="record the operator's answer on a clean round's judgement calls: change "
+                                       "these, keep the rest")
+    se.add_argument("spec")
+    se.add_argument("--change", help="the judgement calls to change, as L<n>,…; the rest are kept")
     rv = sub.add_parser("reviewed", help="end of review: a clean last round on the pushed, green spec branch")
     rv.add_argument("spec")
-    rv.add_argument("--left", help="more for the left list, beyond the last round's judgement calls; `-` for stdin")
+    rv.add_argument("--left", help="more for the left list, beyond the kept judgement calls; `-` for stdin")
     cl = sub.add_parser("cleanup", help="remove the spec and slice worktrees and the notes")
     cl.add_argument("spec")
     qa = sub.add_parser("qa", help="step 11: mark QA of the spec PR begun and print the QA subagent's prompt")
@@ -2752,6 +2859,8 @@ def main():
             code = cmd_next(spec)
         elif args.cmd == "review":
             code = cmd_review(spec)
+        elif args.cmd == "settle":
+            code = cmd_settle(spec, args.change)
         elif args.cmd == "reviewed":
             code = cmd_reviewed(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "frontier":

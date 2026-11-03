@@ -31,3 +31,11 @@ _Avoid_: allowed author, whitelisted user
 **Shadow mode**:
 The merge gate deciding a risk tier and posting it without acting on it.
 _Avoid_: dry run, audit mode
+
+**Judgement call**:
+A review finding that cites no written rule and shows no failure: a matter of taste or design the operator decides, never a fixer.
+_Avoid_: nit, suggestion, soft finding
+
+**Left list**:
+The judgement calls a spec's review rounds leave for the operator, each settled as **change** (fixed before QA) or **keep**; the kept calls across every round reach the spec PR as `Left from review:`.
+_Avoid_: open items, leftovers, "left from review" as a noun
