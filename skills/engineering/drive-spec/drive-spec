@@ -1427,6 +1427,11 @@ def cmd_start(spec, m):
 # the other flags, never last, where it would swallow the prompt.
 DEFAULT_AGENT = ["claude", "-p", "--allowedTools", "Bash", "--verbose", "--output-format", "stream-json",
                  "--permission-mode", "acceptEdits", "--permission-prompts", "none"]
+# The same agent resuming its session, `{session}` replaced by the session id, and the prompt appended last.
+DEFAULT_AGENT_RESUME = [*DEFAULT_AGENT, "--resume", "{session}"]
+RESUME_PROMPT = ("Your last response did not end with a valid report block: {why}. Reply with that block only, "
+                 "nothing before or after it: <report>{{\"sha\": ..., \"verdict\": ..., \"verdictLine\": ..., "
+                 "\"deviations\": [...], \"unverified\": [...], \"proof\": ...}}</report>, as {brief} describes.")
 REPORT = re.compile(r"<report>(.*?)</report>\s*\Z", re.S)
 REPORT_TYPES = {"sha": str, "verdict": str, "verdictLine": str, "deviations": list, "unverified": list}
 
@@ -1438,9 +1443,19 @@ def agent_argv(run):
     return argv
 
 
-def quietly(fn, *args):
+def agent_resume_argv(run, session):
+    """The command that resumes an agent's session, `{session}` in it replaced by the session id."""
+    argv = run.config.get("agentResume", DEFAULT_AGENT_RESUME)
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv)
+            and any("{session}" in x for x in argv)):
+        raise Failed(".claude/drive-spec.json: `agentResume` is the resume command as an argv list of strings, "
+                     "`{session}` in it standing for the session id", REFUSE)
+    return [x.replace("{session}", session) for x in argv]
+
+
+def quietly(fn, *args, held=()):
     """A command run in-process with its output held back, as `build` prints one line per slice event: shown when
-    the command fails or exits non-zero, so its reason is not lost."""
+    the command fails or exits non-zero, except with a code in `held`, which the caller reports itself."""
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -1448,7 +1463,7 @@ def quietly(fn, *args):
     except Failed:
         sys.stderr.write(buf.getvalue())
         raise
-    if code:
+    if code and code not in held:
         sys.stdout.write(buf.getvalue())
     return code, buf.getvalue()
 
@@ -1462,13 +1477,13 @@ def write_agents(run, table):
     run.status(agents=json.dumps(table, sort_keys=True))
 
 
-def launch(run, m, role, wt, brief_path):
+def launch(run, m, role, wt, brief_path, argv=None, prompt=None):
     """The agent, detached in its own session in the slice worktree, stdin closed, its stream appended to its log."""
     logs = run.notes / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"agent-{m}-{role}.log"
     with open(log, "a") as out:
-        proc = subprocess.Popen([*agent_argv(run), f"Read {brief_path} and follow it."], cwd=wt,
+        proc = subprocess.Popen([*(argv or agent_argv(run)), prompt or f"Read {brief_path} and follow it."], cwd=wt,
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     return proc, log
 
@@ -1496,10 +1511,14 @@ def session_of(log):
     return next((x for x in reversed(ids) if x), None)
 
 
+class BadReport(Failed):
+    """A report missing or malformed: the agent is asked for it once more."""
+
+
 def parse_report(text, local_only, log):
     """The `<report>{...}</report>` block that ends an implementer's response, checked for form."""
     def bad(why):
-        return Failed(f"the implementer's report {why}; log {log}")
+        return BadReport(f"the implementer's report {why}; log {log}")
 
     m = REPORT.search((text or "").rstrip())
     if not m:
@@ -1579,11 +1598,40 @@ def launch_implementer(run, spec, m, table, restarts=0):
     return proc, log
 
 
-def integrate_and_land(run, m, report, deadline):
+def resume_for_report(run, m, entry, why):
+    """The implementer's session resumed once, asked for its report block only; its stream appended to its log."""
+    brief_path = run.notes / f"brief-{m}.md"
+    prompt = RESUME_PROMPT.format(why=why.rstrip("."), brief=brief_path)
+    proc, _ = launch(run, m, "implementer", run.root / f"issue-{m}", brief_path,
+                     agent_resume_argv(run, entry["session_id"]), prompt)
+    entry.update(pid=proc.pid, resumed=True)
+    return proc
+
+
+def halt(run, table, m, why):
+    """The slice halted through `halt`, its agent dropped from the map: exit 4, as `build` ends the run there."""
+    why = why.rstrip(".")
+    table.pop(str(m), None)
+    write_agents(run, table)
+    quietly(cmd_halt, run.spec, m, why)
+    print(f"halted #{m}: {why}", flush=True)
+    return RED
+
+
+def integrate_and_land(run, m, report, deadline, table):
     """`integrate` the slice with what time is left, then `land` it once merged; integrate's exit code otherwise,
-    6 included: the next `build` runs integrate again, which picks up where it stopped."""
+    6 included: the next `build` runs integrate again, which picks up where it stopped. Red (4) and a refusal (2)
+    halt the slice with the reason integrate gave."""
     left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
-    code, out = quietly(cmd_integrate, run.spec, m, report, left)
+    try:
+        code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED,))
+    except Failed as e:
+        if e.code != REFUSE:
+            raise
+        return halt(run, table, m, f"integrate refused it: {e}")
+    if code == RED:
+        lines = out.strip().splitlines()
+        return halt(run, table, m, f"integrate: {lines[-1] if lines else 'red on the spec branch'}")
     if code:
         return code
     merged = re.search(r"^merged (#\d+)", out, re.M)
@@ -1596,6 +1644,7 @@ def integrate_and_land(run, m, report, deadline):
 def cmd_build(spec, sequential, max_slices, wait=None):
     run = Run(spec)
     argv = agent_argv(run)
+    agent_resume_argv(run, "")
     if not shutil.which(argv[0]):
         raise Failed(f"the agent command `{argv[0]}` is not on PATH: install it, or set `agent` in "
                      ".claude/drive-spec.json", REFUSE)
@@ -1621,22 +1670,34 @@ def cmd_build(spec, sequential, max_slices, wait=None):
             entry["session_id"] = entry.get("session_id") or session_of(log)
             if died(log):
                 if entry.get("restarts"):
-                    raise Failed(f"#{m}: its implementer died again without a report; log {log}")
+                    return halt(run, table, m, f"its implementer died again without a report; log {log}")
                 procs[m], log = launch_implementer(run, spec, m, table, restarts=1)
                 print(f"restarted #{m}: its implementer died without a report; implementer pid {procs[m].pid}, "
                       f"log {log}", flush=True)
                 running = running or m
                 continue
-            rep = checked_report(run, m, run.root / f"issue-{m}", log)
+            try:
+                rep = checked_report(run, m, run.root / f"issue-{m}", log)
+            except BadReport as e:
+                if entry.get("resumed"):
+                    return halt(run, table, m, f"still no valid report after one resume: {e}")
+                if not entry.get("session_id"):
+                    return halt(run, table, m, f"{e}, and no session id to resume it with")
+                procs[m] = resume_for_report(run, m, entry, str(e))
+                write_agents(run, table)
+                print(f"resumed #{m}: {e}; implementer pid {procs[m].pid}, asked for its report only", flush=True)
+                running = running or m
+                continue
+            except Failed as e:
+                return halt(run, table, m, str(e))
             print(f"reported #{m}: {rep['verdictLine']}", flush=True)
             if rep["verdict"] != "green":
-                write_agents(run, table)
-                return RED
+                return halt(run, table, m, f"its implementer reported red: {rep['verdictLine']}")
             entry["report"] = report_text(rep)
             write_agents(run, table)
             ready = ready or m
         if ready:
-            code = integrate_and_land(run, ready, table[str(ready)]["report"], deadline)
+            code = integrate_and_land(run, ready, table[str(ready)]["report"], deadline, table)
             if code:
                 return code
             table.pop(str(ready), None)
@@ -1664,7 +1725,7 @@ def cmd_build(spec, sequential, max_slices, wait=None):
         p = f["picks"][0]
         m = p["number"]
         if p["action"] == "integrate":
-            code = integrate_and_land(run, m, None, deadline)
+            code = integrate_and_land(run, m, None, deadline, table)
             if code:
                 return code
             continue

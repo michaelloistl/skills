@@ -9,6 +9,8 @@
   "worktreeRoot": ".claude/worktrees",
   "agent": ["claude", "-p", "--allowedTools", "Bash", "--verbose", "--output-format", "stream-json",
             "--permission-mode", "acceptEdits", "--permission-prompts", "none"],
+  "agentResume": ["claude", "-p", "--allowedTools", "Bash", "--verbose", "--output-format", "stream-json",
+                  "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--resume", "{session}"],
   "localOnly": {
     "label": "needs:desktop",
     "proof": "docs/agents/desktop-proof.md"
