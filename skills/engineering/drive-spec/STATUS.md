@@ -43,7 +43,7 @@ While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes
 
 ## Agents
 
-`drive-spec build` keeps an `agents` map in the status file: one entry per slice with an agent running for it, keyed by the slice number as a string, removed once that slice lands.
+`drive-spec build` keeps an `agents` map in the status file: one entry per slice with an agent running for it, keyed by the slice number as a string, removed once that slice lands or halts.
 
 ```json
 "agents": {"2990": {"role": "implementer", "pid": 4242, "log": "<notes>/logs/agent-2990-implementer.log", "session_id": "…", "started_at": "2026-11-03T09:12:00+00:00"}}
@@ -55,7 +55,8 @@ The map is how a `build` resumes another's work. On entry, and on each pass, `bu
 
 - **Live.** The PID runs and its command still names the slice's brief, so a reused PID is not mistaken for it: `build` adopts the agent and waits for it. It never launches a second agent on that slice.
 - **Reported.** A `report` key holds the validated report in `integrate`'s `--report` text form: the slice waits for, or is part way through, `integrate`, which the next pass runs again. The report is read once.
-- **Died.** The PID is gone and the log's last run has no `result` event: the agent ended without a response. `build` restarts it once, through `start` on the same worktree and branch, so its commits are kept and the brief says to carry on; the entry gains `restarts: 1`, with the new PID. A second death fails the slice.
+- **Finished, report missing or malformed.** `build` resumes the session once through `agentResume`, asking for the report block only: the entry gains `resumed: true`, with the new PID, and the resumed run appends to the same log. Still missing or malformed after that, the slice halts.
+- **Died.** The PID is gone and the log's last run has no `result` event: the agent ended without a response. `build` restarts it once, through `start` on the same worktree and branch, so its commits are kept and the brief says to carry on; the entry gains `restarts: 1`, with the new PID. A second death halts the slice.
 
 `build --wait-minutes N` returns exit 6 once N minutes pass with an agent still running, leaving the map as it is; so does a `build` stopped by a signal or a session ending. The next `build` adopts what it finds.
 
