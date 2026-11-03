@@ -7,6 +7,10 @@
   "parallel": false,
   "maxSlices": 5,
   "worktreeRoot": ".claude/worktrees",
+  "agent": ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
+            "--permission-prompts", "none"],
+  "agentResume": ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
+                  "--permission-prompts", "none", "--resume", "{session}"],
   "localOnly": {
     "label": "needs:desktop",
     "proof": "docs/agents/desktop-proof.md"

@@ -1,10 +1,24 @@
 #!/usr/bin/env bash
-# Usage: status.sh <spec> [key=value ...] | status.sh <spec> --inbox | status.sh <spec> --touch
+# Usage: status.sh <spec> [key=value ...] (agents=<JSON object>) | status.sh <spec> --inbox | status.sh <spec> --touch
 set -u
 
 spec=${1:-}
 [ -n "$spec" ] || exit 0
 shift
+
+# A write and the --touch heartbeat each read, rewrite and rename the file: run them one at a time per spec,
+# so one never puts back what another just wrote. Re-runs this script holding an flock on .spec-<spec>.lock.
+if [ "${1:-}" != --inbox ] && [ -z "${DRIVE_SPEC_STATUS_LOCKED:-}" ] && command -v python3 >/dev/null; then
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    mkdir -p "$common/drive-spec/status" &&
+    DRIVE_SPEC_STATUS_LOCKED=1 exec python3 -c '
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.set_inheritable(fd, True)
+os.execv(sys.argv[2], sys.argv[2:])
+' "$common/drive-spec/status/.spec-$spec.lock" "$BASH" "$0" "$spec" "$@"
+fi
 
 write() {
   command -v jq >/dev/null || return 1
@@ -27,12 +41,18 @@ write() {
     value=${pair#*=}
     case "$key" in
       step|state|summary|next|pr_url|branch|base|question) ;;
-      question_blocking) value=$([ "$value" = true ] && echo true || echo false) ;;
+      question_blocking|sequential) value=$([ "$value" = true ] && echo true || echo false) ;;
+      max) [ -z "$value" ] || [[ "$value" =~ ^[0-9]+$ ]] ||
+        { echo "status.sh: max is not a number" >&2; continue; } ;;
+      agents)
+        updates=$(jq -c --argjson v "$value" '.agents = $v' <<<"$updates") ||
+          { echo "status.sh: agents is not JSON" >&2; return 1; }
+        continue ;;
       *) echo "status.sh: unknown key $key" >&2; continue ;;
     esac
     updates=$(jq -c --arg k "$key" --arg v "$value" \
-      'if $k == "question_blocking" then .[$k] = ($v == "true")
-       elif $v == "" then .[$k] = null else .[$k] = $v end' <<<"$updates") || return 1
+      'if $k == "question_blocking" or $k == "sequential" then .[$k] = ($v == "true")
+       elif $v == "" then .[$k] = null elif $k == "max" then .[$k] = ($v | tonumber) else .[$k] = $v end' <<<"$updates") || return 1
   done
 
   tmp=$(mktemp "$dir/.spec-$spec.XXXXXX") || return 1

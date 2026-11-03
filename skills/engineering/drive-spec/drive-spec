@@ -2,8 +2,10 @@
 """drive-spec: the deterministic half of a drive-spec run. See README.md."""
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -26,7 +28,7 @@ TIMED_OUT = 124
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 HEARTBEAT_SECONDS = float(os.environ.get("DRIVE_SPEC_HEARTBEAT_SECONDS", 300))
 SPEC_MOVES = 5
-REFUSE, CONFLICT, RED, INBOX, PENDING = 2, 3, 4, 5, 6
+REFUSE, CONFLICT, RED, INBOX, PENDING, PAUSED = 2, 3, 4, 5, 6, 7
 LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
 
 
@@ -1254,10 +1256,8 @@ def render_picks(f):
     return "\n".join(lines)
 
 
-def cmd_frontier(spec, running, sequential, max_slices, as_json):
-    run = Run(spec)
-    if inbox(run):
-        return INBOX
+def frontier(run, running, sequential, max_slices):
+    """`pick` on the run's plan, in its mode and under its ceiling; refuses a slice carrying `agent:blocked`."""
     plan = checked_plan(run)
     parallel, max_slices = run.mode(sequential, max_slices)
     f = pick(plan, running, parallel, max_slices, landed_this_run(run) if max_slices is not None else 0,
@@ -1269,6 +1269,14 @@ def cmd_frontier(spec, running, sequential, max_slices, as_json):
         # The last slice closed outside `land` (closed by hand, or on a resume): mark review begun here.
         run.status(step="review", state="running", summary=f"{progress_summary(plan)}; reviewing the spec branch",
                    next="drive-spec reviewed once a review raises nothing new")
+    return f
+
+
+def cmd_frontier(spec, running, sequential, max_slices, as_json):
+    run = Run(spec)
+    if inbox(run):
+        return INBOX
+    f = frontier(run, running, sequential, max_slices)
     print(json.dumps(f, indent=2) if as_json else render_picks(f))
     return 0
 
@@ -1337,9 +1345,14 @@ def brief(run, m, wt, base, continuing, local_only):
     return fill("IMPLEMENTER.md", {
         "path": wt, "m": m, "repo": run.repo, "spec": run.spec, "base": f"origin/{base}", "notes": run.notes,
         "skill dir": Path(__file__).resolve().parent, "label": local.get("label", ""),
-        "proof": local.get("proof", "")}, {
-        "continuing": continuing, "localOnly": local_only, "decided": (run.notes / "decisions.md").is_file(),
+        "proof": local.get("proof", ""), "report": "<report>"}, {
+        "continuing": continuing, "localOnly": local_only, "notLocalOnly": not local_only, "decided": (run.notes / "decisions.md").is_file(),
         "covered": bool(owned_requirements(run, m))})
+
+
+def merger_brief(run, m, wt, merge, files):
+    return fill("MERGER.md", {"path": wt, "m": m, "repo": run.repo, "spec": run.spec, "merge": merge,
+                              "files": ", ".join(files), "skill dir": Path(__file__).resolve().parent})
 
 
 def write_brief(run, name, text):
@@ -1412,6 +1425,429 @@ def cmd_start(spec, m):
     return 0
 
 
+# build
+
+# Claude Code in print mode, streaming JSON events to the log. Auto mode's classifier approves each call, as it does
+# for the operator's own session, and anything that would still prompt is denied: nobody is there to answer.
+DEFAULT_AGENT = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
+                 "--permission-prompts", "none"]
+# The same agent resuming its session, `{session}` replaced by the session id, and the prompt appended last.
+DEFAULT_AGENT_RESUME = [*DEFAULT_AGENT, "--resume", "{session}"]
+RESUME_PROMPT = ("Your last response did not end with a valid report block: {why}. Reply with that block only, "
+                 "nothing before or after it: <report>{{\"sha\": ..., \"verdict\": ..., \"verdictLine\": ..., "
+                 "\"deviations\": [...], \"unverified\": [...], \"proof\": ...}}</report>, as {brief} describes.")
+REPORT = re.compile(r"<report>(.*?)</report>\s*\Z", re.S)
+REPORT_TYPES = {"sha": str, "verdict": str, "verdictLine": str, "deviations": list, "unverified": list}
+
+
+def agent_argv(run):
+    argv = run.config.get("agent", DEFAULT_AGENT)
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv)):
+        raise Failed(".claude/drive-spec.json: `agent` is the agent command as an argv list of strings", REFUSE)
+    return argv
+
+
+def agent_resume_argv(run, session):
+    """The command that resumes an agent's session, `{session}` in it replaced by the session id."""
+    argv = run.config.get("agentResume", DEFAULT_AGENT_RESUME)
+    if not (isinstance(argv, list) and argv and all(isinstance(x, str) and x for x in argv)
+            and any("{session}" in x for x in argv)):
+        raise Failed(".claude/drive-spec.json: `agentResume` is the resume command as an argv list of strings, "
+                     "`{session}` in it standing for the session id", REFUSE)
+    return [x.replace("{session}", session) for x in argv]
+
+
+def quietly(fn, *args, held=()):
+    """A command run in-process with its output held back, as `build` prints one line per slice event: shown when
+    the command fails or exits non-zero, except with a code in `held`, which the caller reports itself."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = fn(*args)
+    except Failed:
+        sys.stderr.write(buf.getvalue())
+        raise
+    if code and code not in held:
+        sys.stdout.write(buf.getvalue())
+    return code, buf.getvalue()
+
+
+def agents(run):
+    """The status file's `agents` map: slice number, as a string, to the agent running for it."""
+    return dict(run.current().get("agents") or {})
+
+
+def write_agents(run, table):
+    run.status(agents=json.dumps(table, sort_keys=True))
+
+
+# What the agent must not inherit from the session that runs `build`: the multiplexer pane, which its SessionStart
+# hooks would claim for its own session, and that session's identity and messaging channel.
+AGENT_ENV_DROP_PREFIXES = ("HERDR_", "REX_")
+AGENT_ENV_DROP = {"CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_SOCKET",
+                  "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_PID", "CLAUDE_ENV_FILE"}
+
+
+def agent_env():
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(AGENT_ENV_DROP_PREFIXES) and k not in AGENT_ENV_DROP}
+
+
+def launch(run, m, role, wt, brief_path, argv=None, prompt=None):
+    """The agent, detached in its own session in the slice worktree, stdin closed, its stream appended to its log."""
+    logs = run.notes / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"agent-{m}-{role}.log"
+    with open(log, "a") as out:
+        proc = subprocess.Popen([*(argv or agent_argv(run)), prompt or f"Read {brief_path} and follow it."], cwd=wt,
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=agent_env())
+    return proc, log
+
+
+def stream(log):
+    """The JSON events of an agent's stream-json log, skipping any line that is not one."""
+    try:
+        lines = Path(log).read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            out.append(e)
+    return out
+
+
+def session_of(log):
+    """The session id of the agent's last run in its log, from its `system` `init` event."""
+    ids = [e.get("session_id") for e in stream(log) if e.get("type") == "system" and e.get("subtype") == "init"]
+    return next((x for x in reversed(ids) if x), None)
+
+
+class BadReport(Failed):
+    """A report missing or malformed: the agent is asked for it once more."""
+
+
+class Mismatch(Failed):
+    """A green report the worktree contradicts: its SHA not HEAD, or a gate verdict `drive-spec verify` never recorded."""
+
+
+def parse_report(text, local_only, log):
+    """The `<report>{...}</report>` block that ends an implementer's response, checked for form."""
+    def bad(why):
+        return BadReport(f"the implementer's report {why}; log {log}")
+
+    m = REPORT.search((text or "").rstrip())
+    if not m:
+        raise bad("is missing: no <report>{...}</report> block ends its response")
+    try:
+        rep = json.loads(m.group(1))
+    except ValueError as e:
+        raise bad(f"is not JSON ({e})")
+    if not isinstance(rep, dict):
+        raise bad("is not a JSON object")
+    missing = [k for k in (*REPORT_TYPES, "proof") if k not in rep]
+    if missing:
+        raise bad(f"has no {', '.join(missing)}")
+    for k, t in REPORT_TYPES.items():
+        if not isinstance(rep[k], t) or t is list and not all(isinstance(x, str) for x in rep[k]):
+            raise bad(f"has `{k}` of the wrong type: {'a list of strings' if t is list else 'a string'} expected")
+    if rep["verdict"] not in ("green", "red"):
+        raise bad(f"has verdict {rep['verdict']!r}: green or red expected")
+    if local_only and not (isinstance(rep["proof"], str) and rep["proof"].strip()):
+        raise bad("has no `proof`: this slice is proved locally, and the proof's result goes in it")
+    if not local_only and rep["proof"] is not None:
+        raise bad("has a `proof`: null expected, as this slice needs no local proof")
+    return rep
+
+
+def checked_report(run, m, wt, log):
+    """The implementer's report, parsed from its log; a green one with its SHA the worktree's HEAD and green the
+    gate verdict `drive-spec verify` recorded for that commit. A red one halts the slice whatever the gate recorded."""
+    results = [e for e in stream(log) if e.get("type") == "result"]
+    local = (run.config.get("localOnly") or {}).get("label")
+    labels = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "[.labels[].name]"))
+    rep = parse_report(results[-1].get("result") if results else None, bool(local) and local in labels, log)
+    if rep["verdict"] != "green":
+        return rep
+    head = git(wt, "rev-parse", "HEAD")
+    if len(rep["sha"]) < 7 or not head.startswith(rep["sha"]):
+        raise Mismatch(f"#{m}: the report names {rep['sha'][:12] or 'no SHA'}, but {wt} is at {head[:12]}; log {log}")
+    gate = run_gate_of(run)
+    rec = record(run, head)
+    recorded = "green" if green(run, head, gate) else "red" if rec.get("gate") == gate and rec.get("exit") else None
+    if recorded != rep["verdict"]:
+        raise Mismatch(f"#{m}: the report says {rep['verdict']} for {head[:12]}, but `drive-spec verify` recorded "
+                     f"{recorded or 'no gate verdict'} for it; log {log}")
+    return rep
+
+
+def report_text(rep):
+    """A validated report in the text form `integrate --report` reads: one `- ` bullet per list item, so the PR body
+    renders each as its own, `none` when empty."""
+    def items(xs):
+        return [x if x.startswith("- ") else f"- {x}" for x in xs] or ["none"]
+    lines = ["Deviations:", *items(rep["deviations"]), "Unverified:", *items(rep["unverified"])]
+    if rep.get("proof"):
+        lines += ["Proof:", rep["proof"]]
+    return "\n".join(lines)
+
+
+def adopted(entry, brief_path):
+    """Whether an agent an earlier `build` launched still runs: its PID alive, and still the agent, whose command
+    names its brief, not a later process that reused the PID."""
+    pid = entry.get("pid")
+    if not isinstance(pid, int) or not alive(pid):
+        return False
+    proc = process_tree(cwds=False).get(pid)
+    return bool(proc) and proc[1] not in "ZX" and str(brief_path) in proc[3]
+
+
+def died(log):
+    """Whether the agent's last run in its log ended without a response: no `result` event after its last `init`."""
+    events = stream(log)
+    inits = [i for i, e in enumerate(events) if e.get("type") == "system" and e.get("subtype") == "init"]
+    return not any(e.get("type") == "result" for e in events[(inits[-1] if inits else 0):])
+
+
+def launch_implementer(run, spec, m, table, restarts=0):
+    """`start` the slice, then its implementer agent, recorded in the `agents` map."""
+    quietly(cmd_start, spec, m)
+    proc, log = launch(run, m, "implementer", run.root / f"issue-{m}", run.notes / f"brief-{m}.md")
+    table[str(m)] = {"role": "implementer", "pid": proc.pid, "log": str(log), "session_id": None,
+                     "started_at": stamp(), **({"restarts": restarts} if restarts else {})}
+    write_agents(run, table)
+    return proc, log
+
+
+def resume_for_report(run, m, entry, why):
+    """The implementer's session resumed once, asked for its report block only; its stream appended to its log."""
+    brief_path = run.notes / f"brief-{m}.md"
+    prompt = RESUME_PROMPT.format(why=why.rstrip("."), brief=brief_path)
+    proc, _ = launch(run, m, "implementer", run.root / f"issue-{m}", brief_path,
+                     agent_resume_argv(run, entry["session_id"]), prompt)
+    entry.update(pid=proc.pid, resumed=True)
+    return proc
+
+
+def brief_path_of(run, m, entry):
+    """The brief an agent was prompted with: the merger's, or the implementer's."""
+    return run.notes / (f"brief-merge-{m}.md" if entry.get("role") == "merger" else f"brief-{m}.md")
+
+
+def launch_merger(run, m, table, out):
+    """The merger agent for a slice `integrate` found conflicting, from the MERGER brief, recorded in the `agents`
+    map in place of the slice's queue entry, which it keeps the finish time of."""
+    merge = re.search(r"`(git merge [0-9a-f]+)`", out).group(1)
+    files = re.search(r"^conflict merging .*?: (.*)$", out, re.M).group(1).split(", ")
+    wt = run.root / f"issue-{m}"
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = write_brief(run, f"brief-merge-{m}.md", merger_brief(run, m, wt, merge, files))
+    proc, log = launch(run, m, "merger", wt, path)
+    table[str(m)] = {"role": "merger", "pid": proc.pid, "log": str(log), "session_id": None, "started_at": stamp(),
+                     "target": merge.split()[-1], "finished_at": table.get(str(m), {}).get("finished_at")}
+    write_agents(run, table)
+    print(f"conflict #{m}: {', '.join(files)}; merger pid {proc.pid}, log {log}", flush=True)
+    return proc
+
+
+def unresolved(run, m, entry):
+    """Why the merger's slice worktree does not hold a finished merge of its target, or None when it does."""
+    wt = run.root / f"issue-{m}"
+    if Path(git(wt, "rev-parse", "--absolute-git-dir"), "MERGE_HEAD").exists():
+        return "a merge is in progress"
+    if dirty(wt):
+        return "it left uncommitted changes"
+    if subprocess.run(["git", "-C", str(wt), "merge-base", "--is-ancestor", entry["target"], "HEAD"],
+                      capture_output=True).returncode:
+        return f"HEAD does not contain {entry['target'][:12]}"
+    return None
+
+
+def halt(run, table, m, why):
+    """The slice halted through `halt`, then its agent dropped from the map: exit 4, as `build` ends the run there.
+    A failed `halt` leaves the entry, so the next `build` comes to the same halt."""
+    why = why.rstrip(".")
+    quietly(cmd_halt, run.spec, m, why)
+    table.pop(str(m), None)
+    write_agents(run, table)
+    print(f"halted #{m}: {why}", flush=True)
+    return RED
+
+
+def integrate_and_land(run, m, report, deadline, table, procs):
+    """`integrate` the slice with what time is left, then `land` it once merged; integrate's exit code otherwise,
+    6 included, with a line of its own: the next `build` runs integrate again, which picks up where it stopped. Red (4) and a refusal (2)
+    halt the slice with the reason integrate gave. A conflict (3) launches the slice's one merger, and returns 0
+    with the slice out of the queue until the merger is done; a conflict after it halts the slice. The entry is
+    marked `merged` before `land`, so a `land` that fails is run again alone, not integrate."""
+    entry = table[str(m)]
+    if not entry.get("merged"):
+        code = integrate_slice(run, m, report, deadline, table, procs)
+        if code:
+            return code
+        entry["merged"] = True
+        write_agents(run, table)
+    quietly(cmd_land, run.spec, m)
+    print(f"landed #{m}", flush=True)
+    return 0
+
+
+def integrate_slice(run, m, report, deadline, table, procs):
+    """`integrate_and_land`'s integrate half: 0 once the slice PR merged."""
+    left = None if deadline is None else max(0.0, (deadline - time.monotonic()) / 60)
+    try:
+        code, out = quietly(cmd_integrate, run.spec, m, report, left, held=(RED, CONFLICT, PENDING))
+    except Failed as e:
+        if e.code != REFUSE:
+            raise
+        return halt(run, table, m, f"integrate refused it: {e}")
+    if code == RED:
+        lines = out.strip().splitlines()
+        return halt(run, table, m, f"integrate: {lines[-1] if lines else 'red on the spec branch'}")
+    if code == CONFLICT:
+        if table.get(str(m), {}).get("role") == "merger":
+            files = re.search(r"^conflict merging .*", out, re.M).group(0)
+            return halt(run, table, m, f"a second conflict after its merger: {files}")
+        procs[m] = launch_merger(run, m, table, out)
+        return CONFLICT
+    if code == PENDING:
+        print(f"integrating #{m}: a gate still runs in {run.root / f'issue-{m}'}; run this same command again to "
+              "keep waiting", flush=True)
+    if code:
+        return code
+    merged = re.search(r"^merged (#\d+)", out, re.M)
+    print(f"integrated #{m}: merged {merged.group(1) if merged else 'its PR'}", flush=True)
+    return 0
+
+
+def cmd_build(spec, sequential, max_slices, wait=None):
+    run = Run(spec)
+    argv = agent_argv(run)
+    agent_resume_argv(run, "")
+    if not shutil.which(argv[0]):
+        raise Failed(f"the agent command `{argv[0]}` is not on PATH: install it, or set `agent` in "
+                     ".claude/drive-spec.json", REFUSE)
+    run.notes.mkdir(parents=True, exist_ok=True)
+    lock = open(run.notes / "build.lock", "w")  # held to the call's end; not inherited by the agents it launches
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Failed(f"another `drive-spec build {spec}` is running: one build per spec at a time", REFUSE)
+    deadline = None if wait is None else time.monotonic() + wait * 60
+    beat = Heartbeat(run)
+    procs = {}  # the agents this call launched: polled, as `alive` reads an unwaited child as running
+    ask = True  # whether `frontier` may have new lines: on the first pass and after each landing
+    while True:
+        if inbox(run):
+            return INBOX
+        table = agents(run)
+        running = []
+        for key, entry in sorted(table.items(), key=lambda kv: kv[1].get("started_at") or ""):
+            m, log = int(key), entry.get("log")
+            if "report" in entry:
+                continue
+            proc = procs.get(m)
+            if proc.poll() is None if proc else adopted(entry, brief_path_of(run, m, entry)):
+                running.append(m)
+                if not entry.get("session_id"):
+                    entry["session_id"] = session_of(log)
+                continue
+            entry["session_id"] = entry.get("session_id") or session_of(log)
+            if entry.get("role") == "merger":
+                why = unresolved(run, m, entry)
+                if why:
+                    return halt(run, table, m, f"its merger exited without resolving the conflict: {why}; log {log}")
+                entry["report"] = None
+                write_agents(run, table)
+                print(f"resolved #{m}: its merger merged {entry['target'][:12]}", flush=True)
+                continue
+            if died(log):
+                if entry.get("restarts"):
+                    return halt(run, table, m, f"its implementer died again without a report; log {log}")
+                procs[m], log = launch_implementer(run, spec, m, table, restarts=1)
+                print(f"restarted #{m}: its implementer died without a report; implementer pid {procs[m].pid}, "
+                      f"log {log}", flush=True)
+                running.append(m)
+                continue
+            try:
+                rep = checked_report(run, m, run.root / f"issue-{m}", log)
+            except BadReport as e:
+                if entry.get("resumed"):
+                    return halt(run, table, m, f"still no valid report after one resume: {e}")
+                if not entry.get("session_id"):
+                    return halt(run, table, m, f"{e}, and no session id to resume it with")
+                procs[m] = resume_for_report(run, m, entry, str(e))
+                write_agents(run, table)
+                print(f"resumed #{m}: {e}; implementer pid {procs[m].pid}, asked for its report only", flush=True)
+                running.append(m)
+                continue
+            except Mismatch as e:
+                return halt(run, table, m, str(e))
+            print(f"reported #{m}: {rep['verdictLine']}", flush=True)
+            if rep["verdict"] != "green":
+                return halt(run, table, m, f"its implementer reported red: {rep['verdictLine']}")
+            # Finish order is the log's last write: right for an agent that ended while no `build` watched it too.
+            entry["report"] = report_text(rep)
+            entry["finished_at"] = datetime.fromtimestamp(os.path.getmtime(log), timezone.utc).isoformat()
+            write_agents(run, table)
+        queue = sorted((k for k, e in table.items() if "report" in e),
+                       key=lambda k: table[k].get("finished_at") or table[k].get("started_at") or "")
+        merging = any(e.get("role") == "merger" and "report" not in e for e in table.values())
+        if queue and not merging:  # a merger holds the queue, so the slices behind it keep their finish order
+            m = int(queue[0])
+            code = integrate_and_land(run, m, table[queue[0]]["report"], deadline, table, procs)
+            if code == CONFLICT:
+                continue
+            if code:
+                return code
+            table.pop(queue[0], None)
+            write_agents(run, table)
+            ask = True
+            continue
+        if ask:
+            ask = False
+            f = frontier(run, [int(k) for k in table], sequential, max_slices)
+            if f["stop"] == "done":
+                print("stop: done")
+                return 0
+            if f["stop"]:
+                print(render_picks(f), flush=True)
+                quietly(finish, run, f["stop"])
+                return PAUSED
+            for p in f["picks"]:
+                m = p["number"]
+                if p["action"] == "integrate":
+                    quietly(cmd_start, spec, m)
+                    table[str(m)] = {"role": "integrate", "pr": p["pr"], "report": None, "finished_at": stamp()}
+                    write_agents(run, table)
+                    print(f"queued #{m}: PR #{p['pr']} is already open", flush=True)
+                    continue
+                procs[m], log = launch_implementer(run, spec, m, table)
+                print(f"started #{m}: implementer pid {procs[m].pid}, log {log}", flush=True)
+            if f["picks"]:
+                continue
+        if not running:
+            ask = True
+            continue
+        if run.current().get("agents") != table:
+            write_agents(run, table)
+        if deadline is not None and time.monotonic() >= deadline:
+            names = ", ".join(f"#{m}" for m in running)
+            roles = {table.get(str(m), {}).get("role", "implementer") for m in running}
+            role = roles.pop() if len(roles) == 1 else "agent"
+            who = f"its {role} is" if len(running) == 1 else f"their {role}s are"
+            print(f"running {names}: {who} still at work after {wait:g} minutes; run this same command again to "
+                  "keep waiting", flush=True)
+            return PENDING
+        beat.beat()
+        time.sleep(max(POLL_SECONDS, 0.1))
+
+
 # open, confirm, cleanup
 
 def cmd_open(spec, base):
@@ -1468,6 +1904,7 @@ def cmd_preview(spec, sequential, max_slices, dry_run):
         return INBOX
     plan = checked_plan(run)
     base = run.base()
+    flags = {"sequential": "true" if sequential else "false", "max": "" if max_slices is None else max_slices}
     parallel, max_slices = run.mode(sequential, max_slices)
     post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
     print(f"base: {base}\nspec branch: {plan['spec_branch']}\nworktree root: {run.root}\n"
@@ -1475,11 +1912,11 @@ def cmd_preview(spec, sequential, max_slices, dry_run):
     print(render(plan))
     summary = progress_summary(plan)
     if dry_run:
-        run.status(step="preview", state="paused", summary=f"dry run: {summary}", next=f"/drive-spec {spec}")
+        run.status(step="preview", state="paused", summary=f"dry run: {summary}", next=f"/drive-spec {spec}", **flags)
     else:
         open_ = sum(x["state"] != "closed" for x in plan["slices"])
         run.status(step="explore", state="running", summary=f"{summary}; exploring {open_} open slice(s)",
-                   next="drive-spec explored once the notes and conflicts.md are written")
+                   next="drive-spec explored once the notes and conflicts.md are written", **flags)
     return 0
 
 
@@ -2041,7 +2478,7 @@ STEP_COMMANDS = {
     "guard": "drive-spec plan {spec}",
     "worktree": "drive-spec open {spec}",
     "preview": "drive-spec preview {spec}",
-    "build": "drive-spec frontier {spec}",
+    "build": "drive-spec build {spec} --wait-minutes 9",
     "review": "drive-spec review {spec}",
     "confirm": "drive-spec confirm {spec}",
     "cleanup": "drive-spec cleanup {spec}",
@@ -2072,6 +2509,10 @@ def next_step(run, status):
             return step, f"`drive-spec finish {spec} done`"
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
         return step, f"`/qa-pr {pr}`, then `drive-spec finish {spec} done`"
+    if step == "build":
+        flags = (" --sequential" if status.get("sequential") is True else "") + \
+            (f" --max {status['max']}" if status.get("max") is not None else "")
+        return step, f"`{STEP_COMMANDS[step].format(spec=spec)}{flags}`"
     if step in STEP_COMMANDS:
         return step, f"`{STEP_COMMANDS[step].format(spec=spec)}`"
     return step or "resolve", f"`drive-spec gate {spec} '<verify>' --base <base>`"
@@ -2220,6 +2661,13 @@ def main():
     st = sub.add_parser("start", help="open a frontier slice's worktree, label it, print the implementer brief")
     st.add_argument("spec")
     st.add_argument("slice")
+    bu = sub.add_parser("build", help="step 6: start each frontier slice, run its implementer agent, integrate and "
+                                      "land it, until the frontier stops; exit 0 at done")
+    bu.add_argument("spec")
+    bu.add_argument("--sequential", action="store_true")
+    bu.add_argument("--max", type=int, dest="max_slices", help="maxSlices; default from .claude/drive-spec.json")
+    bu.add_argument("--wait-minutes", type=float, dest="wait",
+                    help="return after this long, exit 6, while agents or gates run on; run again to pick up")
     h = sub.add_parser("halt", help="halt the run on a red slice: label, comment, status comment, status")
     h.add_argument("spec")
     h.add_argument("slice")
@@ -2312,6 +2760,8 @@ def main():
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
         elif args.cmd == "start":
             code = cmd_start(spec, int(args.slice.lstrip("#")))
+        elif args.cmd == "build":
+            code = cmd_build(spec, args.sequential, args.max_slices, args.wait)
         elif args.cmd == "halt":
             code = cmd_halt(spec, int(args.slice.lstrip("#")), " ".join(args.why).rstrip("."))
         elif args.cmd == "finish":

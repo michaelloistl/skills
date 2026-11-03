@@ -1,6 +1,6 @@
 # Implementer brief
 
-`drive-spec start` fills the placeholders and writes this to `<notes>/brief-<m>.md`, for an implementer subagent prompted `Read <file> and follow it.` Point, never paste: the subagent reads the issue and the spec itself. A placeholder `start` does not fill fails it, so a new one goes into its `brief()` too.
+`drive-spec start` fills the placeholders and writes this to `<notes>/brief-<m>.md`, for an implementer prompted `Read <file> and follow it.`: a subagent, or the agent `drive-spec build` launches. Point, never paste: the implementer reads the issue and the spec itself. A placeholder `start` does not fill fails it, so a new one goes into its `brief()` too.
 
 ```markdown
 You are implementing one tracer-bullet of a spec as a single vertical slice.
@@ -19,5 +19,7 @@ Commit in imperative present tense, one commit or a few focused ones, subject li
 
 Build each acceptance criterion as written.<If covered: " `<notes>/coverage.md` maps the spec's requirements to slices: build every requirement it maps to #<m>, and every one it maps to `every slice`, as part of this issue, as if it were a criterion."> When one cannot be met as written, or you build it differently, that is a deviation: a changelog line or ADR does not record it.
 
-Report back in one paragraph: what you built, the commit SHAs, and the verdict line `drive-spec verify` printed, quoted verbatim, such as `green 3a5b17c9eb8c` or `red 3a5b17c9eb8c: exit 1; log …`. Then a `Deviations:` list, one line per acceptance criterion you did not build as written and why, or `Deviations: none`. Then an `Unverified:` list, one line per behaviour you built that no test in the gate exercises and you could not prove otherwise, such as something seen only in a running app: what it is, why it stays unproven, and how the operator can check it; or `Unverified: none`. A guess that looks finished is worse than an honest line here.<If localOnly: " Then `Proof:` and one line: what you ran per `<proof>` and what you observed."> Red means the verify gate is failing and why; report it as red rather than committing around it.
+Report back in one paragraph: what you built and the commit SHAs. A guess that looks finished is worse than an honest line in the report. Red means the verify gate is failing and why; report it as red rather than committing around it.
+
+End the response with one report block, JSON between the tags, as the last thing in it: `drive-spec build` parses it. `<report>{"sha": "…", "verdict": "green", "verdictLine": "…", "deviations": [], "unverified": ["…"], "proof": null}</report>`. `sha` is the full SHA of the HEAD you verified. `verdict` is `green` or `red`. `verdictLine` is the verdict line `drive-spec verify` printed, quoted verbatim, such as `green 3a5b17c9eb8c` or `red 3a5b17c9eb8c: exit 1; log …`. `deviations` holds one string per acceptance criterion you did not build as written, and why. `unverified` holds one string per behaviour you built that no test in the gate exercises and you could not prove otherwise, such as something seen only in a running app: what it is, why it stays unproven, and how the operator can check it. An empty list means none. <If localOnly: "`proof` is one line: what you ran per `<proof>` and what you observed."><If notLocalOnly: "`proof` is `null`.">
 ```
