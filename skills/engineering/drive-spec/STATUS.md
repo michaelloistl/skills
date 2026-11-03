@@ -3,14 +3,14 @@
 One JSON file per spec, read by a dispatcher that watches every run on the machine without reading transcripts. Each write replaces the run's whole picture: the reader sees only this file, so `summary` and `next` stand alone.
 
 ```sh
-<skill dir>/status.sh <spec> step=<step> state=<state> summary="<one line>" next="<one line>" [base=…] [branch=…] [pr_url=…] [question="…" question_blocking=true|false]
+<skill dir>/status.sh <spec> step=<step> state=<state> summary="<one line>" next="<one line>" [base=…] [branch=…] [pr_url=…] [sequential=true|false] [max=<N>] [question="…" question_blocking=true|false]
 ```
 
 `status.sh` sits beside this file. It writes `$GIT_COMMON_DIR/drive-spec/status/spec-<spec>.json` atomically, merges into the previous write, stamps `updated_at`, `repo`, `host`, `session_id`, `config_dir` (the session's Claude config dir, where the dispatcher looks the session up), `pane` and `mux` itself, and always exits 0: a status write never stops the run. Each write and `--touch` holds an flock on `.spec-<spec>.lock` beside the file while it reads, rewrites and renames it, so a heartbeat from another process never puts back a map `build` just replaced. `key=` with an empty value clears that key. `pane` is the multiplexer pane the run writes from: `HERDR_PANE_ID` with `mux` `herdr`, else `REX_BLOCK` with `mux` `rex`; with neither set, the previous pair stays. A file written before `pane` existed holds `herdr_pane` instead, which the dispatcher still reads as a herdr pane; the next write with a pane replaces it.
 
 ## When
 
-At every step boundary, and within step 6 at each agent launch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`, except three partial writes; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists. The partial writes: `build`'s `agents` map (Agents), which replaces the map alone; `drive-spec ask --no-block`, which writes `step`, `question` and `question_blocking`; and the `--touch` heartbeat, which refreshes `updated_at` alone. Every key a partial write leaves out stays as the last full write left it.
+At every step boundary, and within step 6 at each agent launch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`, except three partial writes; `base` from step 1, `branch` from step 3, `sequential` and `max` from step 4, and `pr_url` once the spec PR exists. The partial writes: `build`'s `agents` map (Agents), which replaces the map alone; `drive-spec ask --no-block`, which writes `step`, `question` and `question_blocking`; and the `--touch` heartbeat, which refreshes `updated_at` alone. Every key a partial write leaves out stays as the last full write left it.
 
 | Step in progress | Written by |
 |---|---|
@@ -40,6 +40,8 @@ While a gate runs or waits for the host-wide lock, `drive-spec verify` refreshes
 | `done` | step 11 posted its QA comment with no failed scenario | `none` |
 
 `summary` in step 6 counts progress: `landed 3/7; building #2990, #2991`.
+
+`sequential` and `max` are the `--sequential` and `--max` that `drive-spec preview` was given on the command line, not the config's `parallel` and `maxSlices`: `sequential` is `true` or `false`, `max` a number or `null` when none was given. `drive-spec next` appends them to the `build` command it prints, `--sequential` when `sequential` is `true` and `--max <N>` when `max` is set, so a run resumed through `next` keeps the flags the operator gave.
 
 ## Agents
 

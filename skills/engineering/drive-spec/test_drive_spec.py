@@ -1571,7 +1571,7 @@ class Build(BuildCase):
     def test_a_green_claim_the_gate_never_gave_halts(self):
         self.mode(11, "unverified")
         out = self.run_ds("build", "10", "--sequential")
-        self.assert_halted(out, 11, "the report says green", "recorded no verdict for it")
+        self.assert_halted(out, 11, "the report says green", "recorded no gate verdict for it")
         self.assertEqual(self.gh_state()["pulls"], [])
 
     def test_a_second_death_halts(self):
@@ -2652,6 +2652,14 @@ class Boundaries(DispatcherCase):
         self.assertEqual(nxt(), "step: build\nnext: `drive-spec build 10 --wait-minutes 9`\n")
         self.run_ds("frontier", "10")
         self.assertEqual(nxt(), "step: review\nnext: `drive-spec review 10`\n")
+
+    def test_next_keeps_the_mode_and_ceiling_preview_was_given(self):
+        self.run_ds("gate", "10", GATE)
+        self.run_ds("preview", "10", "--sequential", "--max", "2")
+        self.run_ds("explore", "10")
+        self.close_all()
+        self.assertEqual(self.run_ds("next", "10").stdout,
+                         "step: build\nnext: `drive-spec build 10 --wait-minutes 9 --sequential --max 2`\n")
 
     def test_confirm_and_cleanup_read_the_inbox_first(self):
         self.close_all()

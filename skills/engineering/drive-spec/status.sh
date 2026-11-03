@@ -41,7 +41,9 @@ write() {
     value=${pair#*=}
     case "$key" in
       step|state|summary|next|pr_url|branch|base|question) ;;
-      question_blocking) value=$([ "$value" = true ] && echo true || echo false) ;;
+      question_blocking|sequential) value=$([ "$value" = true ] && echo true || echo false) ;;
+      max) [ -z "$value" ] || [[ "$value" =~ ^[0-9]+$ ]] ||
+        { echo "status.sh: max is not a number" >&2; continue; } ;;
       agents)
         updates=$(jq -c --argjson v "$value" '.agents = $v' <<<"$updates") ||
           { echo "status.sh: agents is not JSON" >&2; return 1; }
@@ -49,8 +51,8 @@ write() {
       *) echo "status.sh: unknown key $key" >&2; continue ;;
     esac
     updates=$(jq -c --arg k "$key" --arg v "$value" \
-      'if $k == "question_blocking" then .[$k] = ($v == "true")
-       elif $v == "" then .[$k] = null else .[$k] = $v end' <<<"$updates") || return 1
+      'if $k == "question_blocking" or $k == "sequential" then .[$k] = ($v == "true")
+       elif $v == "" then .[$k] = null elif $k == "max" then .[$k] = ($v | tonumber) else .[$k] = $v end' <<<"$updates") || return 1
   done
 
   tmp=$(mktemp "$dir/.spec-$spec.XXXXXX") || return 1

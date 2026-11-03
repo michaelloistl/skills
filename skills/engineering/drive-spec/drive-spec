@@ -1521,7 +1521,7 @@ class BadReport(Failed):
 
 
 class Mismatch(Failed):
-    """A green report the worktree contradicts: its SHA not HEAD, or a verdict `drive-spec verify` never recorded."""
+    """A green report the worktree contradicts: its SHA not HEAD, or a gate verdict `drive-spec verify` never recorded."""
 
 
 def parse_report(text, local_only, log):
@@ -1555,7 +1555,7 @@ def parse_report(text, local_only, log):
 
 def checked_report(run, m, wt, log):
     """The implementer's report, parsed from its log; a green one with its SHA the worktree's HEAD and green the
-    verdict `drive-spec verify` recorded for that commit. A red one halts the slice whatever the gate recorded."""
+    gate verdict `drive-spec verify` recorded for that commit. A red one halts the slice whatever the gate recorded."""
     results = [e for e in stream(log) if e.get("type") == "result"]
     local = (run.config.get("localOnly") or {}).get("label")
     labels = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "[.labels[].name]"))
@@ -1570,7 +1570,7 @@ def checked_report(run, m, wt, log):
     recorded = "green" if green(run, head, gate) else "red" if rec.get("gate") == gate and rec.get("exit") else None
     if recorded != rep["verdict"]:
         raise Mismatch(f"#{m}: the report says {rep['verdict']} for {head[:12]}, but `drive-spec verify` recorded "
-                     f"{recorded or 'no verdict'} for it; log {log}")
+                     f"{recorded or 'no gate verdict'} for it; log {log}")
     return rep
 
 
@@ -1892,6 +1892,7 @@ def cmd_preview(spec, sequential, max_slices, dry_run):
         return INBOX
     plan = checked_plan(run)
     base = run.base()
+    flags = {"sequential": "true" if sequential else "false", "max": "" if max_slices is None else max_slices}
     parallel, max_slices = run.mode(sequential, max_slices)
     post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
     print(f"base: {base}\nspec branch: {plan['spec_branch']}\nworktree root: {run.root}\n"
@@ -1899,11 +1900,11 @@ def cmd_preview(spec, sequential, max_slices, dry_run):
     print(render(plan))
     summary = progress_summary(plan)
     if dry_run:
-        run.status(step="preview", state="paused", summary=f"dry run: {summary}", next=f"/drive-spec {spec}")
+        run.status(step="preview", state="paused", summary=f"dry run: {summary}", next=f"/drive-spec {spec}", **flags)
     else:
         open_ = sum(x["state"] != "closed" for x in plan["slices"])
         run.status(step="explore", state="running", summary=f"{summary}; exploring {open_} open slice(s)",
-                   next="drive-spec explored once the notes and conflicts.md are written")
+                   next="drive-spec explored once the notes and conflicts.md are written", **flags)
     return 0
 
 
@@ -2496,6 +2497,10 @@ def next_step(run, status):
             return step, f"`drive-spec finish {spec} done`"
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
         return step, f"`/qa-pr {pr}`, then `drive-spec finish {spec} done`"
+    if step == "build":
+        flags = (" --sequential" if status.get("sequential") is True else "") + \
+            (f" --max {status['max']}" if status.get("max") is not None else "")
+        return step, f"`{STEP_COMMANDS[step].format(spec=spec)}{flags}`"
     if step in STEP_COMMANDS:
         return step, f"`{STEP_COMMANDS[step].format(spec=spec)}`"
     return step or "resolve", f"`drive-spec gate {spec} '<verify>' --base <base>`"
