@@ -10,7 +10,7 @@ One JSON file per spec, read by a dispatcher that watches every run on the machi
 
 ## When
 
-At every step boundary, and within step 6 at each dispatch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
+At every step boundary, and within step 6 at each agent launch, landing and halt. `step` is the step in progress: the command that ends one step writes the next as begun, with a `summary` of what just finished, so a long stretch of model work (exploring, implementers, review rounds) reads as its own step while it runs. The `drive-spec` commands write it, never the model; this table is their contract, and `test_drive_spec.py` holds them to it and runs the real dispatcher on what they write. Every write carries `step`, `state`, `summary` and `next`; `base` from step 1, `branch` from step 3, and `pr_url` once the spec PR exists.
 
 | Step in progress | Written by |
 |---|---|
@@ -90,7 +90,7 @@ Prints any unread notes and archives them; prints nothing when the inbox is empt
 
 A **base note** starts `## <base> advanced:` and names what landed in base, the files it changed, and an `Overlaps your branch:` line: the files the spec branch changes too.
 
-- Overlap listed: at this boundary, merge `origin/<base>` into the spec branch in the spec worktree. Conflicts go to a merger subagent, as in the integration queue; then `drive-spec verify <spec> <spec worktree>`, then push. Slices dispatched afterwards start from the merged branch; slices already in flight take it up at integration.
+- Overlap listed: at this boundary, merge `origin/<base>` into the spec branch in the spec worktree. A conflict goes to a merger subagent in the spec worktree, pointed at the conflicted files and the `git merge` to run; then `drive-spec verify <spec> <spec worktree>`, then push. Slices dispatched afterwards start from the merged branch; slices already in flight take it up at integration.
 - `Overlaps your branch: unknown`: base moved before the spec branch reached origin, and `open` cut it from the newer base: nothing to merge.
 
 Say in the next `summary` what the note led to: `merged develop (#2998)` or `develop #2998: nothing to merge`. A base commit that shares no file with the spec branch leaves no note.
