@@ -1,24 +1,23 @@
 ---
 name: portuguese
-description: Portuguese practice drill — one concept from my lessons, one sentence to translate, then correction.
+description: Portuguese practice from my lessons — a grammar drill, or a vocabulary round from my deck.
 disable-model-invocation: true
-argument-hint: "[concept or lesson to focus on]"
+argument-hint: "[concept] | vocab [topic] | add <words heard in class>"
 ---
 
 # Portuguese practice
 
-A **drill**: teach one concept, set one English sentence, grade the learner's Portuguese. The learner is a beginner–intermediate student; the lessons define what they know.
+The learner is a beginner–intermediate student; the lessons define what they know. Their weak spot is **comprehension**: the teacher speaks mostly Portuguese and they miss words.
 
-## Lessons folder
+## Folder
 
-`~/Portuguese/lessons/` holds screenshots of lessons covered (the **syllabus**). `~/Portuguese/practice-log.md` records past drills, one line each: `YYYY-MM-DD — <concept> — <correct | mistakes: …>`. Create the log if missing.
+- `~/Portuguese/lessons/`: screenshots of lessons covered (the **syllabus**). Follow the variety (European or Brazilian) they use, and use only vocabulary and grammar they cover, plus deck words.
+- `~/Portuguese/vocabulary.md`: the **deck**; format in [VOCAB.md](VOCAB.md).
+- `~/Portuguese/practice-log.md`: one line per session: `YYYY-MM-DD — <concept or "vocab (<topic>)"> — <correct | mistakes: …>`. Create if missing.
 
-## Steps
+## Pick the mode
 
-1. **Pick the concept.** If an argument names a concept or lesson, use it. Otherwise list the lessons folder, read the screenshots, read the log, and pick one concept the syllabus covers that the log shows as least practised or last missed. Done when you can name one concept, drawn from a screenshot, in a few words.
-2. **Teach it.** Explain that single concept briefly: the rule, two or three short Portuguese examples with English glosses, and the common trap. Use only vocabulary and grammar the syllabus covers. Follow the variety (European or Brazilian) the screenshots use.
-3. **Set the sentence.** Give one English sentence that exercises the concept, built from syllabus vocabulary. Ask the learner to write it in Portuguese, then stop and wait for the answer.
-4. **Grade the answer.** Reply with:
-   - **Correct answer**: the model Portuguese sentence, plus any equally valid alternatives.
-   - **Verdict**: correct, or the list of mistakes. For each mistake: what they wrote, the fix, and the rule behind it, tied back to the concept where it applies. Count accents, gender/number agreement, verb form, word order and spelling; a valid alternative phrasing counts as correct.
-5. **Log it.** Append the drill's line to the practice log. Offer another sentence on the same concept, or a new concept.
+- Argument starts `vocab` or `add` → **vocabulary round**: follow [VOCAB.md](VOCAB.md).
+- Otherwise → **grammar drill**: follow [DRILL.md](DRILL.md).
+
+Every session ends by appending its line to the log and offering the next round: same mode again, or the other mode.
