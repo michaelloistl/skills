@@ -1576,7 +1576,7 @@ def checked_report(run, m, wt, log):
         return rep
     head = git(wt, "rev-parse", "HEAD")
     if len(rep["sha"]) < 7 or not head.startswith(rep["sha"]):
-        raise Mismatch(f"#{m}: the report names {rep['sha'][:12] or 'no SHA'}, but {wt} is at {head[:12]}; log {log}")
+        raise Mismatch(f"#{m}: the report names {rep['sha'] or 'no SHA'}, but {wt} is at {head}; log {log}")
     gate = run_gate_of(run)
     rec = record(run, head)
     recorded = "green" if green(run, head, gate) else "red" if rec.get("gate") == gate and rec.get("exit") else None
