@@ -65,8 +65,8 @@ link_hooks_to() {
   local TARGET_DIR="$1"
   mkdir -p "$TARGET_DIR"
 
-  for hook in "$HOOKS_DIR"/block-*; do
-    [ -f "$hook" ] || continue
+  for hook in "$HOOKS_DIR"/*; do
+    [ -f "$hook" ] && [ -x "$hook" ] || continue
     hook_name="$(basename "$hook")"
     target="$TARGET_DIR/$hook_name"
 
