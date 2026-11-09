@@ -6,7 +6,8 @@ set -uo pipefail
 
 cmd=$(jq -r '.tool_input.command // ""')
 
-printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_-])(while|until)[[:space:]]' || exit 0
+loop="(^|[;&|({]|\\bdo|\\bthen|\\belse|-c[[:space:]]+['\"])[[:space:]]*(while|until)[[:space:]]"
+printf '%s' "$cmd" | grep -qE "$loop" || exit 0
 printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_-])sleep[[:space:]]' || exit 0
 printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_-])timeout[[:space:]]+(-[^[:space:]]+[[:space:]]+)*[0-9]' && exit 0
 
