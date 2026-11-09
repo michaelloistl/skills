@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Symlinks all skills into skill target directories for local development.
-# Run once after cloning, and again whenever you add a new skill folder.
+# Symlinks all skills into skill target directories, and hooks into each ~/.claude*/hooks, for local development.
+# Run once after cloning, and again whenever you add a new skill folder or hook.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SKILLS_DIR="$REPO/skills"
+HOOKS_DIR="$REPO/hooks"
 
 TARGET_DIRS=("$HOME/.agents/skills")
 
@@ -60,8 +61,41 @@ link_skills_to() {
   echo "Done. Skills available at $TARGET_DIR"
 }
 
+link_hooks_to() {
+  local TARGET_DIR="$1"
+  mkdir -p "$TARGET_DIR"
+
+  for hook in "$HOOKS_DIR"/block-*; do
+    [ -f "$hook" ] || continue
+    hook_name="$(basename "$hook")"
+    target="$TARGET_DIR/$hook_name"
+
+    if [ -L "$target" ] && [ "$(readlink "$target")" = "$hook" ]; then
+      echo "  ok  $hook_name"
+      continue
+    fi
+
+    if [ -L "$target" ]; then
+      rm "$target"
+    elif [ -e "$target" ]; then
+      echo "SKIP $hook_name — $target is a real file, remove it manually"
+      continue
+    fi
+
+    ln -s "$hook" "$target"
+    echo "linked $hook_name"
+  done
+}
+
 for dir in "${TARGET_DIRS[@]}"; do
   echo ""
   echo "==> $dir"
   link_skills_to "$dir"
+done
+
+for claude_dir in "$HOME"/.claude*/; do
+  [ -d "$claude_dir" ] || continue
+  echo ""
+  echo "==> ${claude_dir%/}/hooks"
+  link_hooks_to "${claude_dir%/}/hooks"
 done
