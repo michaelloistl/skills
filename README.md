@@ -20,4 +20,5 @@ skills/
 ├── personal/      # Personal / domain-specific skills
 └── wip/           # Drafts
 hooks/             # Claude Code hooks, see hooks/README.md
+mods/              # Claude Code mods, loaded via CLAUDE_CODE_PLUGIN_DIRS in settings.json `env`
 ```

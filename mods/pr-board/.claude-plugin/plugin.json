@@ -1,0 +1,14 @@
+{
+  "name": "pr-board",
+  "version": "0.1.0",
+  "description": "Pane of the repo's open PRs with status, linked GitHub issues and their Linear issues",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "driveSpecHosts": {
+      "type": "string",
+      "title": "drive-spec hosts",
+      "description": "Comma-separated hosts whose drive-spec runs to show: 'local' for this machine, else an ssh host name",
+      "default": "local,devbox"
+    }
+  }
+}
