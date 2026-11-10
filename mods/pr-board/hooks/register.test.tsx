@@ -30,6 +30,7 @@ const PRS = [
     author: { login: 'ml' },
     isDraft: false,
     baseRefName: 'develop',
+    headRefName: 'fix-burn',
     reviewDecision: 'APPROVED',
     mergeable: 'MERGEABLE',
     statusCheckRollup: [{ conclusion: 'SUCCESS', status: 'COMPLETED' }],
@@ -41,6 +42,7 @@ const RUNS = [
   { spec: '5', state: 'running', step: 'build', summary: 'landed 1/2; building #6', pr_url: 'https://github.com/o/r/pull/12', acked: false },
   { spec: '8', state: 'waiting', step: 'build', summary: 'landed 0/3', pr_url: null, acked: false, attention: 'ASK', question: 'Keep the gap?' },
   { spec: '9', state: 'done', step: 'qa-pr', summary: 'done', pr_url: 'https://github.com/o/r/pull/40', acked: false, attention: 'PR' },
+  { spec: '7', state: null, step: null, summary: 'no status file', pr_url: null, acked: false },
   { spec: '3', state: 'done', step: 'qa-pr', summary: 'done', pr_url: 'https://github.com/o/r/pull/4', acked: true },
 ]
 const ISSUES = {
@@ -84,6 +86,7 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
     const ok = (stdout: string) => ({
       value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     })
+    if (e.argv[0] === 'git' && e.argv[1] === 'branch') return ok('fix-burn\n')
     if (e.argv[0] === 'git') return ok('/home/repo/.git\n')
     if (e.argv[0] === 'sh') return ok('[]')
     if (e.argv[0] === 'ssh') {
@@ -104,19 +107,24 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   await $.command.run(PRS_CMD)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /Fix burn/ }))?.text).toBe('Fix burn @ml')
-  expect((await ui.find({ type: 'Text', text: /approved/ }))?.text).toBe('[approved]')
+  expect((await ui.find({ type: 'Text', text: /Fix burn/ }))?.text).toBe('Fix burn')
+  expect((await ui.find({ type: 'Text', text: /this session/ }))?.text).toBe(' ◉ this session ')
+  expect((await ui.find({ type: 'Text', text: /^fix-burn$/ }))?.text).toBe('fix-burn')
+  expect((await ui.find({ type: 'Text', text: /approved/ }))?.text).toBe(' approved ')
+  expect((await ui.find({ type: 'Text', text: /FOL-1835/ }))?.text).toBe(' FOL-1835 ')
   expect(await ui.find({ type: 'Button', key: 'i-12-7' })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: 'l-12-FOL-1835' })).toBeTruthy()
 
   expect(dispatched[0]?.slice(0, 6)).toEqual(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'devbox'])
   expect(dispatched[0]?.[6]).toContain('cd "$HOME/repo"')
-  expect((await ui.find({ type: 'Text', text: /building #6/ }))?.text).toBe('landed 1/2; building #6 · devbox')
+  expect((await ui.find({ type: 'Text', text: /building #6/ }))?.text).toBe('building #6')
+  expect((await ui.find({ type: 'Text', text: /▰/ }))?.text).toBe('▰▱')
   expect(await ui.find({ type: 'Button', key: 'prrun-12' })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: 'run-devbox-8' })).toBeTruthy()
-  expect((await ui.find({ type: 'Text', text: /Keep the gap/ }))?.text).toBe('  ! ASK: Keep the gap?')
+  expect((await ui.find({ type: 'Text', text: /Keep the gap/ }))?.text).toBe('▲ ASK: Keep the gap?')
   expect(await ui.find({ type: 'Button', key: 'run-devbox-3' })).toBeFalsy()
   expect(await ui.find({ type: 'Button', key: 'run-devbox-9' })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: 'run-devbox-7' })).toBeFalsy()
 
   await ui.press({ key: 'more-12' })
   await ui.press({ key: 'fix-ci-12' })

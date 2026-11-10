@@ -17,6 +17,7 @@ export type Pr = {
   checks: Checks
   mergeable: string
   baseRef: string
+  headRef: string
   /** The spec whose branch this PR merges into: a drive-spec slice PR. */
   sliceOf?: number
   issues: LinkedIssue[]
@@ -43,6 +44,6 @@ export type Board = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'pr-board': { board: Shaped<Board>; expanded: Shaped<number> }
+    'pr-board': { board: Shaped<Board>; expanded: Shaped<number>; branch: Shaped<string> }
   }
 }

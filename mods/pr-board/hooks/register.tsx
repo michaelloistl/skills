@@ -6,12 +6,15 @@ import type { Board, Checks, LinearRef, LinkedIssue, Pr, SpecRun } from '../type
 const PANE = 'pr-board'
 const TITLE = 'Open PRs'
 const REFRESH_MS = 120_000
+const BRANCH_MS = 5_000
 
 const EMPTY: Board = { repo: '', prs: [], runs: [], runErrors: [], fetchedAt: 0, isLoading: false }
 const board = atom({ plugin: 'pr-board', key: 'board' } as const, EMPTY, {
-  shape: 'board-3',
+  shape: 'board-4',
 })
 // The PR whose action row shows; 0 for none.
+// The branch checked out in the session's folder: its PR is this session's.
+const branch = atom({ plugin: 'pr-board', key: 'branch' } as const, '', { shape: 'branch-1' })
 const expanded = atom({ plugin: 'pr-board', key: 'expanded' } as const, 0, { shape: 'expanded-1' })
 
 type RollupItem = { conclusion?: string; status?: string; state?: string }
@@ -22,6 +25,7 @@ type RawPr = {
   author?: { login?: string }
   isDraft: boolean
   baseRefName?: string
+  headRefName?: string
   reviewDecision?: string
   mergeable?: string
   statusCheckRollup?: RollupItem[]
@@ -108,7 +112,8 @@ export function dispatchScript(repoFromHome: string): string {
 export function parseRuns(host: string, json: string): SpecRun[] {
   const raw: RawRun[] = JSON.parse(json || '[]')
   return raw
-    .filter(r => r.spec && !(r.state === 'done' && r.acked))
+    // A row with no state is a pane dispatch matched by name with no status file behind it.
+    .filter(r => r.spec && r.state && !(r.state === 'done' && r.acked))
     .map(r => {
       const pr = r.pr_url?.match(/\/pull\/(\d+)/)?.[1]
       const text = r.attention === 'ASK' ? r.question : r.detail
@@ -161,7 +166,7 @@ async function fetchBoard($: EngineInterface): Promise<Board> {
     await gh(
       $,
       ['pr', 'list', '--state', 'open', '--limit', '50', '--json',
-        'number,title,url,author,isDraft,baseRefName,reviewDecision,mergeable,statusCheckRollup,closingIssuesReferences,body'],
+        'number,title,url,author,isDraft,baseRefName,headRefName,reviewDecision,mergeable,statusCheckRollup,closingIssuesReferences,body'],
       cwd,
     ),
   )
@@ -202,6 +207,7 @@ async function fetchBoard($: EngineInterface): Promise<Board> {
     checks: checksOf(p.statusCheckRollup),
     mergeable: p.mergeable ?? '',
     baseRef: p.baseRefName ?? 'main',
+    headRef: p.headRefName ?? '',
     ...sliceOf(p.baseRefName),
     issues: (refsByPr.get(p.number) ?? []).flatMap(n => issues.get(n) ?? []),
   }))
@@ -221,29 +227,54 @@ async function refresh($: EngineInterface): Promise<void> {
   }
 }
 
-const CHECK_LOOK: Record<Checks, { mark: string; color: string }> = {
-  pass: { mark: '✓', color: 'green' },
-  fail: { mark: '✗', color: 'red' },
-  pending: { mark: '●', color: 'yellow' },
-  none: { mark: '·', color: 'gray' },
+// Theme keys, so the pane follows the person's light or dark theme.
+const LINEAR = '#5E6AD2'
+
+const CHECK_LOOK: Record<Checks, { label: string; color: string }> = {
+  pass: { label: '✓ CI', color: 'success' },
+  fail: { label: '✗ CI', color: 'error' },
+  pending: { label: '● CI', color: 'warning' },
+  none: { label: '· no CI', color: 'inactive' },
 }
 
 const STATE_COLOR: Record<string, string> = {
-  running: 'cyan',
-  waiting: 'yellow',
-  halted: 'red',
-  done: 'green',
+  running: 'suggestion',
+  waiting: 'warning',
+  halted: 'error',
+  done: 'success',
 }
 
 function reviewLabel(pr: Pr): { text: string; color: string } {
-  if (pr.isDraft) return { text: 'draft', color: 'gray' }
-  if (pr.mergeable === 'CONFLICTING') return { text: 'conflicts', color: 'red' }
+  if (pr.isDraft) return { text: 'draft', color: 'inactive' }
+  if (pr.mergeable === 'CONFLICTING') return { text: 'conflicts', color: 'error' }
   switch (pr.review) {
-    case 'APPROVED': return { text: 'approved', color: 'green' }
-    case 'CHANGES_REQUESTED': return { text: 'changes', color: 'red' }
-    case 'REVIEW_REQUIRED': return { text: 'review', color: 'yellow' }
-    default: return { text: 'open', color: 'cyan' }
+    case 'APPROVED': return { text: 'approved', color: 'success' }
+    case 'CHANGES_REQUESTED': return { text: 'changes requested', color: 'warning' }
+    case 'REVIEW_REQUIRED': return { text: 'needs review', color: 'warning' }
+    default: return { text: 'open', color: 'suggestion' }
   }
+}
+
+// The card's border: the worst of CI and review, else how far along it is.
+export function accentOf(pr: Pr): string {
+  if (pr.checks === 'fail' || pr.mergeable === 'CONFLICTING') return 'error'
+  if (pr.isDraft) return 'inactive'
+  if (pr.checks === 'pending' || pr.review === 'CHANGES_REQUESTED') return 'warning'
+  if (pr.review === 'APPROVED') return 'success'
+  return 'subtle'
+}
+
+// "landed 5/6; building #3626" → { done: 5, total: 6, rest: 'building #3626' }
+export function progressOf(summary: string): { done: number; total: number; rest: string } | undefined {
+  const m = summary.match(/landed (\d+)\/(\d+);?\s*(.*)$/)
+  if (!m) return undefined
+  return { done: Number(m[1]), total: Number(m[2]), rest: m[3] ?? '' }
+}
+
+export function bar(done: number, total: number, width = 10): string {
+  const cells = Math.max(1, Math.min(width, total))
+  const filled = total > 0 ? Math.round((done / total) * cells) : 0
+  return '▰'.repeat(filled) + '▱'.repeat(cells - filled)
 }
 
 type Action = { slug: string; label: string; isNeeded: (pr: Pr) => boolean; prompt: (pr: Pr) => string }
@@ -291,6 +322,12 @@ async function launch($: EngineInterface, pr: Pr, action: Action): Promise<void>
   }
 }
 
+async function readBranch($: EngineInterface): Promise<void> {
+  const r = await $.process.run(['git', 'branch', '--show-current'], { cwd: await $.session.cwd() })
+  const name = r.exitCode === 0 ? r.stdout.trim() : ''
+  if (name !== (await read($, branch))) await update($, branch, () => name)
+}
+
 const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE)
 
 export const register: Register = (on, options) => {
@@ -303,6 +340,12 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'prs', description: 'Toggle the pane of open PRs with status and linked GitHub / Linear issues' })
     // A reload keeps the pane up but may drop a board stored in an older shape.
     if (await isOpen($)) void refresh($)
+    void readBranch($)
+    $.clock.every(BRANCH_MS, () => {
+      void isOpen($).then(open => {
+        if (open) return readBranch($)
+      })
+    })
     $.clock.every(REFRESH_MS, () => {
       void isOpen($).then(open => {
         if (open) return refresh($)
@@ -317,6 +360,7 @@ export const register: Register = (on, options) => {
       return { text: 'Open PRs pane closed.' }
     }
     await $.ui.open({ id: PANE, title: TITLE })
+    void readBranch($)
     void refresh($)
     return { text: 'Open PRs pane opened.' }
   })
@@ -325,88 +369,172 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const b = await read($, board)
     const shown = await read($, expanded)
+    const current = await read($, branch)
+    const mine = b.prs.find(p => current && p.headRef === current)
+    const prs = mine ? [mine, ...b.prs.filter(p => p !== mine)] : b.prs
     const open = (url: string) => () => void $.process.run(['open', url])
     const issueUrl = (n: number) => `https://github.com/${b.repo}/issues/${n}`
     const listed = new Set(b.prs.map(p => p.number))
     const runOf = new Map(b.runs.flatMap(r => (r.prNumber ? [[r.prNumber, r] as const] : [])))
     // A finished run whose PR has closed is history, not work.
     const unlisted = b.runs.filter(r => !r.prNumber || (!listed.has(r.prNumber) && r.state !== 'done'))
-    const runLine = (r: SpecRun, key: string) => (
-      <Box key={key} flexDirection="column" paddingLeft={2}>
-        <Box flexDirection="row" gap={1}>
-          <Box flexShrink={0}><Text color={STATE_COLOR[r.state] ?? 'gray'}>⚙</Text></Box>
-          <Box flexShrink={0}>
-            <Button key={key} plain onPress={open(issueUrl(r.spec))}>{`spec #${r.spec}`}</Button>
-          </Box>
-          <Box flexShrink={0}><Text color={STATE_COLOR[r.state] ?? 'gray'}>{`[${r.state} · ${r.step}]`}</Text></Box>
-          <Text dimColor wrap="truncate-end">
-            {r.summary} · {r.host}
-          </Text>
-        </Box>
-        {r.attention && <Text color="yellow" wrap="truncate-end">{`  ! ${r.attention}`}</Text>}
+
+    const chip = (text: string, color: string) => (
+      <Box flexShrink={0}>
+        <Text backgroundColor={color} color="inverseText" bold>{` ${text} `}</Text>
       </Box>
     )
+
+    const runRow = (r: SpecRun, key: string) => {
+      const color = STATE_COLOR[r.state] ?? 'inactive'
+      const p = progressOf(r.summary)
+      return (
+        <Box key={key} flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Box flexShrink={0}><Text color={color}>⚙</Text></Box>
+            <Box flexShrink={0}>
+              <Button key={key} plain onPress={open(issueUrl(r.spec))}>{`spec #${r.spec}`}</Button>
+            </Box>
+            {chip(r.state === 'running' ? r.step : `${r.state} · ${r.step}`, color)}
+            {p && (
+              <Box flexShrink={0}>
+                <Text color={color}>{bar(p.done, p.total)}</Text>
+                <Text dimColor>{` ${p.done}/${p.total}`}</Text>
+              </Box>
+            )}
+            <Text dimColor wrap="truncate-end">{p ? p.rest : r.summary}</Text>
+            <Box flexShrink={0}><Text color="subtle">{`@${r.host}`}</Text></Box>
+          </Box>
+          {r.attention && (
+            <Box paddingLeft={2}>
+              <Text color="warning" wrap="truncate-end">{`▲ ${r.attention}`}</Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    const failing = b.prs.filter(p => p.checks === 'fail').length
+    const conflicts = b.prs.filter(p => p.mergeable === 'CONFLICTING').length
+    const running = b.runs.filter(r => r.state === 'running' || r.state === 'waiting').length
 
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between">
-          <Text bold>{b.repo || 'Open PRs'}</Text>
-          <Button key="refresh" onPress={() => void refresh($)}>{b.isLoading ? 'Loading…' : 'Refresh'}</Button>
+          <Box flexDirection="row" gap={1}>
+            <Text bold color="claude">⎇</Text>
+            <Text bold>{b.repo || 'Open PRs'}</Text>
+          </Box>
+          <Button key="refresh" plain dimColor onPress={() => void refresh($)}>{b.isLoading ? '↻ loading…' : '↻ refresh'}</Button>
         </Box>
-        {b.error && <Text color="red" wrap="wrap">{b.error}</Text>}
-        {unlisted.length > 0 && (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold>drive-spec runs</Text>
-            {unlisted.map(r => runLine(r, `run-${r.host}-${r.spec}`))}
+        {b.repo && (
+          <Box flexDirection="row" gap={1} marginTop={1}>
+            {chip(`${b.prs.length} open`, 'subtle')}
+            {failing > 0 && chip(`${failing} failing`, 'error')}
+            {conflicts > 0 && chip(`${conflicts} conflicting`, 'error')}
+            {running > 0 && chip(`${running} spec${running === 1 ? '' : 's'} running`, 'suggestion')}
           </Box>
         )}
+        {b.error && <Text color="error" wrap="wrap">{b.error}</Text>}
         {b.runErrors.map(err => (
           <Text key={err} dimColor wrap="truncate-end">{`drive-spec ${err}`}</Text>
         ))}
-        {!b.isLoading && !b.error && b.prs.length === 0 && <Text dimColor>No open PRs.</Text>}
-        {b.prs.map(pr => {
+
+        {unlisted.length > 0 && (
+          <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
+            <Text bold color="suggestion">drive-spec · no PR yet</Text>
+            {unlisted.map(r => runRow(r, `run-${r.host}-${r.spec}`))}
+          </Box>
+        )}
+
+        {current && !mine && b.repo && !b.isLoading && (
+          <Box flexDirection="row" gap={1} marginTop={1} borderStyle="bold" borderColor="claude" paddingX={1}>
+            {chip('◉ this session', 'claude')}
+            <Text bold wrap="truncate-end">{current}</Text>
+            <Box flexShrink={0}><Text dimColor>no PR</Text></Box>
+          </Box>
+        )}
+
+        {!b.isLoading && !b.error && b.repo && b.prs.length === 0 && (
+          <Box marginTop={1}><Text dimColor>No open PRs. ✨</Text></Box>
+        )}
+
+        {prs.map(pr => {
           const c = CHECK_LOOK[pr.checks]
           const r = reviewLabel(pr)
+          const run = runOf.get(pr.number)
+          const isMine = pr === mine
           return (
-            <Box key={`pr-${pr.number}`} flexDirection="column" marginTop={1}>
+            <Box
+              key={`pr-${pr.number}`}
+              flexDirection="column"
+              borderStyle={isMine ? 'bold' : 'round'}
+              borderColor={isMine ? 'claude' : accentOf(pr)}
+              paddingX={1}
+            >
+              {isMine && (
+                <Box flexDirection="row" gap={1}>
+                  {chip('◉ this session', 'claude')}
+                  <Text color="claude" wrap="truncate-end">{pr.headRef}</Text>
+                </Box>
+              )}
               <Box flexDirection="row" gap={1}>
-                <Box flexShrink={0}><Text color={c.color}>{c.mark}</Text></Box>
-                <Box flexShrink={0}><Button key={`pr-${pr.number}`} plain onPress={open(pr.url)}>{`#${pr.number}`}</Button></Box>
+                {chip(c.label, c.color)}
+                {chip(r.text, r.color)}
+                <Box flexShrink={0}>
+                  <Button key={`pr-${pr.number}`} plain onPress={open(pr.url)}>{`#${pr.number}`}</Button>
+                </Box>
+                <Box flexGrow={1} flexShrink={1}>
+                  <Text bold wrap="truncate-end">{pr.title}</Text>
+                </Box>
                 <Box flexShrink={0}>
                   <Button key={`more-${pr.number}`} plain dimColor={shown !== pr.number} onPress={() => void update($, expanded, n => (n === pr.number ? 0 : pr.number))}>⋯</Button>
                 </Box>
-                <Box flexShrink={0}><Text color={r.color}>{`[${r.text}]`}</Text></Box>
-                <Text wrap="truncate-end">
-                  {pr.title} <Text dimColor>@{pr.author}</Text>
-                </Text>
               </Box>
-              {runOf.has(pr.number) && runLine(runOf.get(pr.number)!, `prrun-${pr.number}`)}
-              {pr.sliceOf !== undefined && (
-                <Box flexDirection="row" gap={1} paddingLeft={2}>
-                  <Text dimColor>⚙ slice of</Text>
-                  <Button key={`slice-${pr.number}`} plain dimColor onPress={open(issueUrl(pr.sliceOf))}>{`spec #${pr.sliceOf}`}</Button>
-                </Box>
-              )}
+              <Box flexDirection="row" gap={1}>
+                <Text color="subtle">{`@${pr.author}`}</Text>
+                <Text dimColor>{`→ ${pr.baseRef}`}</Text>
+                {pr.sliceOf !== undefined && (
+                  <Box flexDirection="row">
+                    <Text dimColor>· slice of </Text>
+                    <Button key={`slice-${pr.number}`} plain dimColor onPress={open(issueUrl(pr.sliceOf))}>{`spec #${pr.sliceOf}`}</Button>
+                  </Box>
+                )}
+              </Box>
+
               {shown === pr.number && (
-                <Box flexDirection="row" gap={1} paddingLeft={2}>
+                <Box flexDirection="row" gap={1} marginY={1}>
                   {ACTIONS.map(a => (
                     <Button key={`${a.slug}-${pr.number}`} variant={a.isNeeded(pr) ? 'primary' : undefined} onPress={() => void launch($, pr, a)}>{a.label}</Button>
                   ))}
                 </Box>
               )}
-              {pr.issues.map(i => (
-                <Box key={`i-${pr.number}-${i.number}`} flexDirection="row" gap={1} paddingLeft={2}>
-                  <Box flexShrink={0}><Text dimColor>└</Text></Box>
-                  <Button key={`i-${pr.number}-${i.number}`} plain dimColor={i.state === 'CLOSED'} onPress={open(i.url)}>{`#${i.number}`}</Button>
-                  {i.linear.map(l => (
-                    <Button key={`l-${pr.number}-${l.key}`} plain onPress={open(l.url)}>{l.key}</Button>
-                  ))}
-                  <Text dimColor wrap="truncate-end">
-                    {i.state === 'CLOSED' ? '(closed) ' : ''}
-                    {i.title}
-                  </Text>
+
+              {run && <Box marginTop={1}>{runRow(run, `prrun-${pr.number}`)}</Box>}
+
+              {pr.issues.length > 0 && (
+                <Box flexDirection="column" marginTop={1}>
+                  {pr.issues.map(i => {
+                    const isClosed = i.state === 'CLOSED'
+                    return (
+                      <Box key={`i-${pr.number}-${i.number}`} flexDirection="row" gap={1}>
+                        <Box flexShrink={0}><Text color={isClosed ? 'merged' : 'success'}>{isClosed ? '✓' : '◆'}</Text></Box>
+                        <Box flexShrink={0}>
+                          <Button key={`i-${pr.number}-${i.number}`} plain dimColor={isClosed} onPress={open(i.url)}>{`#${i.number}`}</Button>
+                        </Box>
+                        {i.linear.map(l => (
+                          <Box key={`l-${pr.number}-${l.key}`} flexShrink={0}>
+                            <Button key={`l-${pr.number}-${l.key}`} plain onPress={open(l.url)}>
+                              <Text backgroundColor={LINEAR} color="#FFFFFF" bold>{` ${l.key} `}</Text>
+                            </Button>
+                          </Box>
+                        ))}
+                        <Text dimColor={isClosed} strikethrough={isClosed} wrap="truncate-end">{i.title}</Text>
+                      </Box>
+                    )
+                  })}
                 </Box>
-              ))}
+              )}
             </Box>
           )
         })}
