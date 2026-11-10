@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, UiPressArgument } from 'claude-code'
 
 import type { Board, Checks, LinearRef, LinkedIssue, Pr, SpecRun } from '../types'
 
@@ -378,6 +378,20 @@ async function readBranch($: EngineInterface): Promise<void> {
   if (name !== (await read($, branch))) await update($, branch, () => name)
 }
 
+// macOS opens a URL in the person's browser; elsewhere (a devbox) a browser
+// would open on the wrong machine, so the URL goes to the clipboard instead.
+let isMac: boolean | undefined
+
+async function openUrl($: EngineInterface, url: string, press: UiPressArgument): Promise<void> {
+  isMac ??= (await $.process.run(['uname', '-s'])).stdout.trim() === 'Darwin'
+  if (isMac) {
+    await $.process.run(['open', url])
+    return
+  }
+  const copied = await $.ui.copy({ text: url, surface: press.surface })
+  await $.ui.toast(copied.isCopied ? `Copied ${url}` : url)
+}
+
 const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE)
 
 export const register: Register = (on, options) => {
@@ -439,7 +453,7 @@ export const register: Register = (on, options) => {
     const session = sessionPrOf(b.prs, pin, await read($, mentions), current)
     const mine = session?.pr
     const prs = mine ? [mine, ...b.prs.filter(p => p !== mine)] : b.prs
-    const open = (url: string) => () => void $.process.run(['open', url])
+    const open = (url: string) => (press: UiPressArgument) => void openUrl($, url, press)
     const issueUrl = (n: number) => `https://github.com/${b.repo}/issues/${n}`
     const listed = new Set(b.prs.map(p => p.number))
     const runOf = new Map(b.runs.flatMap(r => (r.prNumber ? [[r.prNumber, r] as const] : [])))

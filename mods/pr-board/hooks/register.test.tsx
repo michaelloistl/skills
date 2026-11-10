@@ -106,10 +106,16 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   const dispatched: (readonly string[])[] = []
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home' : '/home/.claude-on' }))
   on('ui.toast', () => ({ value: undefined }))
+  const copied: string[] = []
+  on('ui.copy', (_, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
+  })
   on('process.run', (_, e) => {
     const ok = (stdout: string) => ({
       value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     })
+    if (e.argv[0] === 'uname') return ok('Linux\n')
     if (e.argv[0] === 'git' && e.argv[1] === 'branch') return ok('fix-burn\n')
     if (e.argv[0] === 'git') return ok('/home/repo/.git\n')
     if (e.argv[0] === 'sh') return ok('[]')
@@ -150,6 +156,9 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   expect(await ui.find({ type: 'Button', key: 'run-devbox-3' })).toBeFalsy()
   expect(await ui.find({ type: 'Button', key: 'run-devbox-9' })).toBeFalsy()
   expect(await ui.find({ type: 'Button', key: 'run-devbox-7' })).toBeFalsy()
+
+  await ui.press({ key: 'i-12-7' })
+  expect(copied).toEqual(['https://github.com/o/r/issues/7'])
 
   await ui.press({ key: 'more-12' })
   await ui.press({ key: 'fix-ci-12' })
