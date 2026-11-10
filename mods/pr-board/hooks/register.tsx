@@ -1,16 +1,16 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, UiPressArgument } from 'claude-code'
 
-import type { Board, Checks, LinearRef, LinkedIssue, Pr, SpecRun } from '../types'
+import type { Board, Checks, LinearRef, LinkedIssue, MergedSlice, Pr, SpecRun } from '../types'
 
 const PANE = 'pr-board'
 const TITLE = 'Open PRs'
 const REFRESH_MS = 120_000
 const BRANCH_MS = 5_000
 
-const EMPTY: Board = { repo: '', prs: [], runs: [], runErrors: [], fetchedAt: 0, isLoading: false }
+const EMPTY: Board = { repo: '', prs: [], runs: [], runErrors: [], merged: [], fetchedAt: 0, isLoading: false }
 const board = atom({ plugin: 'pr-board', key: 'board' } as const, EMPTY, {
-  shape: 'board-4',
+  shape: 'board-5',
 })
 // The PR whose action row shows; 0 for none.
 // The branch checked out in the session's folder: its PR is this session's.
@@ -75,9 +75,37 @@ export function linearRefs(text: string): LinearRef[] {
   return [...out.values()]
 }
 
+// A spec branch: agent/local-spec-<n>-<slug>, or agent/spec-<n>-<slug> in CI.
+export function specOfBranch(ref?: string): number | undefined {
+  const spec = ref?.match(/^agent\/(?:local-)?spec-(\d+)-/)?.[1]
+  return spec ? Number(spec) : undefined
+}
+
 function sliceOf(base?: string): { sliceOf?: number } {
-  const spec = base?.match(/^agent\/(?:local-)?spec-(\d+)-/)?.[1]
-  return spec ? { sliceOf: Number(spec) } : {}
+  const spec = specOfBranch(base)
+  return spec ? { sliceOf: spec } : {}
+}
+
+const MERGED_WINDOW_MS = 24 * 60 * 60 * 1000
+
+type RawMerged = { number: number; title: string; url: string; mergedAt?: string; baseRefName?: string }
+
+export function mergedSlices(raw: readonly RawMerged[], now: number): MergedSlice[] {
+  return raw
+    .flatMap(p => {
+      const spec = specOfBranch(p.baseRefName)
+      const mergedAt = p.mergedAt ? Date.parse(p.mergedAt) : NaN
+      if (!spec || Number.isNaN(mergedAt) || now - mergedAt > MERGED_WINDOW_MS) return []
+      return [{ spec, number: p.number, title: p.title, url: p.url, mergedAt }]
+    })
+    .sort((a, b) => b.mergedAt - a.mergedAt)
+}
+
+export function ago(ms: number): string {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  if (m < 60) return `${m}m`
+  const h = Math.round(m / 60)
+  return h < 24 ? `${h}h` : `${Math.round(h / 24)}d`
 }
 
 async function gh($: EngineInterface, args: string[], cwd: string): Promise<string> {
@@ -166,6 +194,11 @@ async function fetchBoard($: EngineInterface): Promise<Board> {
   const cwd = await $.session.cwd()
   const repo = JSON.parse(await gh($, ['repo', 'view', '--json', 'nameWithOwner'], cwd)).nameWithOwner as string
   const runsP = fetchRuns($, cwd)
+  const mergedP = gh(
+    $,
+    ['pr', 'list', '--state', 'merged', '--limit', '40', '--json', 'number,title,url,mergedAt,baseRefName'],
+    cwd,
+  ).then(out => JSON.parse(out) as RawMerged[], () => [])
   const raw: RawPr[] = JSON.parse(
     await gh(
       $,
@@ -217,7 +250,9 @@ async function fetchBoard($: EngineInterface): Promise<Board> {
   }))
 
   const { runs, runErrors } = await runsP
-  return { repo, prs, runs, runErrors, fetchedAt: await $.clock.now(), isLoading: false }
+  const fetchedAt = await $.clock.now()
+  const merged = mergedSlices(await mergedP, fetchedAt)
+  return { repo, prs, runs, runErrors, merged, fetchedAt, isLoading: false }
 }
 
 async function refresh($: EngineInterface): Promise<void> {
@@ -495,6 +530,22 @@ export const register: Register = (on, options) => {
       )
     }
 
+    const mergedLine = (spec: number | undefined, key: string) => {
+      const slices = spec ? b.merged.filter(m => m.spec === spec).slice(0, 4) : []
+      if (slices.length === 0) return undefined
+      return (
+        <Box key={key} flexDirection="row" gap={1}>
+          <Box flexShrink={0}><Text color="merged">⤷ merged</Text></Box>
+          {slices.map((m, i) => (
+            <Box key={`${key}-${m.number}`} flexDirection="row" flexShrink={i === 0 ? 0 : 1}>
+              <Button key={`${key}-${m.number}`} plain dimColor onPress={open(m.url)}>{`#${m.number}`}</Button>
+              <Text dimColor>{` ${ago(b.fetchedAt - m.mergedAt)}`}</Text>
+            </Box>
+          ))}
+        </Box>
+      )
+    }
+
     const failing = b.prs.filter(p => p.checks === 'fail').length
     const conflicts = b.prs.filter(p => p.mergeable === 'CONFLICTING').length
     const running = b.runs.filter(r => r.state === 'running' || r.state === 'waiting').length
@@ -524,7 +575,12 @@ export const register: Register = (on, options) => {
         {unlisted.length > 0 && (
           <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
             <Text bold color="suggestion">drive-spec · no PR yet</Text>
-            {unlisted.map(r => runRow(r, `run-${r.host}-${r.spec}`))}
+            {unlisted.map(r => (
+              <Box key={`run-${r.host}-${r.spec}`} flexDirection="column">
+                {runRow(r, `run-${r.host}-${r.spec}`)}
+                {mergedLine(r.spec, `merged-run-${r.spec}`)}
+              </Box>
+            ))}
           </Box>
         )}
 
@@ -545,6 +601,7 @@ export const register: Register = (on, options) => {
           const r = reviewLabel(pr)
           const run = runOf.get(pr.number)
           const isMine = pr === mine
+          const slices = mergedLine(run?.spec ?? specOfBranch(pr.headRef), `merged-pr-${pr.number}`)
           return (
             <Box
               key={`pr-${pr.number}`}
@@ -598,7 +655,12 @@ export const register: Register = (on, options) => {
                 </Box>
               )}
 
-              {run && <Box marginTop={1}>{runRow(run, `prrun-${pr.number}`)}</Box>}
+              {(run || slices) && (
+                <Box marginTop={1} flexDirection="column">
+                  {run && runRow(run, `prrun-${pr.number}`)}
+                  {slices}
+                </Box>
+              )}
 
               {pr.issues.length > 0 && (
                 <Box flexDirection="column" marginTop={1}>

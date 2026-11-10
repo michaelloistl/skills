@@ -32,11 +32,21 @@ export type SpecRun = {
   /** A question or dialog waiting on the operator. */
   attention?: string
 }
+export type MergedSlice = {
+  spec: number
+  number: number
+  title: string
+  url: string
+  /** Milliseconds since the epoch. */
+  mergedAt: number
+}
 export type Board = {
   repo: string
   prs: Pr[]
   runs: SpecRun[]
   runErrors: string[]
+  /** Slice PRs merged into a spec branch in the last day, newest first. */
+  merged: MergedSlice[]
   fetchedAt: number
   isLoading: boolean
   error?: string

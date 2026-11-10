@@ -2,7 +2,7 @@ import type { CommandRunInput, UiPane } from 'claude-code'
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Pr } from '../types'
-import { countMentions, sessionPrOf } from './register'
+import { ago, countMentions, mergedSlices, sessionPrOf } from './register'
 
 const PRS_CMD: CommandRunInput = {
   command: 'prs',
@@ -68,6 +68,14 @@ const pr = (number: number, headRef: string): Pr => ({
 })
 const BOARD_PRS = [pr(12, 'fix-burn'), pr(13, 'book-people')]
 
+const NOW = Date.parse('2026-11-10T18:00:00Z')
+const MERGED = [
+  { number: 20, title: 'Slice A', url: 'https://github.com/o/r/pull/20', mergedAt: '2026-11-10T17:55:00Z', baseRefName: 'agent/local-spec-5-fix' },
+  { number: 21, title: 'Slice B', url: 'https://github.com/o/r/pull/21', mergedAt: '2026-11-10T15:00:00Z', baseRefName: 'agent/local-spec-8-x' },
+  { number: 22, title: 'Old', url: 'https://github.com/o/r/pull/22', mergedAt: '2026-11-08T15:00:00Z', baseRefName: 'agent/local-spec-5-fix' },
+  { number: 23, title: 'Not a slice', url: 'https://github.com/o/r/pull/23', mergedAt: '2026-11-10T17:00:00Z', baseRefName: 'develop' },
+]
+
 const ISSUES = {
   data: {
     repository: {
@@ -99,7 +107,7 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   on('ui.panes', () => ({ value: panes }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.every', () => ({ value: undefined }))
-  on('clock.now', () => ({ value: 0 }))
+  on('clock.now', () => ({ value: NOW }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.messages', () => ({ value: [] }))
   const launched: (readonly string[])[] = []
@@ -127,6 +135,7 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
       launched.push(e.argv)
       return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    if (e.argv.includes('merged')) return ok(JSON.stringify(MERGED))
     const sub = e.argv.slice(1, 3).join(' ')
     const out =
       sub === 'repo view' ? { nameWithOwner: 'o/r' } : sub === 'pr list' ? PRS : ISSUES
@@ -156,6 +165,12 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   expect(await ui.find({ type: 'Button', key: 'run-devbox-3' })).toBeFalsy()
   expect(await ui.find({ type: 'Button', key: 'run-devbox-9' })).toBeFalsy()
   expect(await ui.find({ type: 'Button', key: 'run-devbox-7' })).toBeFalsy()
+
+  // Spec 5's run sits on PR 12; spec 8 has no PR yet.
+  expect(await ui.find({ type: 'Button', key: 'merged-pr-12-20' })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'merged-run-8-21' })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'merged-pr-12-22' })).toBeFalsy()
+  expect((await ui.find({ type: 'Text', text: /^ 5m$/ }))?.text).toBe(' 5m')
 
   await ui.press({ key: 'i-12-7' })
   expect(copied).toEqual(['https://github.com/o/r/issues/7'])
@@ -189,5 +204,15 @@ describe('the session PR', () => {
     expect(sessionPrOf(BOARD_PRS, 12, { '13': 9 }, '')?.why).toBe('pinned')
     expect(sessionPrOf(BOARD_PRS, 0, {}, 'fix-burn')).toEqual({ pr: BOARD_PRS[0], why: 'branch' })
     expect(sessionPrOf(BOARD_PRS, 0, { '999': 4 }, 'nope')).toBeUndefined()
+  })
+})
+
+describe('recently merged slices', () => {
+  test('keeps slice PRs of the last day, newest first', () => {
+    expect(mergedSlices(MERGED, NOW).map(m => [m.spec, m.number])).toEqual([[5, 20], [8, 21]])
+  })
+
+  test('reads an age in minutes, hours, then days', () => {
+    expect([ago(4 * 60_000), ago(3 * 3_600_000), ago(50 * 3_600_000)]).toEqual(['4m', '3h', '2d'])
   })
 })
