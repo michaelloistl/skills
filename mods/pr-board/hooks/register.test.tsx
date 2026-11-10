@@ -1,5 +1,8 @@
 import type { CommandRunInput, UiPane } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { describe, expect, test } from 'claude-code/testing'
+
+import type { Pr } from '../types'
+import { countMentions, sessionPrOf } from './register'
 
 const PRS_CMD: CommandRunInput = {
   command: 'prs',
@@ -37,6 +40,20 @@ const PRS = [
     closingIssuesReferences: [],
     body: 'Ref #7',
   },
+  {
+    number: 13,
+    title: 'Book people',
+    url: 'https://github.com/o/r/pull/13',
+    author: { login: 'ml' },
+    isDraft: false,
+    baseRefName: 'develop',
+    headRefName: 'book-people',
+    reviewDecision: 'REVIEW_REQUIRED',
+    mergeable: 'MERGEABLE',
+    statusCheckRollup: [],
+    closingIssuesReferences: [],
+    body: '',
+  },
 ]
 const RUNS = [
   { spec: '5', state: 'running', step: 'build', summary: 'landed 1/2; building #6', pr_url: 'https://github.com/o/r/pull/12', acked: false },
@@ -45,6 +62,12 @@ const RUNS = [
   { spec: '7', state: null, step: null, summary: 'no status file', pr_url: null, acked: false },
   { spec: '3', state: 'done', step: 'qa-pr', summary: 'done', pr_url: 'https://github.com/o/r/pull/4', acked: true },
 ]
+const pr = (number: number, headRef: string): Pr => ({
+  number, title: '', url: '', author: '', isDraft: false, review: '', checks: 'none',
+  mergeable: '', baseRef: 'develop', headRef, issues: [],
+})
+const BOARD_PRS = [pr(12, 'fix-burn'), pr(13, 'book-people')]
+
 const ISSUES = {
   data: {
     repository: {
@@ -78,6 +101,7 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   on('clock.every', () => ({ value: undefined }))
   on('clock.now', () => ({ value: 0 }))
   on('session.cwd', () => ({ value: '/repo' }))
+  on('session.messages', () => ({ value: [] }))
   const launched: (readonly string[])[] = []
   const dispatched: (readonly string[])[] = []
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home' : '/home/.claude-on' }))
@@ -110,6 +134,7 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   expect((await ui.find({ type: 'Text', text: /Fix burn/ }))?.text).toBe('Fix burn')
   expect((await ui.find({ type: 'Text', text: /this session/ }))?.text).toBe(' ◉ this session ')
   expect((await ui.find({ type: 'Text', text: /^fix-burn$/ }))?.text).toBe('fix-burn')
+  expect((await ui.find({ type: 'Text', text: /^branch$/ }))?.text).toBe('branch')
   expect((await ui.find({ type: 'Text', text: /approved/ }))?.text).toBe(' approved ')
   expect((await ui.find({ type: 'Text', text: /FOL-1835/ }))?.text).toBe(' FOL-1835 ')
   expect(await ui.find({ type: 'Button', key: 'i-12-7' })).toBeTruthy()
@@ -138,4 +163,22 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
 
   expect(await $.command.run(PRS_CMD)).toEqual({ text: 'Open PRs pane closed.' })
   expect(panes).toEqual([])
+})
+
+describe('the session PR', () => {
+  test('the PR the tool calls name most beats the branch', () => {
+    const counts = countMentions([
+      '{"command":"gh pr view 13"}',
+      '{"file_path":"/tmp/qa-pr/13/report.md"}',
+      '{"command":"gh api repos/o/r/pulls/12/reviews"}',
+    ])
+    expect(counts).toEqual({ '13': 2, '12': 1 })
+    expect(sessionPrOf(BOARD_PRS, 0, counts, 'fix-burn')).toEqual({ pr: BOARD_PRS[1], why: 'most referenced' })
+  })
+
+  test('a pin beats everything, and the branch is the fallback', () => {
+    expect(sessionPrOf(BOARD_PRS, 12, { '13': 9 }, '')?.why).toBe('pinned')
+    expect(sessionPrOf(BOARD_PRS, 0, {}, 'fix-burn')).toEqual({ pr: BOARD_PRS[0], why: 'branch' })
+    expect(sessionPrOf(BOARD_PRS, 0, { '999': 4 }, 'nope')).toBeUndefined()
+  })
 })

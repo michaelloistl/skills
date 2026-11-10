@@ -44,6 +44,6 @@ export type Board = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'pr-board': { board: Shaped<Board>; expanded: Shaped<number>; branch: Shaped<string> }
+    'pr-board': { board: Shaped<Board>; expanded: Shaped<number>; branch: Shaped<string>; pinned: Shaped<number>; mentions: Shaped<Record<string, number>> }
   }
 }

@@ -15,6 +15,10 @@ const board = atom({ plugin: 'pr-board', key: 'board' } as const, EMPTY, {
 // The PR whose action row shows; 0 for none.
 // The branch checked out in the session's folder: its PR is this session's.
 const branch = atom({ plugin: 'pr-board', key: 'branch' } as const, '', { shape: 'branch-1' })
+// A PR the person pinned to this session; 0 for none.
+const pinned = atom({ plugin: 'pr-board', key: 'pinned' } as const, 0, { shape: 'pinned-1' })
+// How often the session's prompts and tool calls name each PR number.
+const mentions = atom({ plugin: 'pr-board', key: 'mentions' } as const, {}, { shape: 'mentions-1' })
 const expanded = atom({ plugin: 'pr-board', key: 'expanded' } as const, 0, { shape: 'expanded-1' })
 
 type RollupItem = { conclusion?: string; status?: string; state?: string }
@@ -322,6 +326,52 @@ async function launch($: EngineInterface, pr: Pr, action: Action): Promise<void>
   }
 }
 
+const MESSAGES_SCANNED = 400
+
+// PR-shaped references: #3648, pull/3648, pulls/3648, PR 3648, pr-3648, qa-pr/3648, gh pr view 3648.
+const PR_REF = /(?:#|\bpulls?\/|\bPR[ #-]?|\bpr[-/ #]|\bqa-pr\/|\bgh pr [a-z-]+ )(\d{2,6})\b/g
+
+export function countMentions(texts: readonly string[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const text of texts) {
+    for (const m of text.matchAll(PR_REF)) {
+      const n = m[1] ?? ''
+      counts[n] = (counts[n] ?? 0) + 1
+    }
+  }
+  return counts
+}
+
+// The person's prompts and the tool calls' inputs: what the session works on, not what it says.
+async function readMentions($: EngineInterface): Promise<void> {
+  const found = await $.session.messages()
+  if (!Array.isArray(found)) return
+  const texts = found.slice(-MESSAGES_SCANNED).flatMap(m => [
+    ...(m.role === 'user' && !m.text.includes('<system-reminder>') ? [m.text] : []),
+    ...m.toolUses.map(u => JSON.stringify(u.input)),
+  ])
+  await update($, mentions, () => countMentions(texts))
+}
+
+export type SessionPr = { pr: Pr; why: 'pinned' | 'most referenced' | 'branch' }
+
+export function sessionPrOf(
+  prs: readonly Pr[],
+  pin: number,
+  counts: Readonly<Record<string, number>>,
+  current: string,
+): SessionPr | undefined {
+  const byPin = prs.find(p => p.number === pin)
+  if (byPin) return { pr: byPin, why: 'pinned' }
+  let best: Pr | undefined
+  for (const p of prs) {
+    if ((counts[p.number] ?? 0) > (best ? counts[best.number] ?? 0 : 0)) best = p
+  }
+  if (best) return { pr: best, why: 'most referenced' }
+  const byBranch = prs.find(p => current && p.headRef === current)
+  return byBranch && { pr: byBranch, why: 'branch' }
+}
+
 async function readBranch($: EngineInterface): Promise<void> {
   const r = await $.process.run(['git', 'branch', '--show-current'], { cwd: await $.session.cwd() })
   const name = r.exitCode === 0 ? r.stdout.trim() : ''
@@ -337,10 +387,11 @@ export const register: Register = (on, options) => {
   }
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'prs', description: 'Toggle the pane of open PRs with status and linked GitHub / Linear issues' })
+    await $.command.register({ name: 'prs', description: 'Toggle the open PRs pane; /prs pin <n> or /prs unpin sets this session\'s PR' })
     // A reload keeps the pane up but may drop a board stored in an older shape.
     if (await isOpen($)) void refresh($)
     void readBranch($)
+    void readMentions($)
     $.clock.every(BRANCH_MS, () => {
       void isOpen($).then(open => {
         if (open) return readBranch($)
@@ -354,13 +405,27 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'prs' }, async $ => {
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId === undefined) void readMentions($)
+    return done
+  })
+
+  on('command.run', { command: 'prs' }, async ($, e) => {
+    const [verb, arg] = e.args.trim().split(/\s+/)
+    if (verb === 'pin' || verb === 'unpin') {
+      const n = verb === 'pin' ? Number(arg?.replace('#', '')) : 0
+      if (verb === 'pin' && !n) return { text: 'Usage: /prs pin <PR number>' }
+      await update($, pinned, () => n)
+      return { text: n ? `PR #${n} pinned to this session.` : 'Session PR unpinned.' }
+    }
     if (await isOpen($)) {
       await $.ui.close({ id: PANE })
       return { text: 'Open PRs pane closed.' }
     }
     await $.ui.open({ id: PANE, title: TITLE })
     void readBranch($)
+    void readMentions($)
     void refresh($)
     return { text: 'Open PRs pane opened.' }
   })
@@ -370,7 +435,9 @@ export const register: Register = (on, options) => {
     const b = await read($, board)
     const shown = await read($, expanded)
     const current = await read($, branch)
-    const mine = b.prs.find(p => current && p.headRef === current)
+    const pin = await read($, pinned)
+    const session = sessionPrOf(b.prs, pin, await read($, mentions), current)
+    const mine = session?.pr
     const prs = mine ? [mine, ...b.prs.filter(p => p !== mine)] : b.prs
     const open = (url: string) => () => void $.process.run(['open', url])
     const issueUrl = (n: number) => `https://github.com/${b.repo}/issues/${n}`
@@ -475,7 +542,8 @@ export const register: Register = (on, options) => {
               {isMine && (
                 <Box flexDirection="row" gap={1}>
                   {chip('◉ this session', 'claude')}
-                  <Text color="claude" wrap="truncate-end">{pr.headRef}</Text>
+                  <Box flexShrink={0}><Text color="claude">{session?.why}</Text></Box>
+                  <Text dimColor wrap="truncate-end">{pr.headRef}</Text>
                 </Box>
               )}
               <Box flexDirection="row" gap={1}>
@@ -507,6 +575,12 @@ export const register: Register = (on, options) => {
                   {ACTIONS.map(a => (
                     <Button key={`${a.slug}-${pr.number}`} variant={a.isNeeded(pr) ? 'primary' : undefined} onPress={() => void launch($, pr, a)}>{a.label}</Button>
                   ))}
+                  <Button
+                    key={`pin-${pr.number}`}
+                    onPress={() => void update($, pinned, n => (n === pr.number ? 0 : pr.number)).then(() => update($, expanded, () => 0))}
+                  >
+                    {pin === pr.number ? 'Unpin from this session' : '◉ Pin to this session'}
+                  </Button>
                 </Box>
               )}
 
