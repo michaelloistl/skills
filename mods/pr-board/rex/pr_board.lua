@@ -3,7 +3,9 @@
 --   dofile(os.getenv("HOME") .. "/Development/skills/mods/pr-board/rex/pr_board.lua")
 
 local LABEL = "pr-board"
-local SCRIPT = os.getenv("HOME") .. "/Development/skills/mods/pr-board/rex/pr_board.py"
+-- Resolved in the pane, on the host of the session it opens in: a Mac's key can open
+-- the board in a devbox session, where the Mac's home and shell don't exist.
+local SCRIPT = '"$HOME/Development/skills/mods/pr-board/rex/pr_board.py"'
 
 local function quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
@@ -31,8 +33,8 @@ rex.action{
           if cerr ~= nil then error(cerr, 0) end
           return { closed = board }
         end
-        local shell = os.getenv("SHELL") or "/bin/sh"
-        local cmd = "exec python3 " .. quote(SCRIPT) .. " --block " .. quote(ctx.block_id)
+        local board_cmd = "exec python3 " .. SCRIPT .. " --block " .. quote(ctx.block_id)
+        local cmd = 'exec "${SHELL:-/bin/sh}" -lc ' .. quote(board_cmd)
         local r, serr = rex.session.new_split{
           anchor_id = ctx.block_id,
           direction = "horizontal",
@@ -41,7 +43,7 @@ rex.action{
           layout = { block = {
             flavor = "com.superlogical.terminal.shell",
             label = LABEL,
-            options = { command = { shell, "-lc", cmd }, shell = "none", cwd = os.getenv("HOME") },
+            options = { command = { "/bin/sh", "-c", cmd }, shell = "none" },
           } },
         }
         if r == nil then error(serr, 0) end
