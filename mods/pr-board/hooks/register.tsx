@@ -436,7 +436,7 @@ export const register: Register = (on, options) => {
   }
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'prs', description: 'Toggle the open PRs pane; /prs pin <n> or /prs unpin sets this session\'s PR' })
+    await $.command.register({ name: 'prs', description: 'Toggle the open PRs pane; /prs pin <n> or /prs unpin sets this session\'s PR', immediate: true })
     // A reload keeps the pane up but may drop a board stored in an older shape.
     if (await isOpen($)) void refresh($)
     void readBranch($)
