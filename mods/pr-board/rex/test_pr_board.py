@@ -81,6 +81,23 @@ class SessionPrTest(unittest.TestCase):
         self.assertEqual(pb.session_pr_of(prs, 0, {99: 4}, 'feat'), (prs[0], 'branch'))
         self.assertEqual(pb.session_pr_of(prs, 0, {}, 'other'), (None, None))
 
+    def test_a_mention_of_a_spec_counts_for_the_pr_that_builds_it(self):
+        prs = [pr(1, headRef='feat'), pr(40, headRef='agent/local-spec-29-history')]
+        self.assertEqual(pb.session_pr_of(prs, 0, {29: 5, 1: 1}, 'feat'), (prs[1], 'most referenced'))
+
+    def test_graphql_keeps_the_data_of_a_query_with_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, 'gh')
+            with open(fake, 'w') as f:
+                f.write('#!/bin/sh\necho \'{"data":{"repository":{"i1":{"number":1}}},"errors":[{}]}\'\nexit 1\n')
+            os.chmod(fake, 0o755)
+            saved = os.environ['PATH']
+            os.environ['PATH'] = tmp + os.pathsep + saved
+            try:
+                self.assertEqual(pb.graphql(['api', 'graphql'], tmp)['data']['repository']['i1'], {'number': 1})
+            finally:
+                os.environ['PATH'] = saved
+
     def test_transcript_texts_reads_prompts_and_tool_inputs_not_reminders_or_replies(self):
         lines = [json.dumps(e) for e in [
             {'type': 'user', 'message': {'content': 'look at PR 3648'}},

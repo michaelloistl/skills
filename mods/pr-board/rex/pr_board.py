@@ -175,13 +175,19 @@ def transcript_texts(lines, limit=MESSAGES_SCANNED):
     return texts
 
 
+def references_of(pr, counts):
+    """Mentions of a PR, and of the spec a drive-spec PR builds (its head agent/local-spec-<n>-…)."""
+    spec = spec_of_branch(pr['headRef'])
+    return counts.get(pr['number'], 0) + (counts.get(spec, 0) if spec else 0)
+
+
 def session_pr_of(prs, pin, counts, branch):
     for p in prs:
         if p['number'] == pin:
             return p, 'pinned'
     best = None
     for p in prs:
-        if counts.get(p['number'], 0) > (counts.get(best['number'], 0) if best else 0):
+        if references_of(p, counts) > (references_of(best, counts) if best else 0):
             best = p
     if best:
         return best, 'most referenced'
@@ -235,6 +241,19 @@ def gh(args, cwd):
     return run(['gh', *args], cwd=cwd)
 
 
+def graphql(args, cwd):
+    """A gh GraphQL answer: a number that is no issue or PR errors the query but leaves the rest of its data."""
+    try:
+        r = subprocess.run(['gh', *args], cwd=cwd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise RuntimeError(f'gh: {err}') from err
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        raise RuntimeError(lines[0] if lines else f'gh exited {r.returncode}') from None
+
+
 def fetch_runs(repo_dir, hosts):
     if not repo_dir.startswith(HOME + '/'):
         return [], []
@@ -274,8 +293,8 @@ def fetch_board(repo_dir, hosts):
                 f'i{n}: issueOrPullRequest(number: {n}) {{ ... on Issue {{ number title state url body '
                 f'comments(first: 30) {{ nodes {{ body }} }} }} }}' for n in wanted)
             query = f'query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}'
-            res = json.loads(gh(['api', 'graphql', '-f', f'query={query}', '-F', f'owner={owner}',
-                                 '-F', f'name={name}'], repo_dir))
+            res = graphql(['api', 'graphql', '-f', f'query={query}', '-F', f'owner={owner}', '-F', f'name={name}'],
+                          repo_dir)
             for node in ((res.get('data') or {}).get('repository') or {}).values():
                 if not node or not node.get('number'):
                     continue

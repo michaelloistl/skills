@@ -205,6 +205,11 @@ describe('the session PR', () => {
     expect(sessionPrOf(BOARD_PRS, 0, {}, 'fix-burn')).toEqual({ pr: BOARD_PRS[0], why: 'branch' })
     expect(sessionPrOf(BOARD_PRS, 0, { '999': 4 }, 'nope')).toBeUndefined()
   })
+
+  test('a mention of a spec counts for the PR that builds it', () => {
+    const spec = { ...BOARD_PRS[0]!, number: 40, headRef: 'agent/local-spec-29-history' }
+    expect(sessionPrOf([...BOARD_PRS, spec], 0, { '29': 5, '13': 1 }, 'fix-burn')).toEqual({ pr: spec, why: 'most referenced' })
+  })
 })
 
 describe('recently merged slices', () => {

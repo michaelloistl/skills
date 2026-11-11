@@ -217,9 +217,17 @@ async function fetchBoard($: EngineInterface): Promise<Board> {
       .map(n => `i${n}: issueOrPullRequest(number: ${n}) { ... on Issue { number title state url body comments(first: 30) { nodes { body } } } }`)
       .join('\n')
     const query = `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`
-    const res = JSON.parse(
-      await gh($, ['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`], cwd),
+    // A number that is no issue or PR errors the query but leaves the rest of its data.
+    const r = await $.process.run(
+      ['gh', 'api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`],
+      { cwd, timeoutMs: 60_000 },
     )
+    let res: { data?: { repository?: Record<string, RawIssue | null> } } = {}
+    try {
+      res = JSON.parse(r.stdout)
+    } catch {
+      throw new Error((r.stderr || r.stdout).trim().split('\n')[0] || `gh exited ${r.exitCode}`)
+    }
     const found: Record<string, RawIssue | null> = res?.data?.repository ?? {}
     for (const node of Object.values(found)) {
       if (!node?.number) continue
@@ -390,6 +398,12 @@ async function readMentions($: EngineInterface): Promise<void> {
 
 export type SessionPr = { pr: Pr; why: 'pinned' | 'most referenced' | 'branch' }
 
+// A mention of a PR, or of the spec a drive-spec PR builds (its head agent/local-spec-<n>-…).
+export function referencesOf(pr: Pr, counts: Readonly<Record<string, number>>): number {
+  const spec = specOfBranch(pr.headRef)
+  return (counts[pr.number] ?? 0) + (spec ? counts[spec] ?? 0 : 0)
+}
+
 export function sessionPrOf(
   prs: readonly Pr[],
   pin: number,
@@ -400,7 +414,7 @@ export function sessionPrOf(
   if (byPin) return { pr: byPin, why: 'pinned' }
   let best: Pr | undefined
   for (const p of prs) {
-    if ((counts[p.number] ?? 0) > (best ? counts[best.number] ?? 0 : 0)) best = p
+    if (referencesOf(p, counts) > (best ? referencesOf(best, counts) : 0)) best = p
   }
   if (best) return { pr: best, why: 'most referenced' }
   const byBranch = prs.find(p => current && p.headRef === current)
