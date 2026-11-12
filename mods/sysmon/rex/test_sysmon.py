@@ -57,28 +57,38 @@ class SourcesTest(unittest.TestCase):
 
 
 class RenderTest(unittest.TestCase):
-    def test_render_shows_each_section_it_has_data_for(self):
-        state = {
-            'sample': {'cpu': 90, 'cores': [80], 'steal': 0.0, 'iowait': 1.0, 'memUsed': 500000, 'memTotal': 1000000,
-                       'swapUsed': 0, 'swapTotal': 0, 'load': '1 2 3'},
-            'history': [10, 90], 'pressure': {'cpu': 30.0, 'memory': None, 'io': 1.0},
-            'disk': {'used': 1073741824, 'total': 2147483648},
-            'groups': [{'name': 'spec-1', 'cpu': 60.0, 'rss': 1073741824, 'procs': 3}],
-            'procs': [{'name': 'ruby', 'count': 4, 'delta': 2, 'minutes': 62}],
-            'ports': [{'port': 3000, 'proc': 'ruby', 'pid': 9, 'cwd': '/h/x', 'clashWith': '/h/y'}],
-            'postgres': 'n/a', 'docker': None, 'tests': None,
-        }
-        lines = sm.render(state, 60, '/h')
-        text = '\n'.join(''.join(t for t, _ in line) for line in lines)
-        for want in ['cpu ', 'io ', 'CPU  ', ' 90%', 'Mem  ', '1.0/2.0G', 'Load 1 2 3', 'Load by worktree', 'spec-1',
-                     'ruby 4 (+2)', 'deltas vs 1h ago', ' 3000 ruby       ~/x  ⚠ was ~/y', 'postgres: n/a']:
+    STATE = {
+        'host': 'devbox', 'uptime': 90000, 'now': 0,
+        'sample': {'cpu': 90, 'cores': [80, 20], 'steal': 0.0, 'iowait': 1.0, 'memUsed': 500000, 'memTotal': 1000000,
+                   'swapUsed': 0, 'swapTotal': 0, 'load': '1 2 3'},
+        'history': [10, 90], 'pressure': {'cpu': 30.0, 'memory': None, 'io': 1.0},
+        'disk': {'used': 1073741824, 'total': 2147483648},
+        'groups': [{'name': 'spec-1', 'cpu': 150.0, 'rss': 1073741824, 'procs': 3}],
+        'procs': [{'name': 'ruby', 'count': 4, 'delta': 2, 'minutes': 62}],
+        'ports': [{'port': 3000, 'proc': 'ruby', 'pid': 9, 'cwd': '/h/x', 'clashWith': '/h/y'},
+                  {'port': 22, 'proc': '', 'pid': None, 'cwd': '', 'clashWith': None}],
+        'postgres': 'n/a', 'docker': None, 'tests': None,
+    }
+
+    def test_render_draws_a_card_for_each_section_with_data(self):
+        lines = sm.render(self.STATE, 80, '/h')
+        text = '\n'.join(sm.plain(line) for line in lines)
+        for want in ['◉ devbox · 2 cores · up 1d 1h', ' CPU 90% ', ' MEM 50% ', ' DISK 50% ', ' LOAD 1 ',
+                     '╭─ CPU ', '╭─ Memory · Disk ', 'pressure  cpu 30.0%  io 1.0%', '1.0/2.0G', 'load 1 2 3',
+                     '╭─ Load by worktree ', 'spec-1', '150%', 'ruby 4 +2', 'changes vs 1h ago',
+                     ' 3000 ruby       ~/x', '⚠ was ~/y', 'other 22', 'not reachable']:
             self.assertIn(want, text)
-        self.assertNotIn('memo', text)
-        cpu = next(line for line in lines if line and line[0][0] == 'CPU  ')
-        self.assertEqual(cpu[1][1], 'red')
+        self.assertNotIn('mem ', text.split('pressure')[1].split('\n')[0])
+        self.assertTrue(all(len(sm.plain(line)) == 80 for line in lines))
+
+    def test_bars_take_the_tone_of_their_share(self):
+        cpu = sm.meter(90, 10)
+        self.assertEqual([(seg.text, seg.fg) for seg in cpu], [('━━━━━━━━━', 'red'), ('━', 'track')])
+        self.assertEqual(sm.meter(10, 10)[0].fg, 'green')
 
     def test_render_waits_for_the_first_sample(self):
-        self.assertEqual(sm.render({'sample': None}, 60), [[('Sampling…', 'dim')]])
+        lines = sm.render({'sample': None, 'host': 'devbox'}, 60)
+        self.assertIn('Sampling…', sm.plain(lines[-1]))
 
 
 if __name__ == '__main__':

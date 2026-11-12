@@ -235,18 +235,69 @@ def read(path):
 
 # ── drawing ─────────────────────────────────────────────────────────────────
 
-RGB = {'green': (78, 186, 101), 'yellow': (255, 193, 7), 'red': (255, 107, 128), 'dim': (130, 130, 130),
-       'bold': None}
+RGB = {
+    'green': (78, 186, 101), 'yellow': (255, 193, 7), 'red': (255, 107, 128), 'accent': (215, 119, 87),
+    'blue': (177, 185, 249), 'purple': (175, 135, 255), 'dim': (130, 130, 130), 'track': (58, 58, 58),
+    'border': (85, 85, 85), 'ink': (20, 20, 20), 'white': (235, 235, 235),
+}
 SPARK = '▁▂▃▄▅▆▇█'
 
 
-def bar(p, width):
-    filled = round(min(100, max(0, p)) / 100 * width)
-    return '█' * filled + '░' * (width - filled)
+class Seg:
+    __slots__ = ('text', 'fg', 'bg', 'bold', 'dim', 'flex', 'fill')
+
+    def __init__(self, text, fg=None, bg=None, bold=False, dim=False, flex=False, fill=False):
+        self.text, self.fg, self.bg, self.bold, self.dim, self.flex, self.fill = text, fg, bg, bold, dim, flex, fill
+
+    def with_text(self, text):
+        return Seg(text, self.fg, self.bg, self.bold, self.dim, self.flex, self.fill)
 
 
-def spark(values):
-    return ''.join(SPARK[min(7, int(v / 100 * 8))] for v in values)
+def cut(text, cells):
+    if len(text) <= cells:
+        return text
+    return '' if cells <= 0 else text[:cells - 1] + '…'
+
+
+def fit(segs, width):
+    """One line exactly `width` cells: shrink flex segments, then cut the end; a fill segment takes what is left."""
+    segs = list(segs)
+    over = sum(len(s.text) for s in segs if not s.fill) - width
+    for i in reversed(range(len(segs))):
+        if over > 0 and segs[i].flex:
+            t = cut(segs[i].text, max(0, len(segs[i].text) - over))
+            over -= len(segs[i].text) - len(t)
+            segs[i] = segs[i].with_text(t)
+    if over > 0:
+        out, used = [], 0
+        for s in segs:
+            if s.fill or used >= width:
+                continue
+            t = cut(s.text, width - used)
+            out.append(s.with_text(t))
+            used += len(t)
+        segs = out
+    used = sum(len(s.text) for s in segs if not s.fill)
+    fills = [i for i, s in enumerate(segs) if s.fill]
+    if fills:
+        segs[fills[0]] = segs[fills[0]].with_text(' ' * max(0, width - used))
+        return [s for i, s in enumerate(segs) if not s.fill or i == fills[0]]
+    return segs + [Seg(' ' * max(0, width - used))]
+
+
+def card(title, inner, width, color='border'):
+    """A rounded card with its title in the top border."""
+    label = f' {title} '
+    top = [Seg('╭─', fg=color), Seg(label, fg='white', bold=True), Seg('─' * max(0, width - 3 - len(label)) + '╮', fg=color)]
+    lines = [top]
+    for line in inner:
+        lines.append([Seg('│ ', fg=color), *fit(line, width - 4), Seg(' │', fg=color)])
+    lines.append([Seg('╰' + '─' * (width - 2) + '╯', fg=color)])
+    return lines
+
+
+def chip(text, color):
+    return Seg(f' {text} ', fg='ink', bg=color, bold=True)
 
 
 def tone(p):
@@ -263,6 +314,19 @@ def steal_tone(p):
 
 def pg_tone(p):
     return 'red' if p >= 90 else 'yellow' if p >= 70 else 'green'
+
+
+def meter(p, width, color=None):
+    """A thin bar: the filled share in its tone, the rest as a dark track."""
+    width = max(1, width)
+    filled = round(min(100, max(0, p)) / 100 * width)
+    return [Seg('━' * filled, fg=color or tone(p)), Seg('━' * (width - filled), fg='track')]
+
+
+def spark(values, width):
+    values = values[-width:]
+    pad = [Seg(' ' * (width - len(values)))] if len(values) < width else []
+    return pad + [Seg(SPARK[min(7, int(v / 100 * 8))], fg=tone(v)) for v in values]
 
 
 def gb(b):
@@ -285,113 +349,155 @@ def signed(n):
     return f'+{n}' if n > 0 else str(n)
 
 
+def uptime(seconds):
+    d, h, m = int(seconds // 86400), int(seconds % 86400 // 3600), int(seconds % 3600 // 60)
+    return f'{d}d {h}h' if d else f'{h}h {m}m'
+
+
+def gauge(label, p, value, width):
+    """`Mem  ━━━━━━━━━━━━━━  4.4/30.6G`: the bar takes what the label and value leave."""
+    return [Seg(label.ljust(5), fg='dim'), *meter(p, width - 5 - 12), Seg(value.rjust(12))]
+
+
 def render(st, width, home=HOME):
-    """Lines of (text, color) parts; color is a tone, 'dim', 'bold' or None."""
+    """The pane as lines of segments."""
+    width = max(40, width)
+    inner = width - 4
     s = st.get('sample')
-    if not s:
-        return [[('Sampling…', 'dim')]]
-    w = max(10, min(40, width - 22))
     L = []
-    head = lambda title: L.extend([[], [(title, 'bold')]])  # noqa: E731
-    p = st.get('pressure')
-    if p:
-        L.append([('Pressure (some avg10)', 'bold')])
-        for k in ('cpu', 'memory', 'io'):
-            if p.get(k) is not None:
-                L.append([(k[:4].ljust(4) + ' ', None), (bar(p[k], w), pressure_tone(p[k])), (f' {p[k]:5.1f}%', None)])
-        L.append([])
-    L.append([('CPU  ', None), (bar(s['cpu'], w), tone(s['cpu'])), (f' {s["cpu"]:3d}%', None)])
-    L.append([('     ' + spark(st['history'][-w:]), 'dim')])
-    L.append([('     steal ', None), (f'{s["steal"]:.1f}%', steal_tone(s['steal'])), (f' · iowait {s["iowait"]:.1f}%', None)])
-    mp = pct(s['memUsed'], s['memTotal'])
-    L.append([('Mem  ', None), (bar(mp, w), tone(mp)), (f' {kb_gb(s["memUsed"])}/{kb_gb(s["memTotal"])}G', None)])
-    if s['swapTotal'] > 0:
-        sp = pct(s['swapUsed'], s['swapTotal'])
-        L.append([('Swap ', None), (bar(sp, w), tone(sp)), (f' {kb_gb(s["swapUsed"])}/{kb_gb(s["swapTotal"])}G', None)])
-    d = st.get('disk')
+    host = st.get('host') or ''
+    up = st.get('uptime')
+    L.append(fit([Seg('◉ ', fg='accent', bold=True), Seg(host or 'system', bold=True),
+                  Seg(f' · {len(s["cores"])} cores' if s else '', fg='dim'),
+                  Seg(f' · up {uptime(up)}' if up else '', fg='dim'), Seg('', fill=True),
+                  Seg(time.strftime('%H:%M:%S', time.localtime(st.get('now') or time.time())), fg='dim')], width))
+    if not s:
+        return L + [fit([], width), fit([Seg('Sampling…', dim=True)], width)]
+
+    mp, d = pct(s['memUsed'], s['memTotal']), st.get('disk')
+    chips = [chip(f'CPU {s["cpu"]}%', tone(s['cpu'])), Seg(' '), chip(f'MEM {mp}%', tone(mp))]
     if d:
         dp = pct(d['used'], d['total'])
-        L.append([('Disk ', None), (bar(dp, w), tone(dp)), (f' {gb(d["used"])}/{gb(d["total"])}G', None)])
-    L.append([(f'Load {s["load"]}', 'dim')])
-    L.append([])
-    for i, c in enumerate(s['cores']):
-        L.append([(f'{i:3d} ', None), (bar(c, max(5, w - 4)), tone(c)), (f' {c:3d}%', None)])
+        chips += [Seg(' '), chip(f'DISK {dp}%', tone(dp))]
+    chips += [Seg(' '), chip(f'LOAD {s["load"].split()[0]}', 'blue')]
+    L += [fit([], width), fit(chips, width)]
 
-    groups = st.get('groups') or []
+    # CPU: total, history, then every core, two columns when there is room.
+    cpu = [gauge('CPU', s['cpu'], f'{s["cpu"]}%', inner), spark(st['history'], inner),
+           [Seg('steal ', fg='dim'), Seg(f'{s["steal"]:.1f}%', fg=steal_tone(s['steal'])),
+            Seg('  iowait ', fg='dim'), Seg(f'{s["iowait"]:.1f}%'), Seg('', fill=True),
+            Seg('load ', fg='dim'), Seg(s['load'])], []]
+    cols = 2 if inner >= 56 else 1
+    col_w = (inner - (cols - 1) * 3) // cols
+    cores = [[Seg(f'{i:>2} ', fg='dim'), *meter(c, col_w - 8), Seg(f'{c:>4}%')] for i, c in enumerate(s['cores'])]
+    for i in range(0, len(cores), cols):
+        row = []
+        for j, core in enumerate(cores[i:i + cols]):
+            row += ([Seg('   ')] if j else []) + core
+        cpu.append(row)
+    L += card('CPU', cpu, width)
+
+    mem = [gauge('Mem', mp, f'{kb_gb(s["memUsed"])}/{kb_gb(s["memTotal"])}G', inner)]
+    if s['swapTotal'] > 0:
+        mem.append(gauge('Swap', pct(s['swapUsed'], s['swapTotal']), f'{kb_gb(s["swapUsed"])}/{kb_gb(s["swapTotal"])}G', inner))
+    if d:
+        mem.append(gauge('Disk', pct(d['used'], d['total']), f'{gb(d["used"])}/{gb(d["total"])}G', inner))
+    p = st.get('pressure')
+    if p:
+        row = [Seg('pressure', fg='dim')]
+        for k, name in (('cpu', 'cpu'), ('memory', 'mem'), ('io', 'io')):
+            if p.get(k) is not None:
+                row += [Seg(f'  {name} ', fg='dim'), Seg(f'{p[k]:.1f}%', fg=pressure_tone(p[k]), bold=p[k] >= 10)]
+        mem.append(row)
+    L += card('Memory · Disk', mem, width)
+
+    groups = (st.get('groups') or [])[:6]
     if groups:
-        head('Load by worktree')
-        for g in groups[:6]:
-            L.append([(g['name'][:18].ljust(18) + ' ', None), (f'{g["cpu"]:4.0f}%', 'yellow' if g['cpu'] > 50 else None),
-                      (f' {gb(g["rss"]):>5}G ', None), (f'{g["procs"]} procs', 'dim')])
+        name_w = max(8, min(22, max(len(g['name']) for g in groups)))
+        bar_w = max(6, inner - name_w - 28)
+        # A group's CPU is per core (346% is three and a half cores): its bar is its share of the box.
+        box = max(1, len(s['cores'])) * 100
+        rows = [[Seg(cut(g['name'], name_w).ljust(name_w) + ' ', bold=g['cpu'] > 50),
+                 *meter(g['cpu'] / box * 100, bar_w, 'yellow' if g['cpu'] > 50 else 'blue'),
+                 Seg(f'{g["cpu"]:5.0f}%', fg='yellow' if g['cpu'] > 50 else None),
+                 Seg(f'{gb(g["rss"]):>6}G'), Seg(f'{g["procs"]:>5} procs', fg='dim')] for g in groups]
+        L += card('Load by worktree', rows, width)
 
     pc = st.get('procs')
     if pc:
-        head('Processes')
         row = []
-        for i, c in enumerate(pc):
-            row.append((('' if i == 0 else ' · ') + f'{c["name"]} {c["count"]}', None))
-            if c['delta'] is not None and c['minutes'] > 0:
-                row.append((f' ({signed(c["delta"])})', 'yellow' if c['delta'] > 0 else 'dim'))
-        L.append(row)
+        for c in pc:
+            row += [Seg(c['name'] + ' ', fg='dim'), Seg(str(c['count']), bold=True)]
+            if c['delta'] is not None and c['minutes'] > 0 and c['delta'] != 0:
+                row.append(Seg(f' {signed(c["delta"])}', fg='yellow' if c['delta'] > 0 else 'green'))
+            row.append(Seg('   '))
+        rows = [row]
         if pc[0]['minutes'] > 0:
-            L.append([(f'deltas vs {"1h" if pc[0]["minutes"] >= 60 else str(pc[0]["minutes"]) + "m"} ago', 'dim')])
+            rows.append([Seg(f'changes vs {"1h" if pc[0]["minutes"] >= 60 else str(pc[0]["minutes"]) + "m"} ago', dim=True)])
+        L += card('Processes', rows, width)
 
     ports = st.get('ports') or []
     if ports:
-        head('Listening')
-        for l in ports:
-            text = f'{l["port"]:5d} {(l["proc"] or "—").ljust(10)[:10]} {short(l["cwd"], home) if l["cwd"] else ""}'
+        owned = [l for l in ports if l['proc'] or l['cwd']]
+        other = [str(l['port']) for l in ports if not (l['proc'] or l['cwd'])]
+        rows = []
+        for l in owned:
+            row = [Seg(f'{l["port"]:>5} ', fg='red' if l.get('clashWith') else 'blue', bold=True),
+                   Seg(cut(l['proc'] or '—', 10).ljust(11)), Seg(short(l['cwd'], home) if l['cwd'] else '', fg='dim', flex=True)]
             if l.get('clashWith'):
-                text += f'  ⚠ was {short(l["clashWith"], home)}'
-            L.append([(text, 'red' if l.get('clashWith') else None)])
+                row.append(Seg(f'  ⚠ was {short(l["clashWith"], home)}', fg='red', flex=True))
+            rows.append(row)
+        if other:
+            rows.append([Seg('other ', fg='dim'), Seg(' · '.join(other), fg='dim', flex=True)])
+        L += card('Listening', rows, width)
 
     pg = st.get('postgres')
     if pg == 'n/a':
-        L.extend([[], [('postgres: n/a', 'dim')]])
+        L += card('Postgres', [[Seg('not reachable', dim=True)]], width)
     elif pg:
-        head('Postgres connections')
         pp = pct(pg['used'], pg['max'])
-        L.append([(bar(pp, w), pg_tone(pp)), (f' {pg["used"]}/{pg["max"]}', None)])
-        for name, n in pg['byDb']:
-            L.append([(f'  {name[:40].ljust(40)} {n}', 'dim')])
+        rows = [gauge('conn', pp, f'{pg["used"]}/{pg["max"]}', inner)]
+        rows += [[Seg('  ' + name, fg='dim', flex=True), Seg('', fill=True), Seg(str(n))] for name, n in pg['byDb']]
+        L += card('Postgres', rows, width, pg_tone(pp) if pp >= 70 else 'border')
 
     dk = st.get('docker') or []
     if dk:
-        head('Docker')
-        for r in dk:
-            L.append([(f'{r["type"].ljust(14)} {r["size"]:>9} ', None), (f'reclaimable {r["reclaimable"]}', 'dim')])
+        L += card('Docker', [[Seg(r['type'].ljust(14)), Seg(r['size'].rjust(9), bold=True), Seg('', fill=True),
+                              Seg(f'reclaimable {r["reclaimable"]}', fg='dim')] for r in dk], width)
 
     ts = st.get('tests')
-    if ts and ts['last']:
-        head('Test runs')
+    if ts and (ts['last'] or ts['medians']):
+        rows = []
         for r in ts['last']:
             ok = r.get('exit_code') == 0
             busy = r.get('busy_groups')
-            L.append([('✓' if ok else '✗', 'green' if ok else 'red'), (f' {r.get("duration_s", 0):7.1f}s ', None),
-                      (f'busy {"?" if busy is None else busy}', 'dim'),
-                      (f' {short(r.get("cwd", ""), home)[-24:]} ', None), (r.get('command', '')[:30], 'dim')])
-    if ts and ts['medians']:
-        L.append([('median s: alone / under load', 'dim')])
-        for m in ts['medians']:
-            alone = '—' if m['alone'] is None else f'{m["alone"]:.1f}'
-            loaded = '—' if m['loaded'] is None else f'{m["loaded"]:.1f}'
-            L.append([(f'{m["project"][:18].ljust(18)} {alone} ({m["aloneN"]}) / {loaded} ({m["loadedN"]})', None)])
+            rows.append([Seg('✓ ' if ok else '✗ ', fg='green' if ok else 'red', bold=True),
+                         Seg(f'{r.get("duration_s", 0):6.1f}s '), Seg(f'busy {"?" if busy is None else busy}  ', fg='dim'),
+                         Seg(short(r.get('cwd', ''), home)[-24:] + ' '), Seg(r.get('command', ''), fg='dim', flex=True)])
+        if ts['medians']:
+            rows += [[], [Seg('median s: alone / under load', dim=True)]]
+            for m in ts['medians']:
+                alone = '—' if m['alone'] is None else f'{m["alone"]:.1f}'
+                loaded = '—' if m['loaded'] is None else f'{m["loaded"]:.1f}'
+                rows.append([Seg(cut(m['project'], 18).ljust(19)), Seg(f'{alone} ', fg='green'), Seg(f'({m["aloneN"]}) / ', fg='dim'),
+                             Seg(f'{loaded} ', fg='yellow'), Seg(f'({m["loadedN"]})', fg='dim')])
+        L += card('Test runs', rows, width)
     return L
 
 
-def paint(parts, width):
-    out, used = [], 0
-    for text, color in parts:
-        if used >= width:
-            break
-        text = text[:width - used]
-        used += len(text)
-        if color == 'bold':
-            out.append(f'\x1b[1m{text}\x1b[0m')
-        elif color:
-            out.append('\x1b[38;2;%d;%d;%dm' % RGB[color] + text + '\x1b[0m')
-        else:
-            out.append(text)
+def plain(line):
+    return ''.join(s.text for s in line)
+
+
+def paint(line):
+    out = []
+    for s in line:
+        codes = (['1'] if s.bold else []) + (['2'] if s.dim else [])
+        if s.fg:
+            codes.append('38;2;%d;%d;%d' % RGB[s.fg])
+        if s.bg:
+            codes.append('48;2;%d;%d;%d' % RGB[s.bg])
+        out.append(f'\x1b[{";".join(codes)}m{s.text}\x1b[0m' if codes else s.text)
     return ''.join(out)
 
 
@@ -401,7 +507,7 @@ def paint(parts, width):
 class Monitor:
     def __init__(self):
         self.lock = threading.Lock()
-        self.state = {'sample': None, 'history': [], 'pressure': None, 'disk': None, 'docker': None, 'procs': None,
+        self.state = {'host': os.uname().nodename, 'uptime': None, 'sample': None, 'history': [], 'pressure': None, 'disk': None, 'docker': None, 'procs': None,
                       'ports': None, 'postgres': None, 'groups': None, 'tests': None}
         self.prev_stat = None
         self.prev_ticks, self.prev_scan_at, self.last_scan = {}, 0.0, []
@@ -427,7 +533,9 @@ class Monitor:
         ps = {k: parse_pressure(read(f'/proc/pressure/{k}')) for k in ('cpu', 'memory', 'io')}
         now = parse_stat(stat or '')
         last, self.prev_stat = self.prev_stat, now
-        kw = {'pressure': ps if any(v is not None for v in ps.values()) else None}
+        up = read('/proc/uptime')
+        kw = {'pressure': ps if any(v is not None for v in ps.values()) else None,
+              'uptime': float(up.split()[0]) if up else None}
         if last and mem and load:
             s = cpu_sample(last, now, mem, load)
             kw.update(sample=s, history=(self.state['history'] + [s['cpu']])[-60:])
@@ -572,15 +680,15 @@ def main():
             except OSError:
                 cols, rows = shutil.get_terminal_size((80, 24))
             with mon.lock:
-                lines = render(mon.state, cols)
+                lines = render({**mon.state, 'now': time.time()}, cols)
             height = rows - 1
             scroll = max(0, min(scroll, len(lines) - height))
-            out = [f'\x1b[{i + 1};1H\x1b[2K' + (paint(lines[scroll + i], cols) if scroll + i < len(lines) else '')
+            out = [f'\x1b[{i + 1};1H\x1b[2K' + (paint(lines[scroll + i]) if scroll + i < len(lines) else '')
                    for i in range(height)]
-            out.append(f'\x1b[{rows};1H\x1b[2K' + paint([('↑↓ scroll · q quit', 'dim')], cols))
+            out.append(f'\x1b[{rows};1H\x1b[2K' + paint(fit([Seg('↑↓ scroll · q quit', dim=True)], cols)))
             sys.stdout.write(''.join(out))
             sys.stdout.flush()
-            ready, _, _ = select.select([fd, mon.wake_r], [], [], 5)
+            ready, _, _ = select.select([fd, mon.wake_r], [], [], 1)
             if mon.wake_r in ready:
                 os.read(mon.wake_r, 4096)
             if fd in ready:
