@@ -48,4 +48,4 @@ rex.action{
   end,
 }
 
-rex.bind("shift+cmd+m", "sysmon")
+rex.bind("alt+cmd+s", "sysmon")

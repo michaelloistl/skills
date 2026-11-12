@@ -237,8 +237,8 @@ def read(path):
 
 RGB = {
     'green': (78, 186, 101), 'yellow': (255, 193, 7), 'red': (255, 107, 128), 'accent': (215, 119, 87),
-    'blue': (177, 185, 249), 'purple': (175, 135, 255), 'dim': (130, 130, 130), 'track': (58, 58, 58),
-    'border': (85, 85, 85), 'ink': (20, 20, 20), 'white': (235, 235, 235),
+    'blue': (177, 185, 249), 'purple': (175, 135, 255), 'dim': (130, 130, 130), 'track': (88, 88, 88),
+    'border': (110, 110, 110), 'ink': (20, 20, 20), 'white': (235, 235, 235),
 }
 SPARK = '▁▂▃▄▅▆▇█'
 
@@ -316,11 +316,14 @@ def pg_tone(p):
     return 'red' if p >= 90 else 'yellow' if p >= 70 else 'green'
 
 
+BAR_MAX = 30
+
+
 def meter(p, width, color=None):
-    """A thin bar: the filled share in its tone, the rest as a dark track."""
-    width = max(1, width)
+    """A bar like the PR board's progress: the filled share in its tone, the rest as a dim track."""
+    width = max(1, min(BAR_MAX, width))
     filled = round(min(100, max(0, p)) / 100 * width)
-    return [Seg('━' * filled, fg=color or tone(p)), Seg('━' * (width - filled), fg='track')]
+    return [Seg('▰' * filled, fg=color or tone(p)), Seg('▱' * (width - filled), fg='track')]
 
 
 def spark(values, width):
@@ -355,8 +358,8 @@ def uptime(seconds):
 
 
 def gauge(label, p, value, width):
-    """`Mem  ━━━━━━━━━━━━━━  4.4/30.6G`: the bar takes what the label and value leave."""
-    return [Seg(label.ljust(5), fg='dim'), *meter(p, width - 5 - 12), Seg(value.rjust(12))]
+    """`Mem  ▰▰▰▱▱▱▱▱  4.4/30.6G`: the bar takes what the label and value leave, up to BAR_MAX."""
+    return [Seg(label.ljust(5), fg='dim'), *meter(p, width - 5 - 12), Seg(' ' + value, bold=True)]
 
 
 def render(st, width, home=HOME):
@@ -380,16 +383,18 @@ def render(st, width, home=HOME):
         dp = pct(d['used'], d['total'])
         chips += [Seg(' '), chip(f'DISK {dp}%', tone(dp))]
     chips += [Seg(' '), chip(f'LOAD {s["load"].split()[0]}', 'blue')]
-    L += [fit([], width), fit(chips, width)]
+    L += [fit([], width), fit(chips, width), fit([], width)]
 
     # CPU: total, history, then every core, two columns when there is room.
-    cpu = [gauge('CPU', s['cpu'], f'{s["cpu"]}%', inner), spark(st['history'], inner),
+    cpu = [gauge('all', s['cpu'], f'{s["cpu"]}%', inner), [Seg('     '), *spark(st['history'], min(BAR_MAX, inner - 5))],
            [Seg('steal ', fg='dim'), Seg(f'{s["steal"]:.1f}%', fg=steal_tone(s['steal'])),
             Seg('  iowait ', fg='dim'), Seg(f'{s["iowait"]:.1f}%'), Seg('', fill=True),
             Seg('load ', fg='dim'), Seg(s['load'])], []]
     cols = 2 if inner >= 56 else 1
     col_w = (inner - (cols - 1) * 3) // cols
-    cores = [[Seg(f'{i:>2} ', fg='dim'), *meter(c, col_w - 8), Seg(f'{c:>4}%')] for i, c in enumerate(s['cores'])]
+    bar_w = min(BAR_MAX, col_w - 8)
+    cores = [[Seg(f'{i:>2} ', fg='dim'), *meter(c, bar_w), Seg(f'{c:>4}%'), Seg(' ' * (col_w - 8 - bar_w))]
+             for i, c in enumerate(s['cores'])]
     for i in range(0, len(cores), cols):
         row = []
         for j, core in enumerate(cores[i:i + cols]):

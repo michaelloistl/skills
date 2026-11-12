@@ -83,7 +83,8 @@ class RenderTest(unittest.TestCase):
 
     def test_bars_take_the_tone_of_their_share(self):
         cpu = sm.meter(90, 10)
-        self.assertEqual([(seg.text, seg.fg) for seg in cpu], [('━━━━━━━━━', 'red'), ('━', 'track')])
+        self.assertEqual([(seg.text, seg.fg) for seg in cpu], [('▰▰▰▰▰▰▰▰▰', 'red'), ('▱', 'track')])
+        self.assertEqual(len(''.join(seg.text for seg in sm.meter(50, 200))), sm.BAR_MAX)
         self.assertEqual(sm.meter(10, 10)[0].fg, 'green')
 
     def test_render_waits_for_the_first_sample(self):

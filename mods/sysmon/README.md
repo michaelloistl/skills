@@ -16,7 +16,7 @@ claude plugin validate mods/sysmon
 
 `rex/sysmon.py` is a terminal program using only the Python 3 standard library. It reads `/proc`, so it runs in Linux sessions, such as devbox ones. In a Mac session it says so and closes on any key.
 
-- `shift+cmd+m`, or Toggle System Monitor in the command palette, opens the pane right of the focused pane, or closes it. The action is `sysmon` in `rex/sysmon.lua`.
+- `alt+cmd+s`, or Toggle System Monitor in the command palette, opens the pane right of the focused pane, or closes it. The action is `sysmon` in `rex/sysmon.lua`.
 - It shows the mod's sections:
   - pressure, CPU with its history and per-core bars, steal and iowait
   - memory, swap, disk and load

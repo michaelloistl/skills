@@ -54,4 +54,4 @@ rex.action{
   end,
 }
 
-rex.bind("shift+cmd+o", "pr_board")
+rex.bind("alt+cmd+p", "pr_board")
