@@ -102,6 +102,8 @@ def ago(seconds):
 def dispatch_script(repo_from_home):
     return '\n'.join([
         f'cd "$HOME/{repo_from_home}" 2>/dev/null || {{ echo \'[]\'; exit 0; }}',
+        # Over ssh no REX_SESSION is set: without it dispatch reports no pane for any run.
+        'command -v rex >/dev/null && export REX_SESSION="${REX_SESSION:-status}"',
         'for d in "$HOME/.claude-on" "$HOME/.claude"; do',
         '  f="$d/skills/dispatch/dispatch"',
         '  [ -f "$f" ] && exec python3 "$f" status --json',
@@ -122,7 +124,7 @@ def parse_runs(host, text):
         runs.append({
             'spec': int(r['spec']), 'host': host, 'state': r['state'], 'step': r.get('step') or '',
             'summary': r.get('summary') or '', 'prNumber': int(pr.group(1)) if pr else None,
-            'attention': (f'{att}: {note}' if note else att) if att else None,
+            'attention': (f'{att}: {note}' if note else att) if att else None, 'pane': r.get('pane'),
         })
     return runs
 
@@ -224,6 +226,20 @@ def launch_argv(pr, action, cwd, config_dir=None):
     env = [f'CLAUDE_CONFIG_DIR={config_dir}'] if config_dir else []
     return ['rex', 'new', name, '-c', cwd, '--shell', 'zsh', '--', 'env', *env,
             'claude', '--worktree', name, '-n', name, action['prompt'](pr)]
+
+
+def focus_pane(host, pane, call=None):
+    """Shows the Rex tab holding `pane` on `host`: focuses the block, then has the app select its session and tab."""
+    call = call or (lambda argv: run(argv, timeout=10))
+    rex = ['rex', '--autostart=false', *([] if host == 'local' else ['-S', host])]
+    found = json.loads(call([*rex, 'api', 'call', 'target.resolve', json.dumps({'queries': [pane], 'kinds': ['block']})]))
+    target = (found.get('results') or [{}])[0].get('target') or {}
+    if not target.get('session_id'):
+        raise RuntimeError('its pane is gone')
+    call([*rex, 'api', 'call', 'session.focus_block',
+          json.dumps({'session_id': target['session_id'], 'block_id': pane})])
+    call([*rex, 'do', 'session.select', f'session_id={target["session_id"]}', f'window_id={target["window_id"]}'])
+    return target['window_id']
 
 
 def run(argv, cwd=None, timeout=60):
@@ -511,9 +527,13 @@ def run_rows(r, issue_url):
               chip(r['step'] if r['state'] == 'running' else f'{r["state"]} · {r["step"]}', color),
               [Seg(bar(p[0], p[1]), fg=color), Seg(f' {p[0]}/{p[1]}', dim=True)] if p else None,
               Seg(p[2] if p else r['summary'], dim=True, flex=True))
-    rows = [row + [Seg('', fill=True), Seg(f' @{r["host"]}', fg='subtle')]]
+    rows = [row + [Seg('', fill=True), Seg(f' ↗ @{r["host"]}' if r.get('pane') else f' @{r["host"]}', fg='subtle')]]
     if r.get('attention'):
         rows.append([Seg('  ▲ ' + r['attention'], fg='warning', flex=True)])
+    if r.get('pane'):
+        # Anywhere on the run but its issue link shows the run's tab.
+        for seg in (seg for row_ in rows for seg in row_):
+            seg.hit = seg.hit or ('tab', r['host'], r['pane'], r['spec'])
     return rows
 
 
@@ -852,6 +872,19 @@ class App:
             self.model['expanded'] = 0 if self.model['expanded'] == hit[1] else hit[1]
         elif kind == 'action':
             self.launch(hit[1], hit[2])
+        elif kind == 'tab':
+            self.say(f'Opening spec #{hit[3]}…')
+            self.wake()
+
+            def work():
+                try:
+                    focus_pane(hit[1], hit[2])
+                    self.say(f'Showing spec #{hit[3]}')
+                except (RuntimeError, ValueError, IndexError) as err:
+                    self.say(f'Could not show spec #{hit[3]}: {err}')
+                self.wake()
+
+            threading.Thread(target=work, daemon=True).start()
         elif kind == 'pin':
             self.model['pin'] = 0 if self.model['pin'] == hit[1] else hit[1]
             self.model['expanded'] = 0

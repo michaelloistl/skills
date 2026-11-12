@@ -55,6 +55,22 @@ class DataTest(unittest.TestCase):
         self.assertEqual(runs[0]['attention'], 'ASK: Q1?')
         self.assertEqual(runs[1]['prNumber'], 9)
 
+    def test_focus_pane_selects_the_tab_holding_the_runs_pane_on_its_host(self):
+        calls = []
+
+        def call(argv):
+            calls.append(argv)
+            if 'target.resolve' in argv:
+                return json.dumps({'results': [{'status': 'resolved', 'target': {
+                    'session_id': 'session:s', 'window_id': 'window:w', 'label': 'spec-7'}}]})
+            return ''
+
+        self.assertEqual(pb.focus_pane('devbox', 'block:b', call), 'window:w')
+        self.assertEqual(calls[1][:7], ['rex', '--autostart=false', '-S', 'devbox', 'api', 'call', 'session.focus_block'])
+        self.assertEqual(calls[2][4:], ['do', 'session.select', 'session_id=session:s', 'window_id=window:w'])
+        with self.assertRaisesRegex(RuntimeError, 'gone'):
+            pb.focus_pane('local', 'block:b', lambda argv: json.dumps({'results': [{'status': 'not_found'}]}))
+
     def test_merged_slices_keeps_the_last_day_of_spec_slices_newest_first(self):
         raw = [
             {'number': 1, 'title': 'a', 'url': 'u1', 'mergedAt': '2027-01-15T07:00:00Z', 'baseRefName': 'agent/local-spec-7-x'},
@@ -179,6 +195,17 @@ class DrawTest(unittest.TestCase):
         out = text(pb.render(model([], board={'runs': [run]}), 60)[0])
         self.assertIn('drive-spec · no PR yet', out)
         self.assertIn('▲ ASK: Q1?', out)
+
+    def test_a_click_on_a_run_with_a_pane_shows_its_tab_but_its_spec_still_opens_the_issue(self):
+        run = {'spec': 5, 'host': 'local', 'state': 'running', 'step': 'build', 'summary': 'busy', 'prNumber': None,
+               'attention': 'ASK: Q1?', 'pane': 'block:b'}
+        lines = pb.render(model([], board={'runs': [run]}), 60)[0]
+        row = next(line for line in lines if 'spec #5' in pb.plain(line))
+        self.assertIn('↗ @local', pb.plain(row))
+        self.assertEqual(pb.hit_at(row, pb.plain(row).index('busy')), ('tab', 'local', 'block:b', 5))
+        self.assertEqual(pb.hit_at(row, pb.plain(row).index('spec #5'))[0], 'open')
+        ask = next(line for line in lines if 'Q1?' in pb.plain(line))
+        self.assertEqual(pb.hit_at(ask, pb.plain(ask).index('Q1?'))[0], 'tab')
 
 
 class InputTest(unittest.TestCase):

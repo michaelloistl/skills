@@ -23,7 +23,7 @@ The same board as a terminal program in a Rex split, independent of any Claude s
 
 - `alt+cmd+p`, or Toggle Open PRs in the command palette, opens the board right of the focused pane, or closes it. The action is `pr_board` in `rex/pr_board.lua`.
 - The board follows the pane it opened beside, reading it every 5 seconds through the Rex API. It reads the folder, repo and branch of the program in the foreground. When that program is Claude, it also reads the session from `~/.claude*/sessions/<pid>.json` and finds the PR the session references most in its transcript. The session PR rules match the mod's.
-- Keys: `↑↓`/`jk` select a PR, `⏎`/`o` open it, `␣`/`a` show its actions, `f` Fix CI, `c` Resolve conflicts, `p` pin it to the followed session, `r` refresh, `q` close. A click works on any number, `⋯`, an action or `↻ refresh`, and the wheel scrolls.
+- Keys: `↑↓`/`jk` select a PR, `⏎`/`o` open it, `␣`/`a` show its actions, `f` Fix CI, `c` Resolve conflicts, `p` pin it to the followed session, `r` refresh, `q` close. A click works on any number, `⋯`, an action or `↻ refresh`, and the wheel scrolls. A click on a drive-spec run marked `↗` shows its Rex tab, even on a remote host; its `spec #N` still opens the issue.
 - On macOS, links open in the browser. Elsewhere, such as a devbox, they copy to the clipboard through OSC 52.
 - drive-spec hosts come from the mod's `driveSpecHosts` in the followed session's settings, or `--hosts`.
 
