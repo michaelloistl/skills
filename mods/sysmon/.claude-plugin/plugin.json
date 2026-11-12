@@ -1,0 +1,1 @@
+{ "name": "sysmon", "version": "0.1.0", "description": "Live CPU and memory of this Linux box in the status line and a pane", "types": "./types/index.d.ts" }
