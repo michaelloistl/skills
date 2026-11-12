@@ -327,9 +327,15 @@ def meter(p, width, color=None):
 
 
 def spark(values, width):
+    """A two-row sparkline of the last `width` values: each column in eighths of a cell, toned by its value."""
     values = values[-width:]
     pad = [Seg(' ' * (width - len(values)))] if len(values) < width else []
-    return pad + [Seg(SPARK[min(7, int(v / 100 * 8))], fg=tone(v)) for v in values]
+    top, bottom = list(pad), list(pad)
+    for v in values:
+        h = max(1, round(min(100, max(0, v)) / 100 * 16))
+        top.append(Seg(SPARK[h - 9] if h > 8 else ' ', fg=tone(v)))
+        bottom.append(Seg(SPARK[min(h, 8) - 1], fg=tone(v)))
+    return top, bottom
 
 
 def gb(b):
@@ -386,7 +392,11 @@ def render(st, width, home=HOME):
     L += [fit([], width), fit(chips, width), fit([], width)]
 
     # CPU: total, history, then every core, two columns when there is room.
-    cpu = [gauge('all', s['cpu'], f'{s["cpu"]}%', inner), [Seg('     '), *spark(st['history'], min(BAR_MAX, inner - 5))],
+    spark_w = min(BAR_MAX, inner - 5)
+    top, bottom = spark(st['history'], spark_w)
+    seconds = min(len(st['history']), spark_w) * 2
+    cpu = [gauge('all', s['cpu'], f'{s["cpu"]}%', inner), [],
+           [Seg('     '), *top], [Seg('     '), *bottom, Seg(f' last {seconds // 60}m' if seconds >= 60 else f' last {seconds}s', fg='dim')], [],
            [Seg('steal ', fg='dim'), Seg(f'{s["steal"]:.1f}%', fg=steal_tone(s['steal'])),
             Seg('  iowait ', fg='dim'), Seg(f'{s["iowait"]:.1f}%'), Seg('', fill=True),
             Seg('load ', fg='dim'), Seg(s['load'])], []]

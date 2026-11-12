@@ -87,6 +87,11 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(len(''.join(seg.text for seg in sm.meter(50, 200))), sm.BAR_MAX)
         self.assertEqual(sm.meter(10, 10)[0].fg, 'green')
 
+    def test_spark_stacks_two_rows_of_eighths(self):
+        top, bottom = sm.spark([25, 100], 3)
+        self.assertEqual(sm.plain(top), '  █')
+        self.assertEqual(sm.plain(bottom), ' ▄█')
+
     def test_render_waits_for_the_first_sample(self):
         lines = sm.render({'sample': None, 'host': 'devbox'}, 60)
         self.assertIn('Sampling…', sm.plain(lines[-1]))
