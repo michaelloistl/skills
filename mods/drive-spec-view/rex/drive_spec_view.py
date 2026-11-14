@@ -488,18 +488,16 @@ def step_rows(step, state, inner_width):
 
 def slice_card(s, model, url, width):
     glyph, color = SLICE_LOOK.get(s['state'], ('?', 'inactive'))
-    selected = model.get('selected') == s['number']
     link_url = f'{url}/pull/{s["pr"]}' if url and s.get('pr') else (f'{url}/issues/{s["number"]}' if url else None)
     title = [Seg(glyph, fg=color, bold=True), Seg(' '),
-             Seg(f'#{s["number"]}', bold=True, fg='white' if selected else None,
-                 hit=('open', link_url) if link_url else None, link=link_url)]
+             Seg(f'#{s["number"]}', bold=True, hit=('open', link_url) if link_url else None, link=link_url)]
     if s['state'] == 'landed' and s.get('landed_at'):
         right = [Seg(f'landed {ago(model["now"] - s["landed_at"])} ago', dim=True)]
     elif s['waiting_on']:
         right = [Seg('after ' + ', '.join(f'#{b}' for b in s['waiting_on']), fg='subtle')]
     else:
         right = [Seg(s['state'], fg=color, bold=s['state'] != 'todo')]
-    inner = [[Seg(t, dim=s['state'] == 'landed', bold=selected)]
+    inner = [[Seg(t, dim=s['state'] == 'landed')]
              for t in wrap(s['title'] or '(title not read yet)', width - 6, 3)]
     a = s.get('agent')
     if a:
@@ -519,12 +517,14 @@ def slice_card(s, model, url, width):
             kind, text = a['action']
             for t in wrap('“' + text + '”' if kind == 'text' else text, width - 8, 2):
                 inner.append([Seg('  ' + t, dim=True)])
-    lines = card(inner, width, 'white' if selected else color if s['state'] != 'todo' else 'subtle',
-                 title, right, 'double' if selected else 'round', pad=False)
-    for line in lines:
-        for seg in line:
-            seg.hit = seg.hit or ('select', s['number'])
-    return lines
+    if a and a.get('log'):
+        info += [Seg('', fill=True), Seg('▸ log', fg='suggestion', hit=('log', s['number']))]
+    return card(inner, width, color if s['state'] != 'todo' else 'subtle', title, right, pad=False)
+
+
+def logged_slices(slices):
+    """The slices whose agent has a log to tail, in build order."""
+    return [s['number'] for s in slices if (s.get('agent') or {}).get('log')]
 
 
 def render_run(model, width):
@@ -713,7 +713,7 @@ def parse_input(data):
 
 # ── the app ─────────────────────────────────────────────────────────────────
 
-RUN_HINTS = '↑↓ slice · ⏎ open · l log · g go to run · s runs · r refresh · q quit'
+RUN_HINTS = '⏎ open PR · l log · g go to run · s runs · r refresh · q quit · click a # to open it'
 PICK_HINTS = '↑↓ select · ⏎ show · esc follow · r refresh · q quit'
 
 
@@ -729,6 +729,7 @@ class App:
         self.plan_for, self.plans_loading = None, set()
         self.last_plan, self.last_dispatch = 0.0, 0.0
         self.pick_open = False  # the picker opened with s
+        self.log_choice = []  # slices `l` asks between, while it asks
         self.model = {'spec': None, 'status': None, 'plan': None, 'slices': [], 'picker': [], 'picking': False,
                       'selected': None, 'following': 'starting…', 'loading': False, 'error': None, 'now': time.time()}
         self.scroll, self.follow_selection = 0, False  # scroll to the selection only once it is moved
@@ -890,11 +891,22 @@ class App:
     def slice(self, n):
         return next((s for s in self.model['slices'] if s['number'] == n), None)
 
-    def open_slice(self, n):
-        url = github_url((self.model['status'] or {}).get('repo'))
-        s = self.slice(n)
-        if url and s:
-            self.open_url(f'{url}/pull/{s["pr"]}' if s.get('pr') else f'{url}/issues/{n}')
+    def open_spec(self):
+        st = self.model['status'] or {}
+        url = github_url(st.get('repo'))
+        self.open_url(st.get('pr_url') or (f'{url}/issues/{self.model["spec"]}' if url else None))
+
+    def ask_log(self):
+        """`l`: tail the one running agent's log, or ask which when several run."""
+        logs = logged_slices(self.model['slices'])
+        if not logs:
+            self.say('No agent is running')
+        elif len(logs) == 1:
+            self.tail_log(logs[0])
+        else:
+            self.log_choice = logs
+            self.status_line = ('tail which log? ' + ' · '.join(f'{i + 1} #{n}' for i, n in enumerate(logs))
+                                + ' · esc cancel', float('inf'))
 
     def tail_log(self, n):
         s = self.slice(n)
@@ -949,18 +961,20 @@ class App:
             self.open_url(hit[1])
         elif kind == 'refresh':
             self.refresh()
-        elif kind == 'select':
-            self.model['selected'] = hit[1]
+        elif kind == 'log':
+            self.tail_log(hit[1])
         elif kind == 'choose':
             self.choose(hit[1])
 
     def order(self):
-        m = self.model
-        return [r['spec'] for r in m['picker']] if m['picking'] else [s['number'] for s in m['slices']]
+        return [r['spec'] for r in self.model['picker']]
 
     def move(self, step):
         order = self.order()
-        if order:
+        if not self.model['picking']:  # the run view has nothing to select: the arrows scroll
+            self.scroll += step * 3
+            self.follow_selection = False
+        elif order:
             sel = self.model['selected']
             i = order.index(sel) if sel in order else -1
             self.model['selected'] = order[max(0, min(len(order) - 1, i + step))]
@@ -968,6 +982,12 @@ class App:
 
     def on_key(self, key, height):
         m = self.model
+        if self.log_choice:
+            choice, self.log_choice = self.log_choice, []
+            self.status_line = ('', 0.0)
+            if key.isdigit() and 1 <= int(key) <= len(choice):
+                self.tail_log(choice[int(key) - 1])
+            return
         if key in ('q', '\x03'):
             raise SystemExit
         if key in ('down', 'j'):
@@ -996,12 +1016,10 @@ class App:
                 self.choose(m['selected'])
         elif key == 'g':
             self.go_to_run()
-        elif m['selected'] is None:
-            return
         elif key in ('enter', 'o'):
-            self.open_slice(m['selected'])
+            self.open_spec()
         elif key == 'l':
-            self.tail_log(m['selected'])
+            self.ask_log()
 
     def on_mouse(self, button, col, row):
         if button in (64, 65):
@@ -1023,15 +1041,13 @@ class App:
         with self.lock:
             m = self.model
             order = self.order()
-            if order and m['selected'] not in order:
-                busy = [s['number'] for s in m['slices'] if s.get('agent')]
-                m['selected'] = (m['spec'] if m['picking'] and m['spec'] in order else None) or \
-                    (busy[0] if busy and not m['picking'] else order[0])
+            if m['picking'] and order and m['selected'] not in order:
+                m['selected'] = m['spec'] if m['spec'] in order else order[0]
             self.lines, self.spans, self.head = render(m, cols)
             picking = m['picking']
         head = min(self.head, height - 1)
         rows_left = height - head
-        span = self.spans.get(self.model['selected'])
+        span = self.spans.get(self.model['selected']) if picking else None
         if self.follow_selection and span:
             top, bottom = span[0] - head, span[1] - head
             if top < self.scroll:

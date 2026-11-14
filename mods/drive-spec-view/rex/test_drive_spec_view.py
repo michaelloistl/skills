@@ -137,8 +137,10 @@ class RenderTest(unittest.TestCase):
         self.assertIn('1/3 landed', out)
         self.assertIn('PR      #12', out)
         self.assertIn('branch  agent/local-spec-7-x', out)
-        self.assertIn('╔═ ● #9 ', out)  # the selected slice is double-bordered
+        self.assertIn('╭─ ● #9 ', out)
+        self.assertNotIn('╔', out)  # nothing in the run view is selected
         self.assertIn('⤷ implementer  2m', out)
+        self.assertIn('▸ log  │', out)
         self.assertIn('    Edit app/x.rb', out)
         self.assertIn('─ ○ #10 ', out)
         self.assertIn(' after #9 ─╮', out)
@@ -178,7 +180,15 @@ class RenderTest(unittest.TestCase):
         row = lines[spans[10][0]]
         col = v.plain(row).index('#10')
         self.assertEqual(v.hit_at(row, col), ('open', 'https://github.com/o/r/issues/10'))
-        self.assertEqual(v.hit_at(lines[spans[10][0] + 1], 5), ('select', 10))
+        self.assertIsNone(v.hit_at(lines[spans[10][0] + 1], 5))
+        agent_row = next(l for l in lines if '▸ log' in v.plain(l))
+        self.assertEqual(v.hit_at(agent_row, v.plain(agent_row).index('▸ log')), ('log', 9))
+
+    def test_only_slices_with_an_agent_log_can_be_tailed(self):
+        m = self.model()
+        self.assertEqual(v.logged_slices(m['slices']), [9])
+        m['slices'][1]['agent']['log'] = None
+        self.assertEqual(v.logged_slices(m['slices']), [])
 
     def test_picker_lists_runs_as_cards(self):
         m = self.model(picking=True, picker=[{'spec': 7, 'state': 'running', 'step': 'build', 'summary': 's',
