@@ -123,22 +123,33 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(v.cw(v.plain(line)), width, v.plain(line))
         return '\n'.join(v.plain(l) for l in lines), spans
 
-    def test_run_view_shows_steps_progress_and_slices(self):
-        out, spans = self.text(self.model(), 120)
-        self.assertIn('spec #7 Export', out)
-        self.assertIn('explore › build › review', out)
-        self.assertIn(' running  landed 1/4; building #9', out)
-        self.assertIn('30s ago', out)
-        self.assertIn('▰▱▱ 1/3 landed PR #12 main ← agent/local-spec-7-x', out)
-        self.assertIn('⤷ implementer 2m · Edit app/x.rb', out)
-        self.assertIn('#10 Third', out)
-        self.assertIn('after #9', out)
+    def test_run_view_shows_run_steps_progress_and_slice_cards(self):
+        out, spans = self.text(self.model(), 90)
+        self.assertIn('spec #7', out)
+        self.assertIn('   Export', out)
+        self.assertIn('─ run ', out)
+        self.assertIn(' RUNNING   step 6 of 11 · build', out)
+        self.assertIn('updated 30s ago', out)
+        self.assertIn('landed 1/4; building #9', out)
+        self.assertIn('next  build #9', out)
+        self.assertIn('✓  5 explore          ○ 11 qa-pr', out)
+        self.assertIn('▶  6 build', out)
+        self.assertIn('1/3 landed', out)
+        self.assertIn('PR      #12', out)
+        self.assertIn('branch  agent/local-spec-7-x', out)
+        self.assertIn('╔═ ● #9 ', out)  # the selected slice is double-bordered
+        self.assertIn('⤷ implementer  2m', out)
+        self.assertIn('    Edit app/x.rb', out)
+        self.assertIn('─ ○ #10 ', out)
+        self.assertIn(' after #9 ─╮', out)
+        self.assertIn('landed 5m ago', out)
         top, bottom = spans[9]
-        self.assertEqual(bottom - top, 1)
+        self.assertEqual(bottom - top, 5)  # border, title, gap, agent, action, border
 
-    def test_narrow_view_numbers_the_steps(self):
-        out, _ = self.text(self.model(), 50)
-        self.assertIn('5 › build › 7', out)
+    def test_narrow_view_lists_the_steps_in_one_column(self):
+        out, _ = self.text(self.model(), 40)
+        self.assertIn('▶  6 build   ', out)
+        self.assertIn('○  7 review   ', out)
 
     def test_a_blocking_question_is_boxed_and_a_stall_flagged(self):
         m = self.model(status={'state': 'waiting', 'question': 'Ship the EU pack first? Options a or b.',
@@ -148,7 +159,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn('Ship the EU pack first?', out)
         stalled = self.model(status={'updated_at': iso(NOW - 3600)})
         lines, _, _ = v.render(stalled, 90)
-        age = next(s for l in lines for s in l if s.text == ' 1h00m ago')
+        age = next(s for l in lines for s in l if s.text == 'updated 1h00m ago')
         self.assertEqual(age.fg, 'error')
 
     def test_a_quiet_agent_is_flagged(self):
@@ -157,19 +168,25 @@ class RenderTest(unittest.TestCase):
         out, _ = self.text(m)
         self.assertIn('⚠ quiet 10m', out)
 
+    def test_long_text_wraps_and_cuts_once(self):
+        self.assertEqual(v.wrap('aa bb cc dd', 5), ['aa bb', 'cc dd'])
+        self.assertEqual(v.wrap('aa bb cc dd ee ff', 5, 2), ['aa bb', 'cc …'])
+        self.assertEqual(v.wrap('aa bb cc dd ee ff', 8, 1), ['aa bb …'])
+
     def test_clicks_open_the_issue_and_select_the_slice(self):
         lines, spans, _ = v.render(self.model(), 90)
         row = lines[spans[10][0]]
         col = v.plain(row).index('#10')
         self.assertEqual(v.hit_at(row, col), ('open', 'https://github.com/o/r/issues/10'))
-        self.assertEqual(v.hit_at(row, col + 6), ('select', 10))
+        self.assertEqual(v.hit_at(lines[spans[10][0] + 1], 5), ('select', 10))
 
-    def test_picker_lists_runs(self):
+    def test_picker_lists_runs_as_cards(self):
         m = self.model(picking=True, picker=[{'spec': 7, 'state': 'running', 'step': 'build', 'summary': 's',
                                               'attention': None}], selected=7)
         out, spans = self.text(m)
-        self.assertIn('spec #7  running · build  s', out)
-        self.assertEqual(v.hit_at(v.render(m, 90)[0][spans[7][0]], 0), ('choose', 7))
+        self.assertIn('╔═ spec #7 ', out)
+        self.assertIn(' running · build ', out)
+        self.assertEqual(v.hit_at(v.render(m, 90)[0][spans[7][0] + 1], 5), ('choose', 7))
 
 
 class HelpersTest(unittest.TestCase):

@@ -400,19 +400,57 @@ def gap(*parts):
     return out
 
 
-def card(inner, width, color, title=None):
-    top = '╭' + (f'─ {title} ' if title else '')
-    lines = [[Seg(top, fg=color), Seg('─' * max(0, width - cw(top) - 1), fg=color), Seg('╮', fg=color)]]
-    for line in inner:
-        lines.append([Seg('│ ', fg=color), *fit(line, width - 4), Seg(' │', fg=color)])
-    lines.append([Seg('╰' + '─' * (width - 2) + '╯', fg=color)])
+BORDERS = {'round': '╭╮╰╯─│', 'double': '╔╗╚╝═║'}
+
+
+def card(inner, width, color, title=None, right=None, style='round', pad=True):
+    """A bordered box: `title` and `right` are segments set into its top border; `pad` adds a blank row above and below."""
+    tl, tr, bl, br, h, v = BORDERS[style]
+    head = [Seg(tl + h, fg=color)]
+    if title:
+        head += [Seg(' ')] + title + [Seg(' ')]
+    tail = ([Seg(' ')] + right + [Seg(' ')] if right else []) + [Seg(h + tr, fg=color)]
+    used = sum(cw(x.text) for x in head + tail)
+    lines = [head + [Seg(h * max(0, width - used), fg=color)] + tail]
+    body = ([[]] if pad else []) + inner + ([[]] if pad else [])
+    for line in body:
+        lines.append([Seg(v + '  ', fg=color), *fit(line, width - 6), Seg('  ' + v, fg=color)])
+    lines.append([Seg(bl + h * (width - 2) + br, fg=color)])
     return lines
 
 
+def wrap(text, width, max_lines=None):
+    """`text` in lines of at most `width` cells, words kept whole where they fit; the last kept line ends in … when cut."""
+    out, row = [], ''
+    for w in (text or '').split():
+        while cw(w) > width:  # a word longer than a line: break it
+            if row:
+                out.append(row)
+                row = ''
+            out.append(w[:width])
+            w = w[width:]
+        if row and cw(row) + 1 + cw(w) > width:
+            out.append(row)
+            row = w
+        else:
+            row = f'{row} {w}' if row else w
+    if row:
+        out.append(row)
+    if max_lines and len(out) > max_lines:
+        out = out[:max_lines]
+        last = out[-1]
+        out[-1] = last + ' …' if cw(last) + 2 <= width else cut(last, width - 1).rstrip('…') + '…'
+    return out
+
+
 def bar(done, total, width=12):
-    cells = max(1, min(width, total))
+    cells = max(1, width)
     filled = round(done / total * cells) if total > 0 else 0
     return '▰' * filled + '▱' * (cells - filled)
+
+
+def blank(width):
+    return fit([], width)
 
 
 STATE_COLOR = {'running': 'success', 'waiting': 'warning', 'halted': 'error', 'paused': 'inactive', 'done': 'done'}
@@ -421,174 +459,180 @@ SLICE_LOOK = {
     'queued': ('◷', 'warning'), 'halted': ('✗', 'error'), 'held': ('⏸', 'inactive'),
     'open-pr': ('◆', 'suggestion'), 'in-flight': ('◇', 'suggestion'), 'todo': ('○', 'subtle'),
 }
+STEP_COL = 22
 
 
-def step_strip(step, state, width):
-    """The 11 steps, done ones dim, the current one a chip in its state's colour; numbers when names don't fit."""
+def step_rows(step, state, inner_width):
+    """The 11 steps as a checklist, in two columns when they fit: done ✓, the current one ▶ in its state's colour."""
     i = STEPS.index(step) if step in STEPS else -1
     color = STATE_COLOR.get(state, 'inactive')
 
-    def build(names):
-        segs = []
-        for j, name in enumerate(names):
-            if segs:
-                segs.append(Seg('›', fg='subtle'))
-            if j == i:
-                segs.append(chip(STEPS[j], color))
-            elif state == 'done' or j < i:
-                segs.append(Seg(f' {name} ', fg='success', dim=True))
-            else:
-                segs.append(Seg(f' {name} ', fg='subtle'))
-        return segs
+    def cell(j):
+        name = f'{j + 1:>2} {STEPS[j]}'
+        if j == i and state != 'done':
+            return [Seg('▶ ', fg=color, bold=True), Seg(name, fg=color, bold=True)]
+        if state == 'done' or j < i:
+            return [Seg('✓ ', fg='success'), Seg(name, dim=True)]
+        return [Seg('○ ', fg='subtle'), Seg(name, fg='subtle')]
 
-    full = build(STEPS)
-    if sum(cw(s.text) for s in full) <= width:
-        return full
-    return build([str(j + 1) for j in range(len(STEPS))])
+    if inner_width < 2 * STEP_COL:
+        return [cell(j) for j in range(len(STEPS))]
+    half = (len(STEPS) + 1) // 2
+    rows = []
+    for r in range(half):
+        left = cell(r)
+        pad = Seg(' ' * (STEP_COL - sum(cw(x.text) for x in left)))
+        rows.append(left + [pad] + (cell(r + half) if r + half < len(STEPS) else []))
+    return rows
 
 
-def slice_rows(s, model, url):
+def slice_card(s, model, url, width):
     glyph, color = SLICE_LOOK.get(s['state'], ('?', 'inactive'))
     selected = model.get('selected') == s['number']
-    bg = 'select' if selected else None
     link_url = f'{url}/pull/{s["pr"]}' if url and s.get('pr') else (f'{url}/issues/{s["number"]}' if url else None)
-    tail = []
-    if s['waiting_on']:
-        tail = [Seg(' after ' + ','.join(f'#{b}' for b in s['waiting_on']), fg='subtle', bg=bg)]
-    elif s['state'] == 'landed' and s.get('landed_at'):
-        tail = [Seg(f' {ago(model["now"] - s["landed_at"])} ago', dim=True, bg=bg)]
-    elif s['state'] not in ('todo', 'landed'):
-        tail = [Seg(f' {s["state"]}', fg=color, bg=bg)]
-    row = [Seg(glyph + ' ', fg=color, bg=bg, bold=True),
-           Seg(f'#{s["number"]}', bold=selected, bg=bg, hit=('open', link_url) if link_url else None, link=link_url),
-           Seg(' ' + (s['title'] or ''), bg=bg, dim=s['state'] == 'landed', flex=True),
-           Seg('', fill=True, bg=bg), *tail]
-    for seg in row:
-        seg.hit = seg.hit or ('select', s['number'])
-    rows = [row]
+    title = [Seg(glyph, fg=color, bold=True), Seg(' '),
+             Seg(f'#{s["number"]}', bold=True, fg='white' if selected else None,
+                 hit=('open', link_url) if link_url else None, link=link_url)]
+    if s['state'] == 'landed' and s.get('landed_at'):
+        right = [Seg(f'landed {ago(model["now"] - s["landed_at"])} ago', dim=True)]
+    elif s['waiting_on']:
+        right = [Seg('after ' + ', '.join(f'#{b}' for b in s['waiting_on']), fg='subtle')]
+    else:
+        right = [Seg(s['state'], fg=color, bold=s['state'] != 'todo')]
+    inner = [[Seg(t, dim=s['state'] == 'landed', bold=selected)]
+             for t in wrap(s['title'] or '(title not read yet)', width - 6, 3)]
     a = s.get('agent')
     if a:
-        info = [Seg('  ⤷ ', fg='subtle'), Seg(a['role'], fg=color)]
+        info = [Seg('⤷ ', fg='subtle'), Seg(a['role'], fg=color, bold=True)]
         if a['elapsed'] is not None:
-            info.append(Seg(f' {ago(a["elapsed"])}', dim=True))
+            info.append(Seg(f'  {ago(a["elapsed"])}', dim=True))
         if a['restarts']:
-            info.append(Seg(' restarted', fg='warning'))
+            info.append(Seg('  restarted', fg='warning'))
         if a['resumed']:
-            info.append(Seg(' resumed', fg='warning'))
+            info.append(Seg('  resumed', fg='warning'))
         if a['quiet'] is not None and a['quiet'] > STALE_AGENT_S and not a['queued']:
-            info.append(Seg(f' ⚠ quiet {ago(a["quiet"])}', fg='warning', bold=True))
+            info.append(Seg(f'  ⚠ quiet {ago(a["quiet"])}', fg='warning', bold=True))
+        inner += [[], info]
         if a['queued']:
-            info.append(Seg(' · waiting to integrate', dim=True))
+            inner.append([Seg('  waiting to integrate', dim=True)])
         elif a['action']:
             kind, text = a['action']
-            info.append(Seg(' · ' + ('“' + text + '”' if kind == 'text' else text), dim=kind != 'tool', flex=True))
-        for seg in info:
-            seg.hit = ('select', s['number'])
-        rows.append(info)
-    return rows
+            for t in wrap('“' + text + '”' if kind == 'text' else text, width - 8, 2):
+                inner.append([Seg('  ' + t, dim=True)])
+    lines = card(inner, width, 'white' if selected else color if s['state'] != 'todo' else 'subtle',
+                 title, right, 'double' if selected else 'round', pad=False)
+    for line in lines:
+        for seg in line:
+            seg.hit = seg.hit or ('select', s['number'])
+    return lines
 
 
 def render_run(model, width):
     st = model['status'] or {}
     url = github_url(st.get('repo'))
     now = model['now']
-    lines = []
     state, step = st.get('state') or '?', st.get('step') or '?'
     color = STATE_COLOR.get(state, 'inactive')
     spec = model['spec']
     spec_url = f'{url}/issues/{spec}' if url else None
     title = (model.get('plan') or {}).get('title') or ''
-    lines.append(fit(gap(Seg('⚙', fg='claude', bold=True),
-                         Seg(f'spec #{spec}', bold=True, hit=('open', spec_url) if spec_url else None, link=spec_url),
-                         Seg(title, bold=True, flex=True))
-                     + [Seg('', fill=True), Seg(' ↻ loading…' if model['loading'] else ' ↻', dim=True, hit=('refresh',))],
-                     width))
-    lines.append(fit([Seg('◎ ' + model['following'], dim=True, flex=True)], width))
+    inner_w = width - 6
+
+    lines = [fit([Seg(' ⚙ ', fg='claude', bold=True),
+                  Seg(f'spec #{spec}', fg='claude', bold=True, hit=('open', spec_url) if spec_url else None,
+                      link=spec_url),
+                  Seg('', fill=True), Seg('↻ loading… ' if model['loading'] else '↻ ', dim=True, hit=('refresh',))],
+                 width)]
+    for t in wrap(title, width - 4, 2):
+        lines.append(fit([Seg('   ' + t, bold=True)], width))
+    lines.append(fit([Seg('   ◎ ' + model['following'], dim=True, flex=True)], width))
+    lines.append(blank(width))
     head = len(lines)
 
     q = st.get('question')
     if q:
         blocking = st.get('question_blocking') is not False and state == 'waiting'
-        words, inner, row = q.split(), [], ''
-        for w in words:  # wrap the question: it is the one thing that must be read whole
-            if row and cw(row) + 1 + cw(w) > width - 4:
-                inner.append([Seg(row)])
-                row = w
-            else:
-                row = f'{row} {w}' if row else w
-        if row:
-            inner.append([Seg(row)])
-        lines += card(inner, width, 'warning' if blocking else 'subtle',
-                      '▲ waiting on you' if blocking else 'note for you')
+        qc = 'warning' if blocking else 'subtle'
+        lines += card([[Seg(t)] for t in wrap(q, inner_w)], width, qc,
+                      [Seg('▲ waiting on you' if blocking else 'note for you', fg=qc, bold=True)])
+        lines.append(blank(width))
 
-    lines.append(fit([], width))
-    lines.append(fit(step_strip(step, state, width), width))
     updated = parse_time(st.get('updated_at') or '')
     age = now - updated if updated else None
     stalled = age is not None and age > STALE_RUN_S and state == 'running'
-    lines.append(fit(gap(chip(state, color), Seg(st.get('summary') or '', flex=True))
-                     + [Seg('', fill=True),
-                        Seg(f' {ago(age)} ago' if age is not None else '', fg='error' if stalled else 'subtle',
-                            bold=stalled)], width))
+    where = f'step {STEPS.index(step) + 1} of {len(STEPS)} · {step}' if step in STEPS else f'step {step}'
+    inner = [[chip(state.upper(), color), Seg('  ' + where, bold=True, flex=True)], []]
+    updated_seg = [Seg(f'updated {ago(age)} ago', fg='error' if stalled else 'subtle', bold=stalled)] \
+        if age is not None else None
+    inner += [[Seg(t)] for t in wrap(st.get('summary') or '', inner_w, 4)]
     if st.get('next') and st.get('next') != 'none':
-        lines.append(fit([Seg('next ', fg='subtle'), Seg(st['next'], dim=True, flex=True)], width))
+        nx = wrap(st['next'], inner_w - 6, 3)
+        inner.append([])
+        inner += [[Seg('next  ' if k == 0 else '      ', fg='subtle'), Seg(t, dim=True)] for k, t in enumerate(nx)]
+    if model.get('error'):
+        inner += [[], [Seg(model['error'], fg='error', flex=True)]]
+    lines += card(inner, width, color, [Seg('run', fg=color, bold=True)], updated_seg)
+    lines.append(blank(width))
+
+    lines += card(step_rows(step, state, inner_w), width, 'subtle', [Seg('steps', bold=True)])
+    lines.append(blank(width))
 
     slices = model['slices']
     landed = sum(s['state'] == 'landed' for s in slices)
     pr = re.search(r'/pull/(\d+)', st.get('pr_url') or '')
-    meta = []
+    inner = []
     if slices:
-        meta.append([Seg(bar(landed, len(slices)), fg=color), Seg(f' {landed}/{len(slices)} landed', dim=True)])
+        label = f'  {landed}/{len(slices)} landed'
+        inner += [[Seg(bar(landed, len(slices), max(4, inner_w - cw(label))), fg=color), Seg(label, bold=True)], []]
     if pr:
-        meta.append(Seg(f'PR #{pr.group(1)}', fg='suggestion', hit=('open', st['pr_url']), link=st['pr_url']))
+        inner.append([Seg('PR      ', fg='subtle'),
+                      Seg(f'#{pr.group(1)}', fg='suggestion', bold=True, hit=('open', st['pr_url']), link=st['pr_url'])])
+    if st.get('base'):
+        inner.append([Seg('base    ', fg='subtle'), Seg(st['base'])])
     if st.get('branch'):
-        meta.append(Seg(f'{st.get("base") or "?"} ← {st["branch"]}', dim=True, flex=True))
-    if meta:
-        lines.append(fit(gap(*meta), width))
-
-    if model.get('error'):
-        lines.append(fit([Seg(model['error'], fg='error', flex=True)], width))
+        inner.append([Seg('branch  ', fg='subtle'), Seg(st['branch'], dim=True, flex=True)])
+    if inner:
+        lines += card(inner, width, 'subtle', [Seg('progress', bold=True)])
+        lines.append(blank(width))
 
     spans = {}
     if slices:
-        inner = []
-        tops = {}
+        lines.append(fit([Seg(' SLICES', fg='subtle', bold=True), Seg(f'  {len(slices)}', dim=True)], width))
         for s in slices:
-            tops[s['number']] = len(inner)
-            inner += slice_rows(s, model, url)
-        top = len(lines)
-        lines += card(inner, width, 'subtle', 'slices')
-        order = [s['number'] for s in slices]
-        for i, n in enumerate(order):
-            end = tops[order[i + 1]] if i + 1 < len(order) else len(inner)
-            spans[n] = (top + 1 + tops[n], top + end)
+            top = len(lines)
+            lines += slice_card(s, model, url, width)
+            spans[s['number']] = (top, len(lines) - 1)
     elif not model['loading']:
-        lines.append(fit([], width))
-        lines.append(fit([Seg('No slices read yet.' if not model.get('plan') else 'The spec has no slices.',
+        lines.append(fit([Seg('   No slices read yet.' if not model.get('plan') else '   The spec has no slices.',
                               dim=True)], width))
     return lines, spans, head
 
 
 def render_picker(model, width):
-    lines = [fit([Seg('⚙ ', fg='claude', bold=True), Seg('drive-spec runs', bold=True), Seg('', fill=True),
-                  Seg(' ↻', dim=True, hit=('refresh',))], width),
-             fit([Seg('◎ ' + model['following'], dim=True, flex=True)], width)]
+    lines = [fit([Seg(' ⚙ ', fg='claude', bold=True), Seg('drive-spec runs', fg='claude', bold=True),
+                  Seg('', fill=True), Seg('↻ ', dim=True, hit=('refresh',))], width),
+             fit([Seg('   ◎ ' + model['following'], dim=True, flex=True)], width),
+             blank(width)]
     head = len(lines)
     spans = {}
     rows = model['picker']
     if not rows:
-        lines += [fit([], width), fit([Seg('No drive-spec runs here.' if not model['loading'] else 'Loading…',
-                                           dim=True)], width)]
+        lines.append(fit([Seg('   No drive-spec runs here.' if not model['loading'] else '   Loading…', dim=True)],
+                         width))
     for r in rows:
         selected = model.get('selected') == r['spec']
-        bg = 'select' if selected else None
         color = STATE_COLOR.get(r['state'], 'inactive')
         hit = ('choose', r['spec'])
-        spans[r['spec']] = (len(lines), len(lines))
-        lines.append(fit([Seg('● ', fg=color, bg=bg, hit=hit), Seg(f'spec #{r["spec"]}', bold=True, bg=bg, hit=hit),
-                          Seg(' ', bg=bg), chip(f'{r["state"]} · {r["step"]}', color),
-                          Seg(' ' + (r['summary'] or ''), dim=True, bg=bg, flex=True, hit=hit),
-                          Seg('', fill=True, bg=bg)], width))
+        top = len(lines)
+        card_lines = card([[Seg(t, dim=not selected)] for t in wrap(r['summary'] or '', width - 6, 2)], width,
+                          'white' if selected else color,
+                          [Seg(f'spec #{r["spec"]}', bold=True)], [chip(f'{r["state"]} · {r["step"]}', color)],
+                          'double' if selected else 'round', pad=False)
+        for line in card_lines:
+            for seg in line:
+                seg.hit = hit
+        lines += card_lines
+        spans[r['spec']] = (top, len(lines) - 1)
     return lines, spans, head
 
 
@@ -687,7 +731,7 @@ class App:
         self.pick_open = False  # the picker opened with s
         self.model = {'spec': None, 'status': None, 'plan': None, 'slices': [], 'picker': [], 'picking': False,
                       'selected': None, 'following': 'starting…', 'loading': False, 'error': None, 'now': time.time()}
-        self.scroll, self.follow_selection = 0, True
+        self.scroll, self.follow_selection = 0, False  # scroll to the selection only once it is moved
         self.status_line = ('', 0.0)
         self.lines, self.spans, self.head = [], {}, 0
 
