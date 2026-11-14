@@ -31,3 +31,19 @@ _Avoid_: allowed author, whitelisted user
 **Shadow mode**:
 The merge gate deciding a risk tier and posting it without acting on it.
 _Avoid_: dry run, audit mode
+
+**Spec**:
+An issue describing a feature, broken into tracer-bullet issues that drive-spec builds into one draft PR.
+_Avoid_: epic, parent issue
+
+**Slice**:
+One tracer-bullet issue of a spec, built in its own worktree and merged into the spec branch.
+_Avoid_: ticket, subtask, child issue
+
+**Run**:
+One spec driven by drive-spec from resolve to QA, across however many Claude sessions it takes; its status file is its whole picture.
+_Avoid_: drive-spec session, job
+
+**Agent**:
+A detached Claude process a run launches for one slice: an implementer, or a merger on an integrate conflict.
+_Avoid_: worker, subagent (a subagent lives inside the run's own session)
