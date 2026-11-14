@@ -19,9 +19,9 @@ A Rex pane showing one drive-spec run: its step, state and question, and each sl
   - **Slices:** one card per slice, in build order from `drive-spec plan <spec> --json`, run every 60 seconds and on `r`. Each card is coloured by the slice's state, with its glyph and number in the top border and its state at the right: `✓` landed (with when, from `landed.jsonl`), `●` building, `⇄` merging, `◷` queued to integrate, `✗` halted (`agent:blocked`), `⏸` held, `◆` open PR, `◇` in flight, `○` todo with `after #…` for open blockers. The title wraps over up to 3 lines. A slice with an agent in the status file's `agents` map also shows the agent's role, the time since it started, and its last tool call from its log. The card is flagged `⚠ quiet` once the log has been silent for 5 minutes.
 - **Refresh:** the status file and logs are read every 2 seconds, dispatch every 10. After cleanup the logs are gone, so agent rows go, but the slices still come from the plan.
 - **Keys:** `↑↓`/`jk` or the wheel scroll, `⏎`/`o` open the spec PR (the spec issue before there is one), `l` tail the running agent's log in a split below (with several running, it asks which by number), `g` show the run's own Rex tab, `s` picker, `r` refresh, `q` close. Nothing in the run view is selected: a click on a `#` opens that issue or PR, and a click on an agent's `▸ log` tails its log.
-- It reads only its own machine: a devbox's Rex server opens it there, reading the devbox's runs.
+- It reads only the machine it runs on. In a devbox session it opens on the devbox and shows the devbox's runs; in a Mac session, the Mac's.
 
-Add the action on each Rex server that should have it, then reload:
+The Rex server reads `init.lua` on its own machine, so add the action on each one, the Mac and the devbox. Run the reload on that machine: `rex -S <host> config reload` is refused.
 
 ```sh
 echo 'dofile(os.getenv("HOME") .. "/Development/skills/mods/drive-spec-view/rex/drive_spec_view.lua")' >> ~/.config/rex/init.lua
