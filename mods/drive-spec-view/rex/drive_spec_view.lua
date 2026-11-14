@@ -4,7 +4,7 @@
 
 local LABEL = "drive-spec-view"
 -- Resolved in the pane, on the host of the session it opens in: a Mac's key can open
--- the view in a devbox session, where the Mac's home and shell don't exist.
+-- the view in a remote host's session, where the Mac's home and shell don't exist.
 local SCRIPT = '"$HOME/Development/skills/mods/drive-spec-view/rex/drive_spec_view.py"'
 
 local function quote(s)

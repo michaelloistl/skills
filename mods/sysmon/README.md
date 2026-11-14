@@ -1,12 +1,12 @@
 # sysmon
 
-A Claude Code mod for a Linux box such as the devbox. It reads `/proc`, so it does nothing useful on macOS.
+A Claude Code mod for a Linux machine. It reads `/proc`, so it does nothing useful on macOS.
 
 - **Status line:** CPU and memory, plus a warning when pressure is at or above 10% or disk is at or above 60%.
 - **Pane:** `/sysmon` opens the System pane. It shows pressure, CPU and per-core use, memory, swap, disk, load by worktree, process counts against an hour ago, listening ports, Postgres connections, Docker disk use and recent test runs.
 - **Shared file:** it writes `~/.local/state/sysmon/groups.json` every 5 seconds, the busiest worktrees.
 
-The mod is loaded through `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of the devbox's `~/.claude-on/settings.json`.
+The mod is loaded through `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of the Linux machine's Claude `settings.json`.
 
 ```sh
 claude plugin validate mods/sysmon
@@ -14,7 +14,7 @@ claude plugin validate mods/sysmon
 
 ## Rex pane
 
-`rex/sysmon.py` is a terminal program using only the Python 3 standard library. It reads `/proc`, so it runs in Linux sessions, such as devbox ones. In a Mac session it says so and closes on any key.
+`rex/sysmon.py` is a terminal program using only the Python 3 standard library. It reads `/proc`, so it runs in Linux sessions. In a macOS session it says so and closes on any key.
 
 - `alt+cmd+s`, or Toggle System Monitor in the command palette, opens the pane right of the focused pane, or closes it. The action is `sysmon` in `rex/sysmon.lua`.
 - It shows the mod's sections:

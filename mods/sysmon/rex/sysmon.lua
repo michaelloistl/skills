@@ -4,7 +4,7 @@
 
 local LABEL = "sysmon"
 -- Resolved in the pane, on the host of the session it opens in: a Mac's key can open
--- the pane in a devbox session, where the Mac's home and shell don't exist.
+-- the pane in a remote host's session, where the Mac's home and shell don't exist.
 local CMD = 'exec "${SHELL:-/bin/sh}" -lc \'exec python3 "$HOME/Development/skills/mods/sysmon/rex/sysmon.py"\''
 
 rex.action{

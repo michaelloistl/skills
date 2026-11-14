@@ -671,7 +671,7 @@ class Monitor:
 
 def main():
     if not os.path.exists('/proc/stat'):
-        print('sysmon reads /proc: open it in a Linux session, such as a devbox one. Press any key to close.')
+        print('sysmon reads /proc: open it in a Linux session. Press any key to close.')
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
         tty.setcbreak(fd)

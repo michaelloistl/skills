@@ -427,7 +427,7 @@ async function readBranch($: EngineInterface): Promise<void> {
   if (name !== (await read($, branch))) await update($, branch, () => name)
 }
 
-// macOS opens a URL in the person's browser; elsewhere (a devbox) a browser
+// macOS opens a URL in the person's browser; elsewhere (a remote host) a browser
 // would open on the wrong machine, so the URL goes to the clipboard instead.
 let isMac: boolean | undefined
 

@@ -4,7 +4,7 @@
 
 local LABEL = "pr-board"
 -- Resolved in the pane, on the host of the session it opens in: a Mac's key can open
--- the board in a devbox session, where the Mac's home and shell don't exist.
+-- the board in a remote host's session, where the Mac's home and shell don't exist.
 local SCRIPT = '"$HOME/Development/skills/mods/pr-board/rex/pr_board.py"'
 
 local function quote(s)
