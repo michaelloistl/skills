@@ -115,7 +115,7 @@ async function gh($: EngineInterface, args: string[], cwd: string): Promise<stri
 }
 
 // Set from the mod's options at each load.
-let hosts: string[] = ['local', 'devbox']
+let hosts: string[] = ['local']
 
 type RawRun = {
   spec?: string

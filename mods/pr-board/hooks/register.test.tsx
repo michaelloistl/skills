@@ -126,11 +126,11 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
     if (e.argv[0] === 'uname') return ok('Linux\n')
     if (e.argv[0] === 'git' && e.argv[1] === 'branch') return ok('fix-burn\n')
     if (e.argv[0] === 'git') return ok('/home/repo/.git\n')
-    if (e.argv[0] === 'sh') return ok('[]')
-    if (e.argv[0] === 'ssh') {
+    if (e.argv[0] === 'sh' && e.argv[2]?.includes('status --json')) {
       dispatched.push(e.argv)
       return ok(JSON.stringify(RUNS))
     }
+    if (e.argv[0] === 'sh') return ok('[]')
     if (e.argv[0] === 'rex') {
       launched.push(e.argv)
       return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -155,16 +155,16 @@ test('lists a PR with its status, GitHub issue and Linear issue', async ($, on) 
   expect(await ui.find({ type: 'Button', key: 'i-12-7' })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: 'l-12-FOL-1835' })).toBeTruthy()
 
-  expect(dispatched[0]?.slice(0, 6)).toEqual(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'devbox'])
-  expect(dispatched[0]?.[6]).toContain('cd "$HOME/repo"')
+  expect(dispatched[0]?.slice(0, 2)).toEqual(['sh', '-c'])
+  expect(dispatched[0]?.[2]).toContain('cd "$HOME/repo"')
   expect((await ui.find({ type: 'Text', text: /building #6/ }))?.text).toBe('building #6')
   expect((await ui.find({ type: 'Text', text: /▰/ }))?.text).toBe('▰▱')
   expect(await ui.find({ type: 'Button', key: 'prrun-12' })).toBeTruthy()
-  expect(await ui.find({ type: 'Button', key: 'run-devbox-8' })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'run-local-8' })).toBeTruthy()
   expect((await ui.find({ type: 'Text', text: /Keep the gap/ }))?.text).toBe('▲ ASK: Keep the gap?')
-  expect(await ui.find({ type: 'Button', key: 'run-devbox-3' })).toBeFalsy()
-  expect(await ui.find({ type: 'Button', key: 'run-devbox-9' })).toBeFalsy()
-  expect(await ui.find({ type: 'Button', key: 'run-devbox-7' })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: 'run-local-3' })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: 'run-local-9' })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: 'run-local-7' })).toBeFalsy()
 
   // Spec 5's run sits on PR 12; spec 8 has no PR yet.
   expect(await ui.find({ type: 'Button', key: 'merged-pr-12-20' })).toBeTruthy()

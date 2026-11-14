@@ -383,7 +383,7 @@ def configured_hosts(config_dir):
             return [h.strip() for h in v.split(',') if h.strip()]
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             continue
-    return ['local', 'devbox']
+    return ['local']
 
 
 # ── drawing ─────────────────────────────────────────────────────────────────

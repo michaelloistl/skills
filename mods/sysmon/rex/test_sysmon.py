@@ -58,7 +58,7 @@ class SourcesTest(unittest.TestCase):
 
 class RenderTest(unittest.TestCase):
     STATE = {
-        'host': 'devbox', 'uptime': 90000, 'now': 0,
+        'host': 'remote', 'uptime': 90000, 'now': 0,
         'sample': {'cpu': 90, 'cores': [80, 20], 'steal': 0.0, 'iowait': 1.0, 'memUsed': 500000, 'memTotal': 1000000,
                    'swapUsed': 0, 'swapTotal': 0, 'load': '1 2 3'},
         'history': [10, 90], 'pressure': {'cpu': 30.0, 'memory': None, 'io': 1.0},
@@ -73,7 +73,7 @@ class RenderTest(unittest.TestCase):
     def test_render_draws_a_card_for_each_section_with_data(self):
         lines = sm.render(self.STATE, 80, '/h')
         text = '\n'.join(sm.plain(line) for line in lines)
-        for want in ['◉ devbox · 2 cores · up 1d 1h', ' CPU 90% ', ' MEM 50% ', ' DISK 50% ', ' LOAD 1 ',
+        for want in ['◉ remote · 2 cores · up 1d 1h', ' CPU 90% ', ' MEM 50% ', ' DISK 50% ', ' LOAD 1 ',
                      '╭─ CPU ', '╭─ Memory · Disk ', 'pressure  cpu 30.0%  io 1.0%', '1.0/2.0G', 'load 1 2 3',
                      '╭─ Load by worktree ', 'spec-1', '150%', 'ruby 4 +2', 'changes vs 1h ago',
                      ' 3000 ruby       ~/x', '⚠ was ~/y', 'other 22', 'not reachable']:
@@ -93,7 +93,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(sm.plain(bottom), ' ▄█')
 
     def test_render_waits_for_the_first_sample(self):
-        lines = sm.render({'sample': None, 'host': 'devbox'}, 60)
+        lines = sm.render({'sample': None, 'host': 'remote'}, 60)
         self.assertIn('Sampling…', sm.plain(lines[-1]))
 
 

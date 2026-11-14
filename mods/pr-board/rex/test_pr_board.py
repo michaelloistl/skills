@@ -50,7 +50,7 @@ class DataTest(unittest.TestCase):
             {'spec': '3'},
             {'spec': '4', 'state': 'running', 'step': 'build', 'pr_url': 'https://github.com/o/r/pull/9'},
         ]
-        runs = pb.parse_runs('devbox', json.dumps(rows))
+        runs = pb.parse_runs('remote', json.dumps(rows))
         self.assertEqual([r['spec'] for r in runs], [1, 4])
         self.assertEqual(runs[0]['attention'], 'ASK: Q1?')
         self.assertEqual(runs[1]['prNumber'], 9)
@@ -65,8 +65,8 @@ class DataTest(unittest.TestCase):
                     'session_id': 'session:s', 'window_id': 'window:w', 'label': 'spec-7'}}]})
             return ''
 
-        self.assertEqual(pb.focus_pane('devbox', 'block:b', call), 'window:w')
-        self.assertEqual(calls[1][:7], ['rex', '--autostart=false', '-S', 'devbox', 'api', 'call', 'session.focus_block'])
+        self.assertEqual(pb.focus_pane('remote', 'block:b', call), 'window:w')
+        self.assertEqual(calls[1][:7], ['rex', '--autostart=false', '-S', 'remote', 'api', 'call', 'session.focus_block'])
         self.assertEqual(calls[2][4:], ['do', 'session.select', 'session_id=session:s', 'window_id=window:w'])
         with self.assertRaisesRegex(RuntimeError, 'gone'):
             pb.focus_pane('local', 'block:b', lambda argv: json.dumps({'results': [{'status': 'not_found'}]}))
@@ -171,7 +171,7 @@ class DrawTest(unittest.TestCase):
     def test_actions_issues_runs_and_merged_slices_show_on_the_card(self):
         issue = {'number': 9, 'title': 'The issue', 'state': 'OPEN', 'url': 'https://github.com/o/r/issues/9',
                  'linear': [{'key': 'FOL-1', 'url': 'https://linear.app/on/issue/FOL-1/x'}]}
-        run = {'spec': 7, 'host': 'devbox', 'state': 'running', 'step': 'build', 'summary': 'landed 1/2; building #8',
+        run = {'spec': 7, 'host': 'remote', 'state': 'running', 'step': 'build', 'summary': 'landed 1/2; building #8',
                'prNumber': 1, 'attention': None}
         merged = [{'spec': 7, 'number': 8, 'title': 's', 'url': 'u8', 'mergedAt': NOW - 3600}]
         m = model([pr(1, checks='fail', issues=[issue])], expanded=1, selected=1,
@@ -179,7 +179,7 @@ class DrawTest(unittest.TestCase):
         lines, spans, _ = pb.render(m, 80)
         out = text(lines)
         for want in ['✗ CI', 'f  Fix CI', 'c  Resolve conflicts', '◉ Pin to this session', '#9  FOL-1  The issue',
-                     'spec #7', '▰▱ 1/2 building #8', '@devbox', '⤷ merged #8 1h', '1 failing']:
+                     'spec #7', '▰▱ 1/2 building #8', '@remote', '⤷ merged #8 1h', '1 failing']:
             self.assertIn(want, out)
         top, bottom = spans[1]
         self.assertTrue(pb.plain(lines[top]).startswith('╔') and pb.plain(lines[bottom]).startswith('╚'))
