@@ -1340,14 +1340,29 @@ def fill(name, values, conditions=None):
     return re.sub(r" +\n", "\n", body).strip()
 
 
-def brief(run, m, wt, base, continuing, local_only):
+LINKBACK = re.compile(r"<!-- linear-linkback -->.*?>([A-Z][A-Z0-9]*-\d+)</a>", re.S)
+
+
+def tracker_key(run):
+    """The spec's own key in the tracker the issues mirror, such as FOL-1936, from its linkback comment; "" when none."""
+    cached = run.notes / "key"
+    if cached.is_file():
+        return cached.read_text().strip()
+    bodies = json_lines(gh("--paginate", f"repos/{run.repo}/issues/{run.spec}/comments", "--jq", ".[] | .body | tojson"))
+    key = next((m.group(1) for b in bodies for m in [LINKBACK.search(b)] if m), "")
+    run.notes.mkdir(parents=True, exist_ok=True)
+    cached.write_text(key + "\n")
+    return key
+
+
+def brief(run, m, wt, base, continuing, local_only, key=""):
     local = run.config.get("localOnly") or {}
     return fill("IMPLEMENTER.md", {
         "path": wt, "m": m, "repo": run.repo, "spec": run.spec, "base": f"origin/{base}", "notes": run.notes,
         "skill dir": Path(__file__).resolve().parent, "label": local.get("label", ""),
-        "proof": local.get("proof", ""), "report": "<report>"}, {
+        "proof": local.get("proof", ""), "report": "<report>", "key": key}, {
         "continuing": continuing, "localOnly": local_only, "notLocalOnly": not local_only, "decided": (run.notes / "decisions.md").is_file(),
-        "covered": bool(owned_requirements(run, m))})
+        "covered": bool(owned_requirements(run, m)), "keyed": bool(key)})
 
 
 def merger_brief(run, m, wt, merge, files):
@@ -1420,7 +1435,8 @@ def cmd_start(spec, m):
     continuing = git(wt, "rev-list", "--count", f"origin/{plan['spec_branch']}..HEAD") != "0"
     local_label = (run.config.get("localOnly") or {}).get("label")
     path = write_brief(run, f"brief-{m}.md",
-                       brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"]))
+                       brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"],
+                             tracker_key(run)))
     print(f"next: an implementer subagent with the prompt `Read {path} and follow it.`")
     return 0
 
@@ -2197,6 +2213,7 @@ def cmd_review(spec):
     ks = review_rounds(run)
     k = ks[-1] if ks else 0
     decided = (run.notes / "decisions.md").is_file()
+    key = tracker_key(run)
     if k:
         result = round_file(run, k, "json")
         if not result.is_file():
@@ -2219,7 +2236,8 @@ def cmd_review(spec):
                                      for n, x in enumerate(rules, 1))
                 fix.write_text(fill("REVIEW-FIXER.md", {
                     "path": wt, "spec": spec, "repo": run.repo, "notes": run.notes, "k": k, "findings": findings,
-                    "skill dir": Path(__file__).resolve().parent}, {"decided": decided}) + "\n")
+                    "skill dir": Path(__file__).resolve().parent, "key": key}, {"decided": decided, "keyed": bool(key)})
+                    + "\n")
             run.status(step="review", state="running", summary=f"review round {k}: {len(rules)} finding(s) to fix, "
                        "fixing", next=f"drive-spec review {spec} once the fixes are green", branch=plan["spec_branch"])
             print(f"round {k} raised {len(rules)} finding(s) to fix and {calls} judgement call(s)")
@@ -2245,8 +2263,9 @@ def cmd_review(spec):
         "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
         "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
         "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
-        "out": round_file(run, k, "json")}, {
-        "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier)}) + "\n")
+        "out": round_file(run, k, "json"), "key": key}, {
+        "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier),
+        "keyed": bool(key)}) + "\n")
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
                next=f"drive-spec review {spec} once the reviewer writes its findings", branch=plan["spec_branch"])
     print(f"brief: {brief_path}")
@@ -2438,10 +2457,13 @@ def cmd_ask(spec, question, blocking, step, ref=None):
     if blocking:
         run.status(step=step, state="waiting", question=" ".join(question.split()), question_blocking="true",
                    summary=f"waiting for the operator: {one_line(question, 100)}", next="act on the operator's answer")
-        print("asked: end the turn now; the answer arrives as the next prompt, then run `drive-spec answered`")
+        print("asked: end the turn now with the question below as your message, word for word; the answer "
+              "arrives as the next prompt, then run `drive-spec answered`\n")
+        print(question.strip())
     else:
         run.status(step=step, question=" ".join(question.split()), question_blocking="false")
-        print("noted for the operator; carry on")
+        print("noted for the operator; carry on, and repeat it word for word in the run's last message\n")
+        print(question.strip())
     return 0
 
 
@@ -2697,7 +2719,7 @@ def main():
     qa.add_argument("spec")
     ak = sub.add_parser("ask", help="stop for the operator's decision (or note one, with --no-block)")
     ak.add_argument("spec")
-    ak.add_argument("question", help="the question, with the options and your recommendation")
+    ak.add_argument("question", help="the question, with the options, your recommendation and its reason")
     ak.add_argument("--no-block", dest="blocking", action="store_false",
                     help="a judgement call made on your own the operator may revisit; the run goes on")
     ak.add_argument("--step", help="default: the step in the status file")

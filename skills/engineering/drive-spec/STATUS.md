@@ -64,10 +64,10 @@ The map is how a `build` resumes another's work. On entry, and on each pass, `bu
 
 ## Questions
 
-When the run needs the operator's decision to go on, ask it and end the turn:
+When the run needs the operator's decision to go on, ask it and end the turn with the question `ask` prints, word for word: the operator reads your message, not the status file, and a summary drops the options and recommendations they decide from.
 
 ```sh
-drive-spec ask <spec> "<the question, with the options and your recommendation>"
+drive-spec ask <spec> "<the question, with the options, your recommendation and its reason>"
 ```
 
 It writes `state=waiting` with the question, blocking, at the current step. One question waits at a time, and `ask` refuses another until it is answered: put every decision the run needs now into one question. The question is read on a phone with no other context: name the issue, the choice, and what each answer leads to. The answer arrives as the next prompt; record it before acting on it:

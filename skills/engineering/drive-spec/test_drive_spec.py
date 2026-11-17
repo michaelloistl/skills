@@ -1063,6 +1063,11 @@ class Brief(unittest.TestCase):
         self.assertIn("`proof` is `null`.", b)
         self.assertNotRegex(b, r"<(?!report>)[a-z][a-z ]*>|<If ")
 
+    def test_a_tracker_key_is_named_for_citing(self):
+        b = ds.brief(self.run_({}), 12, Path("/w/issue-12"), "main", False, False, "FOL-1936")
+        self.assertIn("The spec's tracker key is FOL-1936: a changelog entry or ADR that cites this work cites FOL-1936", b)
+        self.assertNotIn("tracker key", ds.brief(self.run_({}), 12, Path("/w/issue-12"), "main", False, False))
+
     def test_merger_brief_fills_every_placeholder(self):
         b = ds.merger_brief(self.run_({}), 12, Path("/w/issue-12"), "git merge abc123", ["a.txt", "b.txt"])
         self.assertNotRegex(b, r"<[a-z][a-z ]*>|<If ")
@@ -2771,6 +2776,20 @@ class Questions(DispatcherCase):
         self.run_ds("start", "10", "11")
         self.assertIn(f"`{decisions}` holds each answer, and it overrides the issue where they differ. Match",
                       (decisions.parent / "brief-11.md").read_text())
+
+    def test_ask_prints_the_question_for_the_operator(self):
+        self.run_ds("gate", "10", GATE)
+        out = self.run_ds("ask", "10", "Q1: Public or sign-in?\n(a) public (b) sign-in. Recommend (a): no login wall.")
+        self.assertTrue(out.stdout.endswith("Q1: Public or sign-in?\n(a) public (b) sign-in. Recommend (a): no login wall.\n"))
+        self.assertIn("word for word", out.stdout)
+
+    def test_the_spec_key_comes_from_its_linkback_and_reaches_the_brief(self):
+        self.edit_state(lambda st: st["comments"].append({"id": 1, "issue": 10, "body":
+            '<!-- linear-linkback -->\n<p><a href="https://linear.app/x/issue/FOL-1936/y">FOL-1936</a></p>'}))
+        self.run_ds("gate", "10", GATE)
+        self.run_ds("start", "10", "11")
+        brief = self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md"
+        self.assertIn("The spec's tracker key is FOL-1936", brief.read_text())
 
     def test_a_second_blocking_ask_is_refused_while_one_waits(self):
         self.run_ds("gate", "10", GATE)
