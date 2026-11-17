@@ -31,6 +31,8 @@ class BlockDriveSpecPipe(unittest.TestCase):
             'D=/x/drive-spec; $D halt 10 11 "gate | red"',
             "D=/x/drive-spec; $D plan 10 --json || echo failed",
             "drive-spec --help | head",
+            "~/.claude-on/skills/drive-spec/drive-spec answered --help 2>&1 | head -20",
+            "./drive-spec ask -h | sed -n 1,5p",
             "git log | tail",
             "python3 - <<'PY'\ns = 'run `drive-spec verify` and quote it'\nPY\nrg -n \"a|b\" x",
             'git commit -m "Run drive-spec open bare, not | tail"',

@@ -18,7 +18,7 @@ callee = r"\S*drive-spec" + "".join(rf"|\$\{{?{n}\}}?" for n in names)
 
 
 def pipes_out(rest):
-    """True when the rest of this command, up to where it ends, pipes its output on."""
+    """True when the rest of this command, up to where it ends, pipes its output on. Help text is no verdict."""
     quote, i = None, 0
     while i < len(rest):
         c = rest[i]
@@ -29,7 +29,7 @@ def pipes_out(rest):
         elif c in ";\n" or rest.startswith("&&", i) or rest.startswith("||", i):
             return False
         elif c == "|":
-            return True
+            return not re.search(r"(?:^|\s)(?:--help|-h)(?=\s|$)", rest[:i])
         i += 1
     return False
 
