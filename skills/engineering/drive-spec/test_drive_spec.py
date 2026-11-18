@@ -2580,6 +2580,62 @@ class Boundaries(DispatcherCase):
         self.assertIn("show origin/main:FILE`, never the branch's copy", brief)
         self.assertIn("The branch also changes what judges it: gate.sh (a gate file, changed).", brief)
 
+    PRE = {"kind": "pre-existing", "path": "README", "line": 1, "finding": "The greeting drops its newline.",
+           "fails": "cat README shows no trailing newline, on main as here."}
+
+    def test_a_pre_existing_bug_goes_to_the_left_list_never_the_fixer(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        brief = (self.notes() / "review" / "round-1.brief.md").read_text()
+        self.assertIn("**pre-existing**", brief)
+        self.assertNotIn("REVIEW.md", brief)
+        self.round_(1, self.PRE)
+        out = self.run_ds("review", "10")
+        self.assertIn("review clean at round 1", out.stdout)
+        self.assertEqual(self.run_ds("reviewed", "10").returncode, 0)
+        self.assertEqual((self.notes() / "left.md").read_text(),
+                         "- `README:1`: The greeting drops its newline. Pre-existing on main: cat README shows no "
+                         "trailing newline, on main as here.\n")
+
+    def test_a_pre_existing_bug_names_a_file_base_has(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, dict(self.PRE, path="export.csv"), dict(self.PRE, fails=""))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("finding 1: a pre-existing finding names no file base has", out.stderr)
+        self.assertIn("finding 2: a pre-existing finding says not how it fails", out.stderr)
+
+    def test_the_review_checklist_comes_from_base_and_its_triggered_items_are_named(self):
+        work = self.tmp / "checklist"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        self.commit(work, "REVIEW.md", "# Review\n\n## Old exports load\nTrigger: the export format changes.\n"
+                    "Check: an export written before still loads.\nWhy: #3\n", "Add the review checklist")
+        self.git(work, "push", "-q", "origin", "main")
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        brief = (self.notes() / "review" / "round-1.brief.md").read_text()
+        self.assertIn("Then the repo's checklist, `REVIEW.md` on base", brief)
+        self.assertIn("top-level `triggered` list", brief)
+        self.round_(1)
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("no `triggered` list", out.stderr)
+        meta = json.loads((self.notes() / "review" / "round-1.meta.json").read_text())
+        result = self.notes() / "review" / "round-1.json"
+        result.write_text(json.dumps({"head": meta["head"], "findings": [], "triggered": ["Old reports load"]}))
+        self.assertIn("'Old reports load' is no REVIEW.md item", self.run_ds("review", "10").stderr)
+        result.write_text(json.dumps({"head": meta["head"], "triggered": ["Old exports load"], "findings": [
+            dict(self.RULE, rule="REVIEW.md: Old exports load: an export written before still loads.")]}))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round 1 raised 1 finding(s) to fix", out.stdout)
+
     def test_the_left_list_holds_only_the_last_rounds_judgement_calls(self):
         self.run_ds("gate", "10", GATE)
         self.close_all()
@@ -2677,7 +2733,7 @@ class Boundaries(DispatcherCase):
                     {"kind": "bug", "finding": "Breaks."})
         err = self.run_ds("review", "10").stderr
         for fault in ("finding 1: a rule finding quotes no rule", "finding 2: NOPE.md is no file",
-                      "finding 3: no file gone.rb", "finding 4: kind is not rule, bug or judgement",
+                      "finding 3: no file gone.rb", "finding 4: kind is not rule, bug, pre-existing or judgement",
                       "finding 5: a bug finding says not how it fails",
                       "finding 3: a judgement call recommends nothing"):
             self.assertIn(fault, err)

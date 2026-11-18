@@ -2143,6 +2143,7 @@ def cmd_explored(spec):
 
 
 REVIEW_ROUNDS = 3
+KINDS = ("rule", "bug", "pre-existing", "judgement")
 SOURCE = re.compile(r"spec #\d+|#\d+|decisions\.md|coverage\.md")
 
 
@@ -2160,6 +2161,15 @@ def at_head(wt, head, path):
     return subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{head}:{path}"], capture_output=True).returncode == 0
 
 
+def checklist(run, wt):
+    """The item names of `REVIEW.md` on base, each a `## ` heading; None when base has no `REVIEW.md`."""
+    shown = subprocess.run(["git", "-C", str(wt), "show", f"origin/{run.base()}:REVIEW.md"], capture_output=True,
+                           text=True)
+    if shown.returncode != 0:
+        return None
+    return [m.group(1).strip() for m in re.finditer(r"^## +(.+)$", shown.stdout, re.M)]
+
+
 def read_round(run, k, wt):
     """A round's findings, held to the form REVIEWER.md sets. Refuses one that does not fit, naming each fault."""
     head = json.loads(round_file(run, k, "meta.json").read_text())["head"]
@@ -2174,8 +2184,8 @@ def read_round(run, k, wt):
     if data.get("head") != head:
         faults.append(f"head is {data.get('head')}, the round reviewed {head}")
     for n, x in enumerate(data["findings"], 1):
-        if not isinstance(x, dict) or x.get("kind") not in ("rule", "bug", "judgement"):
-            faults.append(f"finding {n}: kind is not rule, bug or judgement")
+        if not isinstance(x, dict) or x.get("kind") not in KINDS:
+            faults.append(f"finding {n}: kind is not rule, bug, pre-existing or judgement")
             continue
         if not str(x.get("finding") or "").strip():
             faults.append(f"finding {n}: no finding text")
@@ -2185,12 +2195,22 @@ def read_round(run, k, wt):
             source = str(x.get("rule") or "").split(":", 1)
             if len(source) < 2 or not source[1].strip():
                 faults.append(f"finding {n}: a rule finding quotes no rule (`SOURCE: THE RULE`)")
-            elif not (SOURCE.fullmatch(source[0].strip()) or at_head(wt, head, source[0].strip())):
+            elif not (SOURCE.fullmatch(source[0].strip()) or at_head(wt, head, source[0].strip())
+                      or at_head(wt, f"origin/{run.base()}", source[0].strip())):
                 faults.append(f"finding {n}: {source[0].strip()} is no file, spec, slice or decisions.md")
-        if x["kind"] == "bug" and not str(x.get("fails") or "").strip():
-            faults.append(f"finding {n}: a bug finding says not how it fails (`fails`)")
+        if x["kind"] in ("bug", "pre-existing") and not str(x.get("fails") or "").strip():
+            faults.append(f"finding {n}: a {x['kind']} finding says not how it fails (`fails`)")
+        if x["kind"] == "pre-existing" and not (x.get("path") and at_head(wt, f"origin/{run.base()}", x["path"])):
+            faults.append(f"finding {n}: a pre-existing finding names no file base has (`path`)")
         if x["kind"] == "judgement" and not str(x.get("recommend") or "").strip():
             faults.append(f"finding {n}: a judgement call recommends nothing (`recommend`)")
+    items = checklist(run, wt)
+    if items is not None:
+        triggered = data.get("triggered")
+        if not isinstance(triggered, list) or not all(isinstance(t, str) for t in triggered):
+            faults.append("no `triggered` list of the REVIEW.md items whose trigger the change matches")
+        else:
+            faults += [f"triggered: {t!r} is no REVIEW.md item" for t in triggered if t not in items]
     if faults:
         raise Failed(f"{f} does not fit REVIEWER.md: " + "; ".join(faults)
                      + ". Send the round's reviewer back to fix it", REFUSE)
@@ -2206,9 +2226,13 @@ def to_fix(findings):
     return [x for x in findings if x["kind"] in ("rule", "bug")]
 
 
-def judgement_calls(round_):
-    return [f"- {where(x)}: {' '.join(x['finding'].split())} Recommend: {' '.join(x['recommend'].split())}"
-            for x in round_["findings"] if x["kind"] == "judgement"]
+def judgement_calls(round_, base):
+    """The round's findings for the operator, never for a fixer: each judgement call with its recommendation, and
+    each bug already on base, with how it fails."""
+    return [f"- {where(x)}: {' '.join(x['finding'].split())} "
+            + (f"Recommend: {' '.join(x['recommend'].split())}" if x["kind"] == "judgement"
+               else f"Pre-existing on {base}: {' '.join(x['fails'].split())}")
+            for x in round_["findings"] if x["kind"] in ("judgement", "pre-existing")]
 
 
 def spec_head(run, plan, push):
@@ -2291,10 +2315,12 @@ def cmd_review(spec):
             return 0
         data = read_round(run, k, wt)
         rules = to_fix(data["findings"])
-        calls = len(data["findings"]) - len(rules)
+        older = sum(1 for x in data["findings"] if x["kind"] == "pre-existing")
+        calls = len(data["findings"]) - len(rules) - older
+        calls_text = f"{calls} judgement call(s)" + (f" and {older} pre-existing bug(s)" if older else "")
         if data["head"] == head and not rules:
-            run.status(step="review", state="running", summary=f"review clean at round {k}, {calls} judgement "
-                       f"call(s) this round", next=f"drive-spec reviewed {spec}", branch=plan["spec_branch"])
+            run.status(step="review", state="running", summary=f"review clean at round {k}, {calls_text} "
+                       "this round", next=f"drive-spec reviewed {spec}", branch=plan["spec_branch"])
             print(f"review clean at round {k}: next `drive-spec reviewed {spec}`")
             return 0
         if data["head"] == head:
@@ -2309,7 +2335,7 @@ def cmd_review(spec):
                     + "\n")
             run.status(step="review", state="running", summary=f"review round {k}: {len(rules)} finding(s) to fix, "
                        "fixing", next=f"drive-spec review {spec} once the fixes are green", branch=plan["spec_branch"])
-            print(f"round {k} raised {len(rules)} finding(s) to fix and {calls} judgement call(s)")
+            print(f"round {k} raised {len(rules)} finding(s) to fix and {calls_text}")
             print(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`; then "
                   f"`drive-spec review {spec}` again")
             return 0
@@ -2335,7 +2361,7 @@ def cmd_review(spec):
         "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
         "out": round_file(run, k, "json"), "key": key, "guarded": "; ".join(guarded)}, {
         "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier),
-        "keyed": bool(key), "guarded": bool(guarded)}) + "\n")
+        "keyed": bool(key), "guarded": bool(guarded), "checklisted": checklist(run, wt) is not None}) + "\n")
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
                next=f"drive-spec review {spec} once the reviewer writes its findings", branch=plan["spec_branch"])
     print(f"brief: {brief_path}")
@@ -2359,7 +2385,7 @@ def cmd_reviewed(spec, left):
     if last["head"] != head or to_fix(last["findings"]):
         raise Failed(f"round {ks[-1]} is not a clean review of {head[:12]}: `drive-spec review {spec}`", REFUSE)
     kept = run.notes / "left.md"
-    lines = judgement_calls(last) + ([left.strip()] if left and left.strip() else [])
+    lines = judgement_calls(last, run.base()) + ([left.strip()] if left and left.strip() else [])
     if lines:
         kept.write_text("\n".join(lines) + "\n")
     else:

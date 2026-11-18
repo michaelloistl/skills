@@ -16,8 +16,8 @@ Python 3, standard library only, with `gh` and `git` on the PATH. Run it from in
 - `drive-spec explore <spec>`: writes the explorer brief, [`EXPLORER.md`](EXPLORER.md) filled, to `brief-explore.md`.
 - `drive-spec preview <spec> [--sequential] [--max N] [--dry-run]`: prints the run and the plan, refreshes the progress comment; `--dry-run` writes `paused`.
 - `drive-spec explored <spec>`: refuses until every open slice has notes and `conflicts.md`, `coverage.md` and `questions.md` are fresh this run, while `coverage.md` holds a line out of form (`→ #<m>`, `→ #<m> (note) and #<k> (note)`, `→ every slice`, `→ unmapped`, `→ out of scope: …`, `→ done on base: …`; split at the rightmost arrow that fits), a slice not of this spec, or an `unmapped` requirement, and while a `questions.md` id has no `[Q<k>]` answer in `decisions.md`; exit 3 when it lists conflicts, after finishing the run as `conflicts`.
-- `drive-spec review <spec>`: step 7, one call per move. With every slice closed and the spec worktree clean (untracked files don't count, and are named in a warning) and green (a green HEAD ahead of origin is pushed), it writes the next round's reviewer brief ([`REVIEWER.md`](REVIEWER.md)), which has the reviewer read the rules from `origin/<base>` and names every change on the branch to what judges it, as `integrate` defines them; once the round's findings file is in, it holds the file to its form and writes a fixer brief ([`REVIEW-FIXER.md`](REVIEW-FIXER.md)) of its rule and bug findings, or prints `review clean`. From round `reviewRounds` (default 3) on, a round with those open goes on while it raises fewer than the round before; one that raises no fewer makes it refuse until the operator has answered since the last round.
-- `drive-spec reviewed <spec> [--left <text>|-]`: refuses until the last round is a clean review of the pushed, green HEAD; keeps the last round's judgement calls, each with its recommendation, and `--left`, for `confirm`.
+- `drive-spec review <spec>`: step 7, one call per move. With every slice closed and the spec worktree clean (untracked files don't count, and are named in a warning) and green (a green HEAD ahead of origin is pushed), it writes the next round's reviewer brief ([`REVIEWER.md`](REVIEWER.md)), which has the reviewer read the rules from `origin/<base>` and names every change on the branch to what judges it, as `integrate` defines them; once the round's findings file is in, it holds the file to its form (a `pre-existing` finding names a file base has; with a `REVIEW.md` on base, `triggered` names only its `## ` items) and writes a fixer brief ([`REVIEW-FIXER.md`](REVIEW-FIXER.md)) of its rule and bug findings, or prints `review clean`. From round `reviewRounds` (default 3) on, a round with those open goes on while it raises fewer than the round before; one that raises no fewer makes it refuse until the operator has answered since the last round.
+- `drive-spec reviewed <spec> [--left <text>|-]`: refuses until the last round is a clean review of the pushed, green HEAD; keeps the last round's judgement calls, each with its recommendation, and its pre-existing bugs, each with how it fails, and `--left`, for `confirm`.
 - `drive-spec next <spec>`: the command that carries the run on, read from its status file; in step 6, `drive-spec build <spec> --wait-minutes 9`, with the `--sequential` and `--max` that `preview` was given.
 - `drive-spec confirm <spec> [--left <text>|-]`: with every slice closed, rewrites the draft spec PR's body to `Closes #<spec>`, the slices, a `Verification:` section from the spec HEAD's verdict and the slice PRs', the unverified behaviour and deviations from their PRs, and what review left; opens the draft first when absent. Refuses while the spec branch HEAD is not green.
 - `drive-spec cleanup <spec>`: with every slice closed and nothing unpushed in the spec worktree, stops any process still running in the spec and slice worktrees, removes them and the notes directory, and prints the spec PR URL.
@@ -54,3 +54,16 @@ Writes the run's status file so a dispatcher can watch every drive-spec on the m
 ```sh
 ./status.sh 2983 step=build state=running summary="landed 2/5; building #2990" next="integrate #2990"
 ```
+
+## REVIEW.md
+
+A repo's own review checklist, read from the base branch so a change cannot edit it. Each `## ` heading is one item, its name; under it, the trigger, readable from a diff, the check, and why the item exists:
+
+```markdown
+## Old exports still load
+Trigger: the change alters the export format or a field it writes.
+Check: an export written before the change loads, with the new field absent.
+Why: #812, where a renamed column broke every saved export.
+```
+
+The reviewer applies only the items whose trigger the change matches, lists them as `triggered`, and raises a failed check as a rule finding citing `REVIEW.md: <item>`.
