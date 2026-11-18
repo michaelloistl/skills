@@ -268,6 +268,8 @@ elif parts == ["pulls"] and method == "POST":
          "merged_at": None}
     st["pulls"].append(p)
     out = pull(p)
+elif parts[:1] == ["pulls"] and parts[2:] == ["comments"] and method == "GET":
+    out = st.get("review_comments", {}).get(parts[1], [])
 elif parts[:1] == ["pulls"] and len(parts) == 2 and method == "PATCH":
     next(p for p in st["pulls"] if p["number"] == int(parts[1]))["body"] = fields["body"]
 elif parts[:1] == ["pulls"] and len(parts) == 2:
@@ -835,6 +837,16 @@ class Integrate(Cli):
                          "\n\nUnverified:\n- the toast shows only in a running app\n\nDeviations:\n- none of note")
         self.git(self.wt, "fetch", "-q", "origin")
         self.assertEqual(self.git(self.wt, "show", "origin/agent/local-spec-10-export:a.txt"), "a")
+
+    def test_a_run_proof_goes_in_every_slice_pr(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "runProof": "docs/run.md"}))
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("proved beyond the gate per `docs/run.md`", out.stderr)
+        out = self.run_ds("integrate", "10", "11", "--report", NONE + "\nProof:\nran the export, saw the CSV")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("\n- Run proof (per `docs/run.md`): ran the export, saw the CSV\n",
+                      self.gh_state()["pulls"][0]["body"])
 
     def test_refuses_a_gate_file_change_its_deviations_leave_out(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE + " && test -n gate.sh"}))
@@ -1661,6 +1673,23 @@ class Build(BuildCase):
         self.assertEqual(self.spawns(11), [])
         self.assertFalse((self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").exists())
 
+    def test_brief_runs_the_change_per_the_verify_skill_on_base(self):
+        work = self.tmp / "verify-skill"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        (work / ".claude" / "skills" / "verify").mkdir(parents=True)
+        self.commit(work, ".claude/skills/verify/SKILL.md", "Start the app.\n", "Add the verify skill")
+        self.git(work, "push", "-q", "origin", "main")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.assertEqual(self.run_ds("start", "10", "11").returncode, 0)
+        brief = (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text()
+        self.assertIn("run the change and watch it work, as `.claude/skills/verify/SKILL.md` says", brief)
+        self.assertIn("`proof` is one line: what you ran per `.claude/skills/verify/SKILL.md`", brief)
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "runProof": False}))
+        self.assertEqual(self.run_ds("start", "10", "11").returncode, 0)
+        brief = (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text()
+        self.assertNotIn("watch it work", brief)
+        self.assertIn("`proof` is `null`.", brief)
+
     def test_brief_asks_for_the_report_block(self):
         self.assertEqual(self.run_ds("start", "10", "11").returncode, 0)
         brief = (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text()
@@ -2089,6 +2118,28 @@ class Dispatcher(DispatcherCase):
                                                 "Spec PR #101.\n\nLeft from review:\n- rename ExportJob")
         self.assertEqual(self.row()["attention"], "PR")
         self.assertEqual(self.run_ds("finish", "10", "held", "--left", "x").returncode, 2)
+
+    def test_done_records_what_the_spec_prs_review_and_qa_caught(self):
+        self.land_11()
+        self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
+        self.qa_done()
+        self.edit_state(lambda st: (st.update(review_comments={"101": [
+            {"id": 7, "path": "a.txt", "line": 1, "body": "The export drops\nthe header row.", "html_url": "u7",
+             "in_reply_to_id": None},
+            {"id": 8, "path": "a.txt", "line": 1, "body": "Fixed.", "html_url": "u8", "in_reply_to_id": 7}]}),
+            st["comments"].append({"id": 991, "issue": 101, "body":
+                "qa-pr done at 000000000000: 1 passed, 1 failed, 0 not verified.\n\n### 1. Export a report — passed\n"
+                "Saw: a file\n\n### 2. Export an empty report — failed\nURL: /r\nSaw: a 500 page\n\n"
+                "## Not verified\n"})))
+        out = self.run_ds("finish", "10", "done")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("recorded 2 miss(es)", out.stdout)
+        self.assertEqual(self.run_ds("misses").stdout,
+                         "- #10 PR #101 review `a.txt:1`: The export drops the header row. (u7)\n"
+                         "- #10 PR #101 qa: Export an empty report: saw a 500 page\n")
+        self.assertNotIn("recorded", self.run_ds("finish", "10", "done").stdout)
+        self.assertEqual(len(json.loads(self.run_ds("misses", "10", "--json").stdout)), 2)
+        self.assertEqual(self.run_ds("misses", "11").stdout, "no misses recorded\n")
 
     def test_a_session_under_another_config_dir_is_seen(self):
         run_dir = self.tmp / "claude-on"

@@ -25,6 +25,8 @@ PR_FIELDS = ".[] | {number, head: .head.ref, sha: .head.sha, url: .html_url, mer
 VERIFY_LOCK = os.environ.get("DRIVE_SPEC_VERIFY_LOCK", "/tmp/drive-spec-verify.lock")
 VERIFY_TIMEOUT_MINUTES = 60
 TIMED_OUT = 124
+VERIFY_SKILL = ".claude/skills/verify/SKILL.md"
+PROOF_LINES = ("- Local proof", "- Run proof")
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 HEARTBEAT_SECONDS = float(os.environ.get("DRIVE_SPEC_HEARTBEAT_SECONDS", 300))
 SPEC_MOVES = 5
@@ -966,7 +968,7 @@ def record_verification(run, pr, head):
     gate = run_gate_of(run)
     body = json.loads(gh(f"repos/{run.repo}/pulls/{pr}", "--jq", "{body}"))["body"] or ""
     lines = [f"- Gate: `{gate}`", f"- Verdict: {verdict_line(verdict_of(run, head, gate), head)}"]
-    lines += [x for x in (section(body, "Verification") or "").splitlines() if x.startswith("- Local proof")]
+    lines += [x for x in (section(body, "Verification") or "").splitlines() if x.startswith(PROOF_LINES)]
     new = "Verification:\n" + "\n".join(lines) + "\n\n"
     if section(body, "Verification") is None:
         body = re.sub(r"^(Unverified:|Deviations:)", lambda x: new + x.group(1), body, count=1, flags=re.M)
@@ -1077,14 +1079,13 @@ def cmd_integrate(spec, m, report_arg, wait=None):
                          + "; ".join(undeclared) + ": restore it, or report it as a deviation naming the path and why",
                          REFUSE)
         info = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "{title, labels: [.labels[].name]}"))
-        local = run.config.get("localOnly") or {}
+        proved = proof_of(run, info["labels"])
         proof_lines = []
-        if local.get("label") in info["labels"]:
+        if proved:
             if not listed(proof):
-                raise Failed(f"#{m} carries `{local['label']}`: the report needs the implementer's Proof: result",
-                             REFUSE)
-            proof_lines = [f"- Local proof (`{local['label']}`, per `{local.get('proof', '')}`): "
-                           + " ".join(proof.split())]
+                raise Failed(f"#{m} is proved beyond the gate per `{proved[1]}`: the report needs the implementer's "
+                             "Proof: result", REFUSE)
+            proof_lines = [f"- {proved[0]}: " + " ".join(proof.split())]
         git(wt, "push", "--quiet", "-u", "origin", branch)
         pr = json.loads(gh(f"repos/{run.repo}/pulls", "-f", f"base={spec_branch}", "-f", f"head={branch}",
                            "-f", f"title={info['title']}",
@@ -1423,13 +1424,38 @@ def tracker_key(run):
     return key
 
 
-def brief(run, m, wt, base, continuing, local_only, key=""):
+def run_proof(run):
+    """The doc saying how to run a change and watch it work, which every slice's implementer follows after the
+    gate: `runProof` in the config, else `.claude/skills/verify/SKILL.md` when base has one; None with `false`."""
+    cfg = run.config.get("runProof")
+    if cfg is False:
+        return None
+    if cfg:
+        return cfg
+    found = subprocess.run(["git", "-C", str(run.repo_dir), "cat-file", "-e", f"origin/{run.base()}:{VERIFY_SKILL}"],
+                           capture_output=True).returncode == 0
+    return VERIFY_SKILL if found else None
+
+
+def proof_of(run, labels):
+    """How a slice is proved beyond the gate: the line its PR's Verification: section opens with, and the doc it
+    follows. The local proof for a `localOnly` slice, else the run proof; None when the gate is the whole proof."""
     local = run.config.get("localOnly") or {}
+    if local.get("label") and local["label"] in labels:
+        return f"Local proof (`{local['label']}`, per `{local.get('proof', '')}`)", local.get("proof", "")
+    doc = run_proof(run)
+    return (f"Run proof (per `{doc}`)", doc) if doc else None
+
+
+def brief(run, m, wt, base, continuing, local_only, key="", proof_doc=None):
+    local = run.config.get("localOnly") or {}
+    proof_doc = local.get("proof", "") if local_only else proof_doc
     return fill("IMPLEMENTER.md", {
         "path": wt, "m": m, "repo": run.repo, "spec": run.spec, "base": f"origin/{base}", "notes": run.notes,
         "skill dir": Path(__file__).resolve().parent, "label": local.get("label", ""),
-        "proof": local.get("proof", ""), "report": "<report>", "key": key}, {
-        "continuing": continuing, "localOnly": local_only, "notLocalOnly": not local_only, "decided": (run.notes / "decisions.md").is_file(),
+        "proof": proof_doc or "", "report": "<report>", "key": key}, {
+        "continuing": continuing, "localOnly": local_only, "runProved": bool(proof_doc) and not local_only,
+        "proved": bool(proof_doc), "notProved": not proof_doc, "decided": (run.notes / "decisions.md").is_file(),
         "covered": bool(owned_requirements(run, m)), "keyed": bool(key)})
 
 
@@ -1503,9 +1529,10 @@ def cmd_start(spec, m):
     base = run.base()
     continuing = git(wt, "rev-list", "--count", f"origin/{plan['spec_branch']}..HEAD") != "0"
     local_label = (run.config.get("localOnly") or {}).get("label")
+    proved = proof_of(run, s["labels"])
     path = write_brief(run, f"brief-{m}.md",
                        brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"],
-                             tracker_key(run)))
+                             tracker_key(run), proved and proved[1]))
     print(f"next: an implementer subagent with the prompt `Read {path} and follow it.`")
     return 0
 
@@ -1621,7 +1648,7 @@ class Mismatch(Failed):
     """A green report the worktree contradicts: its SHA not HEAD, or a gate verdict `drive-spec verify` never recorded."""
 
 
-def parse_report(text, local_only, log):
+def parse_report(text, proved, log):
     """The `<report>{...}</report>` block that ends an implementer's response, checked for form."""
     def bad(why):
         return BadReport(f"the implementer's report {why}; log {log}")
@@ -1643,10 +1670,10 @@ def parse_report(text, local_only, log):
             raise bad(f"has `{k}` of the wrong type: {'a list of strings' if t is list else 'a string'} expected")
     if rep["verdict"] not in ("green", "red"):
         raise bad(f"has verdict {rep['verdict']!r}: green or red expected")
-    if local_only and not (isinstance(rep["proof"], str) and rep["proof"].strip()):
-        raise bad("has no `proof`: this slice is proved locally, and the proof's result goes in it")
-    if not local_only and rep["proof"] is not None:
-        raise bad("has a `proof`: null expected, as this slice needs no local proof")
+    if proved and not (isinstance(rep["proof"], str) and rep["proof"].strip()):
+        raise bad("has no `proof`: this slice is proved beyond the gate, and the proof's result goes in it")
+    if not proved and rep["proof"] is not None:
+        raise bad("has a `proof`: null expected, as this slice needs no proof beyond the gate")
     return rep
 
 
@@ -1654,9 +1681,8 @@ def checked_report(run, m, wt, log):
     """The implementer's report, parsed from its log; a green one with its SHA the worktree's HEAD and green the
     gate verdict `drive-spec verify` recorded for that commit. A red one halts the slice whatever the gate recorded."""
     results = [e for e in stream(log) if e.get("type") == "result"]
-    local = (run.config.get("localOnly") or {}).get("label")
     labels = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "[.labels[].name]"))
-    rep = parse_report(results[-1].get("result") if results else None, bool(local) and local in labels, log)
+    rep = parse_report(results[-1].get("result") if results else None, bool(proof_of(run, labels)), log)
     if rep["verdict"] != "green":
         return rep
     head = git(wt, "rev-parse", "HEAD")
@@ -2412,7 +2438,7 @@ def slice_verification(x, pr, body):
     lines = (section(body, "Verification") or "").splitlines()
     verdict = next((v.split(":", 1)[1].strip() for v in lines if v.startswith("- Verdict:")), "no verdict recorded")
     out = [f"- #{x['number']} {x['title']}" + (f" (#{pr}): {verdict}" if pr else ": closed without a slice PR")]
-    return out + ["  " + v for v in lines if v.startswith("- Local proof")]
+    return out + ["  " + v for v in lines if v.startswith(PROOF_LINES)]
 
 
 def cmd_confirm(spec, left):
@@ -2660,6 +2686,61 @@ def qa_passed(run, spec_pr):
         raise Failed(f"not done: {verdicts[-1]} Halt the run on the failed scenarios", REFUSE)
 
 
+QA_FAILED = re.compile(r"^### +\d+\. +([^\n]+?) +[—–-]+ +failed[ \t]*$(.*?)(?=^##|\Z)", re.M | re.S)
+
+
+def misses_file(run):
+    return run.common / "drive-spec" / "misses.jsonl"
+
+
+def recorded_misses(run):
+    try:
+        return json_lines(misses_file(run).read_text())
+    except OSError:
+        return []
+
+
+def record_misses(run, pr):
+    """What the spec PR's own review and QA caught after drive-spec's review passed it, each once, in the repo's
+    misses log: every top-level inline review comment, and every scenario a `qa-pr done` comment failed. Repeats
+    across specs are the rules worth writing into REVIEW.md. The count of new ones."""
+    found = [{"id": f"review-{c['id']}", "source": "review", "path": c.get("path"), "line": c.get("line"),
+              "finding": " ".join((c.get("body") or "").split()), "url": c.get("url")}
+             for c in json_lines(gh("--paginate", f"repos/{run.repo}/pulls/{pr}/comments", "--jq",
+                                    ".[] | select(.in_reply_to_id == null) | {id, path, line, body, url: .html_url}"))]
+    for c in json_lines(gh("--paginate", f"repos/{run.repo}/issues/{pr}/comments", "--jq", ".[] | {id, body}")):
+        body = (c.get("body") or "").replace("\r\n", "\n")
+        if not body.startswith("qa-pr done at "):
+            continue
+        for k, m in enumerate(QA_FAILED.finditer(body), 1):
+            saw = re.search(r"^Saw: *(.+)$", m.group(2), re.M)
+            found.append({"id": f"qa-{c['id']}-{k}", "source": "qa", "path": None, "line": None,
+                          "finding": m.group(1).strip() + (f": saw {saw.group(1).strip()}" if saw else ""),
+                          "url": None})
+    seen = {x.get("id") for x in recorded_misses(run)}
+    new = [dict(x, spec=run.spec, pr=pr, at=stamp()) for x in found if x["id"] not in seen]
+    if new:
+        misses_file(run).parent.mkdir(parents=True, exist_ok=True)
+        with open(misses_file(run), "a") as f:
+            f.writelines(json.dumps(x) + "\n" for x in new)
+    return len(new)
+
+
+def cmd_misses(spec, as_json):
+    run = Run(spec or 0)
+    found = [x for x in recorded_misses(run) if spec is None or x.get("spec") == spec]
+    if as_json:
+        print(json.dumps(found))
+        return 0
+    for x in found:
+        where_ = f" `{x['path']}" + (f":{x['line']}`" if x.get("line") else "`") if x.get("path") else ""
+        print(f"- #{x['spec']} PR #{x['pr']} {x['source']}{where_}: {x['finding']}"
+              + (f" ({x['url']})" if x.get("url") else ""))
+    if not found:
+        print("no misses recorded")
+    return 0
+
+
 def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=None):
     spec = run.spec
     plan = make_plan(run)
@@ -2716,11 +2797,14 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=Non
         base = run.base()
         spec_pr = spec_pr or spec_pr_of(run, base, plan["spec_branch"])
         post_progress(run, plan, base, spec_pr)
+        missed = record_misses(run, spec_pr["number"]) if spec_pr else 0
         known = {"branch": plan["spec_branch"], **({"pr_url": spec_pr["url"]} if spec_pr else {})}
     state, default_step = OUTCOMES[outcome]
     run.status(step=step or default_step, state=state, summary=first,
                next="none" if outcome == "done" else resume, question="", **known)
     print(body)
+    if outcome != "refused" and plan["spec_branch"] and missed:
+        print(f"recorded {missed} miss(es) of the run's own review in {misses_file(run)}: `drive-spec misses`")
     return 0
 
 
@@ -2825,6 +2909,9 @@ def main():
     an = sub.add_parser("answered", help="record the operator's answer on the spec and for the implementers")
     an.add_argument("spec")
     an.add_argument("answer", help="the operator's own words, or `-` for stdin")
+    ms = sub.add_parser("misses", help="what spec PRs' review and QA caught after drive-spec's review passed them")
+    ms.add_argument("spec", nargs="?", help="only this spec's; default every spec's")
+    ms.add_argument("--json", action="store_true")
     fi = sub.add_parser("finish", help="post the run's status comment and final status")
     fi.add_argument("spec")
     fi.add_argument("outcome", choices=sorted(OUTCOMES))
@@ -2834,7 +2921,8 @@ def main():
     fi.add_argument("--resume", help="resume command; default /drive-spec <spec>")
     fi.add_argument("--left", help="with done: what the last review left open, or `-` for stdin")
     args = p.parse_args()
-    spec = args.spec if args.cmd == "verify" and re.fullmatch(r"pr-\d+", args.spec) else int(args.spec.lstrip("#"))
+    spec = args.spec if args.cmd == "verify" and re.fullmatch(r"pr-\d+", args.spec) \
+        else None if args.spec is None else int(args.spec.lstrip("#"))
     try:
         if args.cmd == "plan":
             code = cmd_plan(spec, args.json)
@@ -2881,6 +2969,8 @@ def main():
             code = cmd_build(spec, args.sequential, args.max_slices, args.wait)
         elif args.cmd == "halt":
             code = cmd_halt(spec, int(args.slice.lstrip("#")), " ".join(args.why).rstrip("."))
+        elif args.cmd == "misses":
+            code = cmd_misses(spec, args.json)
         elif args.cmd == "finish":
             code = cmd_finish(spec, args.outcome, args.why and args.why.rstrip("."), args.slice, args.step,
                               args.resume, args.left)

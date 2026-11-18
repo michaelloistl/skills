@@ -12,6 +12,7 @@
             "--permission-prompts", "none"],
   "agentResume": ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
                   "--permission-prompts", "none", "--resume", "{session}"],
+  "runProof": "docs/agents/run-proof.md",
   "localOnly": {
     "label": "needs:desktop",
     "proof": "docs/agents/desktop-proof.md"
