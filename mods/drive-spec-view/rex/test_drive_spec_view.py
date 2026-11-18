@@ -76,6 +76,23 @@ class SliceTest(unittest.TestCase):
         self.assertEqual([(s['number'], s['state']) for s in rows], [(9, 'building')])
 
 
+class PlanDueTest(unittest.TestCase):
+    def test_a_plan_is_read_first_then_every_minute(self):
+        open_ = {'slices': [{'state': 'closed'}, {'state': 'open'}]}
+        self.assertTrue(v.plan_due(False, None, False, 0, 1000))
+        self.assertFalse(v.plan_due(True, open_, False, 1000, 1000 + v.PLAN_S - 1))
+        self.assertTrue(v.plan_due(True, open_, False, 1000, 1000 + v.PLAN_S + 1))
+
+    def test_a_plan_with_every_slice_closed_is_not_read_again(self):
+        done = {'slices': [{'state': 'closed'}, {'state': 'closed'}]}
+        self.assertFalse(v.plan_due(True, done, False, 0, 10 ** 6))
+        self.assertTrue(v.plan_due(False, done, False, 0, 1))  # a refresh reads it again
+
+    def test_a_failed_read_waits_longer(self):
+        self.assertFalse(v.plan_due(True, None, True, 1000, 1000 + v.PLAN_S + 1))
+        self.assertTrue(v.plan_due(True, None, True, 1000, 1000 + v.PLAN_RETRY_S + 1))
+
+
 class PickTest(unittest.TestCase):
     RUNS = {5: {'pane': 'block:a', 'mux': 'rex', 'state': 'done'}, 6: {'pane': 'block:b', 'state': 'running'},
             7: {'pane': 'block:c', 'mux': 'herdr', 'state': 'halted'}}

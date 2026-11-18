@@ -28,6 +28,7 @@ STATUS_S = 2
 FOLLOW_S = 5
 DISPATCH_S = 10
 PLAN_S = 60
+PLAN_RETRY_S = 10 * 60  # after a failed plan, such as GitHub's rate limit
 STALE_AGENT_S = 5 * 60
 STALE_RUN_S = 10 * 60
 HOME = os.path.expanduser('~')
@@ -194,6 +195,17 @@ def slice_state(s, agent, landed):
     if s.get('state') == 'in-flight':
         return 'in-flight'
     return 'todo'
+
+
+def plan_due(fetched, plan, failed, last, now):
+    """Whether to read the plan again. A plan whose slices are all closed cannot change, so it is read once: each
+    read lists every issue in the repo once cleanup has deleted the run's issue cache. A failed read waits longer."""
+    if not fetched:
+        return True
+    slices = (plan or {}).get('slices') or []
+    if not failed and slices and all(s.get('state') == 'closed' for s in slices):
+        return False
+    return now - last > (PLAN_RETRY_S if failed else PLAN_S)
 
 
 def board_slices(plan, status, notes_dir, now, **io):
@@ -728,6 +740,7 @@ class App:
         self.chosen = None  # a spec picked by hand, overriding the follow
         self.plan_for, self.plans_loading = None, set()
         self.last_plan, self.last_dispatch = 0.0, 0.0
+        self.plan_failed = False
         self.pick_open = False  # the picker opened with s
         self.log_choice = []  # slices `l` asks between, while it asks
         self.model = {'spec': None, 'status': None, 'plan': None, 'slices': [], 'picker': [], 'picking': False,
@@ -808,7 +821,7 @@ class App:
                 error = f'plan: {err}'
             with self.lock:
                 self.plans_loading.discard(spec)
-                self.last_plan = time.time()
+                self.last_plan, self.plan_failed = time.time(), error is not None
                 self.model['loading'] = bool(self.plans_loading)
                 if spec == self.model['spec']:
                     if plan:
@@ -849,7 +862,7 @@ class App:
             m['status'] = r
             m['picking'] = self.pick_open or spec is None
             m['now'] = now
-            due = r and (self.plan_for != spec or now - self.last_plan > PLAN_S)
+            due = r and plan_due(self.plan_for == spec, m['plan'], self.plan_failed, self.last_plan, now)
             common = r['common'] if r else None
         if due:
             self.plan_for = spec
