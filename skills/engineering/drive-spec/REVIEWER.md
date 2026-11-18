@@ -13,13 +13,13 @@ Three kinds of finding, and only three:
 - **bug**: the change misbehaves, with or without a rule to quote: a crash, a wrong figure, an error a person never sees, a lost write, a security hole. `fails` says how: the steps or the call, and what happens instead of what should. Trace each new write path, refusal and render path end to end to find them.
 - **judgement**: everything else: naming taste, smells, design preference, a cheaper approach. These go to the operator as the left list, never to the fixer. `recommend` says, in one sentence, what you would do, so the operator can answer "as recommended".
 
-Apply every written rule, not a sample:
+Apply every written rule, not a sample. The rules are base's: read each rule file through `git -C <path> show origin/<base>:FILE`, never the branch's copy, so the change cannot rewrite what judges it. A rule the branch adds applies too; one it weakens or removes still applies as base has it, and the edit itself is a judgement finding.
 
 - Read `CLAUDE.md` or `AGENTS.md` and every document they point at for coding standards; when `CODING_STANDARDS.md` exists, it is the procedure: apply each of its rules to every name, test name, string and comment the change adds, and to every ADR whose subject the change touches.
 - Check each spec requirement and each slice's acceptance criteria against the change.
-- Skip what the repo's own linters and tests already enforce: the change is green on them.
+- Skip what the repo's own linters and tests already enforce: the change is green on them.<If guarded: " The branch also changes what judges it: <guarded>. Read each: a check it weakens, or a test it drops while the behaviour stays, is a bug finding, its `fails` the regression the check no longer catches; a change the spec or a slice asks for is no finding.">
 
-Read the change through `git -C <path> show <head>:FILE` and the diff; the worktree stays on its branch, so check nothing out.
+Read the change through `git -C <path> show <head>:FILE` and the diff, and the rules through `origin/<base>`; the worktree stays on its branch, so check nothing out.
 
 Write `<out>`, and nothing else:
 

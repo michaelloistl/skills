@@ -28,6 +28,10 @@ TIMED_OUT = 124
 POLL_SECONDS = float(os.environ.get("DRIVE_SPEC_POLL_SECONDS", 3))
 HEARTBEAT_SECONDS = float(os.environ.get("DRIVE_SPEC_HEARTBEAT_SECONDS", 300))
 SPEC_MOVES = 5
+MAX_REDS = 3
+TEST_PATH = re.compile(r"(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]*$|_test\.[^/]+$|\.(test|spec)\.[^/]+$")
+RUNNER_FILES = {"yarn": "package.json", "npm": "package.json", "pnpm": "package.json", "bun": "package.json",
+                "make": "Makefile", "rake": "Rakefile", "just": "justfile"}
 REFUSE, CONFLICT, RED, INBOX, PENDING, PAUSED = 2, 3, 4, 5, 6, 7
 LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
 
@@ -694,10 +698,64 @@ def run_claimed(run, wt, head, gate):
         verdict = json.dumps({"sha": head, "tree": tree_of(run, head), "gate": gate, "exit": code,
                               "started_at": begun, "finished_at": now(), "log": str(log), "minutes": minutes})
         (run.notes / "verified" / f"{head}.json").write_text(verdict)
+        with open(run.notes / "verified" / "runs.jsonl", "a") as f:
+            f.write(json.dumps({"wt": os.path.realpath(wt), "sha": head, "exit": code, "at": stamp()}) + "\n")
         if code == 0:
             (run.notes / "verified" / f"tree-{tree_of(run, head)}.json").write_text(verdict)
     finally:
         claim_file(run, head).unlink(missing_ok=True)
+
+
+def reds_in_a_row(run, wt):
+    """Red gate runs in this worktree since its last green, or since `start` last cleared it."""
+    wt = os.path.realpath(wt)
+    count = 0
+    try:
+        lines = (run.notes / "verified" / "runs.jsonl").read_text().splitlines()
+    except OSError:
+        return 0
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("wt") == wt:
+            count = 0 if r.get("exit") == 0 or r.get("cleared") else count + 1
+    return count
+
+
+def clear_reds(run, wt):
+    """Start the worktree's count of reds in a row afresh: a new agent on it, after a halt or a death."""
+    (run.notes / "verified").mkdir(parents=True, exist_ok=True)
+    with open(run.notes / "verified" / "runs.jsonl", "a") as f:
+        f.write(json.dumps({"wt": os.path.realpath(wt), "cleared": True, "at": stamp()}) + "\n")
+
+
+def gate_paths(gate):
+    """The repo files the gate names, the manifest of each task runner it calls, and drive-spec's config:
+    what judges a change."""
+    found = {".claude/drive-spec.json"}
+    for segment in re.split(r"&&|\|\||[;|&()\n]", gate or ""):
+        words = [w.strip("'\"") for w in segment.split()]
+        words = [w for w in words if "=" not in w or "/" in w.split("=", 1)[0]]
+        if words and Path(words[0]).name in RUNNER_FILES:
+            found.add(RUNNER_FILES[Path(words[0]).name])
+        found |= {w.removeprefix("./") for w in words
+                  if not w.startswith(("-", "$", "/", "~")) and ("/" in w or "." in w.strip("."))}
+    return found
+
+
+def guarded_changes(run, wt, since):
+    """Each change in `since...HEAD` to what judges the change: a gate file touched, a test file deleted."""
+    paths = gate_paths(run_gate_of(run))
+    out = []
+    for line in git(wt, "diff", "--name-status", f"{since}...HEAD").splitlines():
+        status, *names = line.split("\t")
+        if any(n in paths for n in names):
+            out.append(f"{names[-1]} (a gate file, {'deleted' if status.startswith('D') else 'changed'})")
+        elif status.startswith("D") and TEST_PATH.search(names[0]):
+            out.append(f"{names[0]} (a test, deleted)")
+    return out
 
 
 def report(rec):
@@ -780,6 +838,10 @@ def verify(run, wt, gate=None, wait=None):
         return None
     worker = None
     held = runner(run, head)
+    cap = run.config.get("maxReds") or MAX_REDS
+    if not held and reds_in_a_row(run, wt) >= cap:
+        raise Failed(f"the gate went red {cap} times in a row in {wt}: stop fixing, and report red with what you "
+                     "tried; the operator takes it from here", REFUSE)
     if held:
         print(f"attached to the gate already running on {head[:12]} (pid {held['pid']})", flush=True)
     elif wait is None:
@@ -1008,6 +1070,12 @@ def cmd_integrate(spec, m, report_arg, wait=None):
         missing = [x for x, v in (("Deviations:", deviations), ("Unverified:", unverified)) if v is None]
         if missing:
             raise Failed(f"the report has no {' or '.join(missing)} list: pass the implementer's, or `none`", REFUSE)
+        guarded = guarded_changes(run, wt, f"origin/{spec_branch}")
+        undeclared = [g for g in guarded if g.split(" (")[0] not in (deviations or "")]
+        if undeclared:
+            raise Failed("the slice changes what judges it, and its Deviations: list does not name it: "
+                         + "; ".join(undeclared) + ": restore it, or report it as a deviation naming the path and why",
+                         REFUSE)
         info = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "{title, labels: [.labels[].name]}"))
         local = run.config.get("localOnly") or {}
         proof_lines = []
@@ -1422,6 +1490,7 @@ def cmd_start(spec, m):
                 start = f"origin/{plan['spec_branch']}"
             git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, start)
     bootstrap(run, wt)
+    clear_reds(run, wt)
     if "agent:in-progress" not in s["labels"]:
         add_label(run, m, "agent:in-progress")
         s["labels"].append("agent:in-progress")
@@ -2259,13 +2328,14 @@ def cmd_review(spec):
     earlier = [str(round_file(run, j, "json")) for j in range(1, k)]
     slices = ", ".join(f"#{x['number']}" for x in plan["slices"])
     brief_path = round_file(run, k, "brief.md")
+    guarded = guarded_changes(run, wt, f"origin/{run.base()}")
     brief_path.write_text(fill("REVIEWER.md", {
         "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
         "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
         "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
-        "out": round_file(run, k, "json"), "key": key}, {
+        "out": round_file(run, k, "json"), "key": key, "guarded": "; ".join(guarded)}, {
         "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier),
-        "keyed": bool(key)}) + "\n")
+        "keyed": bool(key), "guarded": bool(guarded)}) + "\n")
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
                next=f"drive-spec review {spec} once the reviewer writes its findings", branch=plan["spec_branch"])
     print(f"brief: {brief_path}")

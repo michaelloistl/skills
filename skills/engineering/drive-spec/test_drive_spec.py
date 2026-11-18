@@ -585,6 +585,30 @@ class Verify(Cli):
         self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
         self.assertEqual(self.gate_runs(), 2)
 
+    def test_three_reds_in_a_row_refuse_until_start_clears_them(self):
+        self.commit(self.wt, "RED", "", "Break the gate")
+        for _ in range(3):
+            self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+        self.git(self.wt, "rm", "-q", "RED")
+        self.git(self.wt, "commit", "-q", "-m", "Mend the gate")
+        out = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("red 3 times in a row", out.stderr)
+        self.assertEqual(self.gate_runs(), 3)
+        self.assertEqual(self.run_ds("start", "10", "11").returncode, 0)
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 0)
+
+    def test_a_green_starts_the_count_of_reds_afresh(self):
+        for n in range(2):
+            self.commit(self.wt, "RED", "", f"Break the gate {n}")
+            self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+            self.git(self.wt, "rm", "-q", "RED")
+            self.git(self.wt, "commit", "-q", "-m", f"Mend the gate {n}")
+            self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 0)
+        self.commit(self.wt, "RED", "", "Break the gate again")
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+
     def test_uncommitted_changes_refused(self):
         (self.wt / "a.txt").write_text("changed")
         out = self.run_ds("verify", "10", str(self.wt))
@@ -811,6 +835,27 @@ class Integrate(Cli):
                          "\n\nUnverified:\n- the toast shows only in a running app\n\nDeviations:\n- none of note")
         self.git(self.wt, "fetch", "-q", "origin")
         self.assertEqual(self.git(self.wt, "show", "origin/agent/local-spec-10-export:a.txt"), "a")
+
+    def test_refuses_a_gate_file_change_its_deviations_leave_out(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE + " && test -n gate.sh"}))
+        self.commit(self.wt, "gate.sh", "true\n", "Loosen the gate")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("changes what judges it", out.stderr)
+        self.assertIn("gate.sh (a gate file, changed)", out.stderr)
+        self.assertEqual(self.gh_state()["pulls"], [])
+        out = self.run_ds("integrate", "10", "11", "--report",
+                          "Deviations:\n- gate.sh: the serializer needs its fixture built first\nUnverified: none")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_refuses_a_deleted_test_its_deviations_leave_out(self):
+        self.advance_spec("test_serializer.py", "x\n")
+        self.git(self.wt, "pull", "-q", "--no-rebase", "origin", "agent/local-spec-10-export")
+        self.git(self.wt, "rm", "-q", "test_serializer.py")
+        self.git(self.wt, "commit", "-q", "-m", "Drop the serializer test")
+        out = self.run_ds("integrate", "10", "11", "--report", NONE)
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("test_serializer.py (a test, deleted)", out.stderr)
 
     def test_skips_the_gate_on_an_already_verified_head(self):
         self.run_ds("verify", "10", str(self.wt))
@@ -1819,6 +1864,27 @@ class ParallelBuild(BuildCase):
         self.assertIn("only held slices remain (#11, #13)", st["summary"])
 
 
+class Guarded(unittest.TestCase):
+    def test_gate_paths(self):
+        cases = {
+            "scripts/verify.sh": {"scripts/verify.sh"},
+            "yarn typecheck && yarn test": {"package.json"},
+            "./bin/rails test; make lint": {"bin/rails", "Makefile"},
+            'FOO=1 python3 -m unittest -s "$DIR" | tee /tmp/x.log': set(),
+            "test ! -f RED": set(),
+        }
+        for gate, paths in cases.items():
+            with self.subTest(gate=gate):
+                self.assertEqual(ds.gate_paths(gate), paths | {".claude/drive-spec.json"})
+
+    def test_test_paths(self):
+        for path in ("test_a.py", "a/test_b.py", "tests/x.rb", "spec/models/a_spec.rb", "src/a.test.ts",
+                     "src/a.spec.js", "pkg/a_test.go", "src/__tests__/a.js"):
+            self.assertTrue(ds.TEST_PATH.search(path), path)
+        for path in ("src/attest.py", "latest/a.py", "inspect.py", "contest_a.py"):
+            self.assertFalse(ds.TEST_PATH.search(path), path)
+
+
 class Report(unittest.TestCase):
     """The report block an implementer ends with, parsed and checked with the standard library."""
 
@@ -2503,6 +2569,16 @@ class Boundaries(DispatcherCase):
         self.assertEqual(self.run_ds("confirm", "10").returncode, 0)
         self.assertTrue(self.gh_state()["pulls"][1]["body"].endswith(
             "\n\nLeft from review:\n- `README:1`: Rename ExportJob. Recommend: Keep the name."))
+
+    def test_the_reviewer_reads_base_rules_and_sees_what_judges_the_change(self):
+        self.run_ds("gate", "10", GATE + " && test -n gate.sh")
+        self.close_all()
+        self.commit(self.spec_wt, "gate.sh", "true\n", "Loosen the gate")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.assertEqual(self.run_ds("review", "10").returncode, 0)
+        brief = (self.notes() / "review" / "round-1.brief.md").read_text()
+        self.assertIn("show origin/main:FILE`, never the branch's copy", brief)
+        self.assertIn("The branch also changes what judges it: gate.sh (a gate file, changed).", brief)
 
     def test_the_left_list_holds_only_the_last_rounds_judgement_calls(self):
         self.run_ds("gate", "10", GATE)

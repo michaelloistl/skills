@@ -12,7 +12,7 @@ Drive a spec issue from its tracer-bullet issues to one draft PR `spec branch â†
 
 The tickets are a task graph. Slices whose blockers have all closed form the **frontier**. State lives only in the tracker and the branches, so any session can resume any spec, and the same slice never builds twice.
 
-`drive-spec`, the script beside this file, runs every deterministic part of a step; `drive-spec --help` lists its commands. Its refusals (exit 2) name the broken rule: fix that, never route around it.
+`drive-spec`, the script beside this file, runs every deterministic part of a step; `drive-spec --help` lists its commands. Its refusals (exit 2) name the broken rule: fix that, never route around it. A change never edits what judges it: `verify` stops a worktree after `maxReds` reds in a row, `integrate` refuses a deleted test or changed gate file its deviations leave out, and the reviewer reads the rules from base.
 
 Reference, read when a step points at it:
 
