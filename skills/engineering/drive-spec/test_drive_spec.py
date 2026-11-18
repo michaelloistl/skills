@@ -584,12 +584,14 @@ class Verify(Cli):
         out = self.run_ds("verify", "10", str(self.wt))
         self.assertEqual(out.returncode, 4)
         self.assertIn("red ", out.stdout)
-        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
-        self.assertEqual(self.gate_runs(), 2)
+        again = self.run_ds("verify", "10", str(self.wt))
+        self.assertEqual(again.returncode, 4)
+        self.assertIn("(already verified): a red verdict stands", again.stdout)
+        self.assertEqual(self.gate_runs(), 1)
 
     def test_three_reds_in_a_row_refuse_until_start_clears_them(self):
-        self.commit(self.wt, "RED", "", "Break the gate")
-        for _ in range(3):
+        for n in range(3):
+            self.commit(self.wt, "RED", str(n), f"Break the gate {n}")
             self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
         self.git(self.wt, "rm", "-q", "RED")
         self.git(self.wt, "commit", "-q", "-m", "Mend the gate")
@@ -607,9 +609,9 @@ class Verify(Cli):
             self.git(self.wt, "rm", "-q", "RED")
             self.git(self.wt, "commit", "-q", "-m", f"Mend the gate {n}")
             self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 0)
-        self.commit(self.wt, "RED", "", "Break the gate again")
-        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
-        self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
+        for n in range(2):
+            self.commit(self.wt, "RED", str(n), f"Break the gate again {n}")
+            self.assertEqual(self.run_ds("verify", "10", str(self.wt)).returncode, 4)
 
     def test_uncommitted_changes_refused(self):
         (self.wt / "a.txt").write_text("changed")
