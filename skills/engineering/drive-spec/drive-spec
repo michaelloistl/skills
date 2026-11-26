@@ -2137,6 +2137,16 @@ def cmd_explore(spec):
     return 0
 
 
+def conflicts_in(run):
+    """What `conflicts.md` lists, or "" when it lists nothing. A conflict names both of its issues, so a file that
+    names no `#<n>`, such as an explorer's "None.", lists nothing."""
+    try:
+        text = (run.notes / "conflicts.md").read_text().strip()
+    except FileNotFoundError:
+        return ""
+    return text if REF.search(text) else ""
+
+
 def cmd_explored(spec):
     run = Run(spec)
     plan = checked_plan(run)
@@ -2152,7 +2162,7 @@ def cmd_explored(spec):
     if stale:
         raise Failed(f"{', '.join(stale)} in {run.notes} predate this run: check the spec and the open slices "
                      "again and write them fresh", REFUSE)
-    if (run.notes / "conflicts.md").read_text().strip():
+    if conflicts_in(run):
         finish(run, "conflicts")
         return CONFLICT
     pairs, bad = coverage(run)
@@ -2795,10 +2805,7 @@ def finish(run, outcome, why=None, slice_=None, step=None, resume=None, left=Non
                 raise Failed("a halt needs --why", REFUSE)
             first = f"drive-spec halted on #{slice_}: {why}." if slice_ else f"drive-spec halted: {why}."
         elif outcome == "conflicts":
-            try:
-                extra = (run.notes / "conflicts.md").read_text().strip()
-            except FileNotFoundError:
-                extra = ""
+            extra = conflicts_in(run)
             if not extra:
                 raise Failed(f"no conflicts recorded in {run.notes / 'conflicts.md'}", REFUSE)
             first = "drive-spec halted before building: the spec and its slices disagree."

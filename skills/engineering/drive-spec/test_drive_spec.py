@@ -2597,6 +2597,15 @@ class Boundaries(DispatcherCase):
         r = self.row()
         self.assertEqual((r["attention"], r["step"]), ("HALT", "explore"))
 
+    def test_explored_reads_a_conflicts_file_naming_no_issue_as_none(self):
+        self.run_ds("gate", "10", GATE)
+        for name in ("issue-11.md", "issue-12.md"):
+            (self.notes() / name).write_text("n\n")
+        self.write_explore("- Export → #11\n- Route → #12\n", conflicts="None. The slices build in order.\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("no conflicts", out.stdout)
+
     def round_(self, k, *findings):
         meta = json.loads((self.notes() / "review" / f"round-{k}.meta.json").read_text())
         (self.notes() / "review" / f"round-{k}.json").write_text(
