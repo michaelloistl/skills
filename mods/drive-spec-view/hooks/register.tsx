@@ -369,7 +369,8 @@ export const register: Register = on => {
       return { text: 'Usage: /drive-spec-view [<spec> | follow]' }
     }
     await $.ui.open({ id: PANE, title: TITLE })
-    await refresh($, true)
+    // In the background, as the plan read can take seconds: the pane fills in when it lands.
+    void refresh($, true)
     return { text: arg === 'follow' ? 'Following this session\'s run.' : arg ? `Showing spec #${arg}.` : 'drive-spec pane opened.' }
   })
 

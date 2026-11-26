@@ -56,6 +56,14 @@ const FILES: Record<string, string> = {
   [LOG]: LOG_TEXT,
 }
 
+// The test runner has timers; the mod's own types leave them out.
+declare function setTimeout(fn: () => void, ms: number): unknown
+
+// The command answers at once and reads in the background: wait for the status line the read ends on.
+async function until(isDone: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !isDone(); i++) await new Promise<void>(r => setTimeout(r, 5))
+}
+
 test('shows the run this session drives, with its steps, slices and agent, and puts it in the status line', async ($, on) => {
   on('command.register', () => ({ value: { command: 'drive-spec-view' } }))
   let panes: UiPane[] = []
@@ -102,6 +110,7 @@ test('shows the run this session drives, with its steps, slices and agent, and p
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   expect(await $.command.run(CMD(''))).toEqual({ text: 'drive-spec pane opened.' })
   await $.command.run(CMD('follow'))
+  await until(() => planned.length > 0 && Boolean(lines.at(-1)?.includes('#10')))
 
   expect(planned[0]).toEqual(['/home/.claude/skills/drive-spec/drive-spec', 'plan', '10', '--json'])
   expect(lines.at(-1)).toBe('drive-spec #10 · running · build 6/11 · 1/3 landed')
@@ -127,12 +136,14 @@ test('shows the run this session drives, with its steps, slices and agent, and p
 
   // Picking another spec shows it, its question first.
   await $.command.run(CMD('20'))
+  await until(() => Boolean(lines.at(-1)?.includes('#20')))
   const picked = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await picked.find({ type: 'Text', text: /▲ waiting on you/ })).toBeTruthy()
   expect(await picked.find({ type: 'Text', text: /Keep the old export\?/ })).toBeTruthy()
   await picked.unmount()
 
   await $.command.run(CMD('follow'))
+  await until(() => Boolean(lines.at(-1)?.includes('#10')))
   expect(await $.command.run(CMD(''))).toEqual({ text: 'drive-spec pane closed.' })
   expect(panes).toEqual([])
 })
