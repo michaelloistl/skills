@@ -186,6 +186,37 @@ class ClickTest(unittest.TestCase):
         plain = lambda ls: [__import__('re').sub(r'\033\[[0-9;?]*[A-Za-z]', '', l) for l in ls]
         self.assertEqual(plain(c.render(items, 80, hover=0)), plain(c.render(items, 80)))
 
+    def approval_rows(self, **action):
+        return c.rows([session('a', 'requires_action', external_metadata={'pending_action': {'tool_name': 'Bash', **action}})], NOW)
+
+    def test_hover_shows_the_pending_approval_and_maps_it_to_its_session(self):
+        items = self.approval_rows(action_description='Push the branch', input={'command': 'git push origin main', 'description': 'x'})
+        quiet = '\n'.join(c.render(items, 80))
+        self.assertNotIn('git push', quiet)
+        hits = []
+        lines = c.render(items, 80, hits=hits, hover=0)
+        shown = [l for l, h in zip(lines, hits) if h == 0]
+        self.assertTrue(any('Push the branch' in l for l in shown))
+        self.assertTrue(any('git push origin main' in l for l in shown))
+
+    def test_approval_falls_back_to_the_input_as_json(self):
+        items = self.approval_rows(input={'weird': [1, 2]})
+        self.assertEqual(items[0]['approval'], ['{"weird":[1,2]}'])
+
+    def test_approval_uses_the_display_name(self):
+        items = self.approval_rows(display_tool_name='Edit file')
+        self.assertEqual(items[0]['detail'], 'Edit file wants approval')
+
+    def test_hovered_approval_is_wrapped_and_capped(self):
+        items = self.approval_rows(input={'command': 'x' * 1000})
+        plain = lambda ls: [__import__('re').sub(r'\033\[[0-9;?]*[A-Za-z]', '', l) for l in ls]
+        lines = plain(c.render(items, 60, hover=0))
+        body = [l for l in lines if '│' in l]
+        self.assertEqual(len(body), c.HOVER_LINES)
+        self.assertTrue(body[-1].endswith('…'))
+        for l in lines:
+            self.assertLessEqual(len(l), 60, l)
+
     def test_parse_input_drops_other_escapes(self):
         self.assertEqual(c.parse_input('q\033[A'), [('key', 'q')])
 

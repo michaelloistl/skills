@@ -10,7 +10,7 @@ Your Claude Code cloud sessions at a glance: which need you, which are working. 
   
   On a 401 it tries the next item. When every item is refused, it says which `CLAUDE_CONFIG_DIR` to run `claude` under once to refresh the token. The organisation comes from that folder's `.claude.json`. A failed account shows its error at the top and keeps its last rows.
 - **Needs you:** by `session_status`, in this order:
-  - `⚠ needs approval`, for `requires_action`. Below it, the tool from `external_metadata.pending_action`.
+  - `⚠ needs approval`, for `requires_action`. Below it, the tool from `external_metadata.pending_action`: its `display_tool_name`, else `tool_name`. Under the pointer, the row also shows what the approval is for, wrapped over up to 6 lines: the action's `action_description`, then its `input`'s `command`, `file_path`, `url` or similar field, else the input as JSON.
   - `✗ failed`. Below it, the reason.
   - `● awaiting reply`, for `idle`: the turn finished.
 - **Working:** `↻ running` and `◌ starting` (`pending`).

@@ -56,7 +56,7 @@ def detail(session):
     status = session.get('session_status')
     if status == 'requires_action':
         action = meta.get('pending_action') or {}
-        name = action.get('tool_name') or action.get('name')
+        name = action.get('display_tool_name') or action.get('tool_name') or action.get('name')
         return f'{name} wants approval' if name else 'waiting on you'
     if status == 'failed':
         err = meta.get('last_init_error') or session.get('startup_failure') or session.get('error_type')
@@ -64,6 +64,40 @@ def detail(session):
             err = err.get('message') or err.get('type')
         return str(err) if err else ''
     return ''
+
+
+INPUT_KEYS = ('command', 'file_path', 'notebook_path', 'url', 'pattern', 'path', 'query', 'prompt', 'plan')
+
+
+def approval(session):
+    """The lines that say what a pending approval would do: its description, then its input."""
+    if session.get('session_status') != 'requires_action':
+        return []
+    action = (session.get('external_metadata') or {}).get('pending_action') or {}
+    out = []
+    desc = action.get('action_description') or action.get('description')
+    if isinstance(desc, str) and desc.strip():
+        out.append(desc.strip())
+    inp = action.get('input')
+    if isinstance(inp, dict):
+        shown = [str(inp[k]) for k in INPUT_KEYS if isinstance(inp.get(k), (str, int, float)) and str(inp[k]).strip()]
+        out.append(shown[0] if shown else json.dumps(inp, separators=(',', ':')))
+    elif isinstance(inp, str) and inp.strip():
+        out.append(inp)
+    return [l for text in out for l in text.splitlines() if l.strip()]
+
+
+def wrap(lines, width, max_lines):
+    """Lines cut into width-wide pieces, at most max_lines, the last ending in … when cut short."""
+    out = []
+    for line in lines:
+        while line and len(out) <= max_lines:
+            out.append(line[:width])
+            line = line[width:]
+    if len(out) > max_lines:
+        out = out[:max_lines]
+        out[-1] = out[-1][:max(0, width - 1)] + '…'
+    return out
 
 
 def rows(sessions, now, max_age_days=2.0):
@@ -84,6 +118,7 @@ def rows(sessions, now, max_age_days=2.0):
             'group': 'needs' if status in NEEDS else 'working',
             'label': NEEDS.get(status) or WORKING.get(status),
             'detail': detail(s),
+            'approval': approval(s),
             'age': age,
             'url': WEB + str(s.get('id')),
             'offline': s.get('connection_status') == 'disconnected',
@@ -200,6 +235,9 @@ C = {'needs': '\033[33m', 'failed': '\033[31m', 'working': '\033[36m', 'dim': '\
 GLYPH = {'requires_action': '⚠', 'failed': '✗', 'idle': '●', 'running': '↻', 'pending': '◌'}
 
 
+HOVER_LINES = 6  # most lines a hovered approval's detail takes
+
+
 def link(text, hovered):
     return f'{C["bold"]}\033[4m{text}{C["off"]}' if hovered else text
 
@@ -244,6 +282,9 @@ def render(items, width, errors=(), fetched=None, now=None, hits=None, hover=Non
                          f'  {colour}{label}{C["off"]}  {C["dim"]}{right}{C["off"]}')
             if r['detail']:
                 lines.append(f'      {C["dim"]}{cut(r["detail"], max(10, width - 7))}{C["off"]}')
+            if i == hover and r.get('approval'):
+                for piece in wrap(r['approval'], max(10, width - 8), HOVER_LINES):
+                    lines.append(f'      {C["needs"]}│{C["off"]} {piece}')
             if hits is not None:
                 hits.extend([i] * (len(lines) - len(hits)))
     lines.append('')
