@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
 # Setup script for Claude Code cloud environments (claude.ai/code).
-# Paste into the environment's "Setup script" field. Runs as root on Ubuntu
-# before Claude Code launches; the result is cached for ~7 days.
-# Needs the Trusted network level (github.com, registry.npmjs.org).
+# Runs as root on Ubuntu before Claude Code launches. The result is cached for
+# ~7 days and rebuilt only when the pasted script changes, so paste this loader
+# pinned to a commit, and bump SKILLS_REF to roll out a change:
+#
+#   #!/bin/bash
+#   set -euo pipefail
+#   export SKILLS_REF=<full commit sha>
+#   f=$(mktemp)
+#   curl -fsSL "https://raw.githubusercontent.com/michaelloistl/skills/$SKILLS_REF/scripts/cloud-setup.sh" -o "$f"
+#   bash "$f" </dev/null
+#
+# SKILLS_REF pins this repo's skills and hooks too. Network: the default
+# Limited level with "Allow package managers" checked reaches every host used
+# here (github.com, raw.githubusercontent.com, registry.npmjs.org).
 
 set -euo pipefail
+
+# This repo at SKILLS_REF: its skills and hooks install from this checkout.
+# A sha must be the full 40 characters: GitHub fetches no abbreviated one.
+src=$(mktemp -d)
+git -C "$src" init -q
+git -C "$src" fetch -q --depth 1 https://github.com/michaelloistl/skills "${SKILLS_REF:-main}"
+git -C "$src" checkout -q FETCH_HEAD
 
 MATT_SKILLS=(
   code-review codebase-design diagnosing-bugs domain-modeling grill-with-docs
@@ -15,10 +33,15 @@ MATT_SKILLS=(
 
 npx -y skills@latest add mattpocock/skills -g -y --agent claude-code --copy \
   --skill "${MATT_SKILLS[@]}" </dev/null
-npx -y skills@latest add michaelloistl/skills -g -y --agent claude-code --copy \
+npx -y skills@latest add "$src" -g -y --agent claude-code --copy \
   --skill '*' </dev/null
 
-mkdir -p ~/.claude
+mkdir -p ~/.claude/hooks
+
+# Every executable in hooks/ is a hook; its tests are not executable.
+for hook in "$src"/hooks/*; do
+  [ -f "$hook" ] && [ -x "$hook" ] && install -m 755 "$hook" ~/.claude/hooks/
+done
 
 cat > ~/.claude/CLAUDE.md <<'EOF'
 Be extremely concise. Sacrifice grammar for the sake of concision.
@@ -50,8 +73,24 @@ The GitHub proxy rejects GraphQL, so `gh issue …` and `gh pr …` fail with 40
 The proxy also rejects remote branch deletion: leave merged branches on origin.
 EOF
 
+# Hooks as hooks/README.md registers them.
 cat > ~/.claude/settings.json <<'EOF'
 {
-  "attribution": { "commit": "", "pr": "", "sessionUrl": false }
+  "attribution": { "commit": "", "pr": "", "sessionUrl": false },
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "~/.claude/hooks/block-claude-attribution.sh"},
+        {"type": "command", "command": "~/.claude/hooks/block-unbounded-wait.sh"},
+        {"type": "command", "command": "~/.claude/hooks/block-git-stash.sh"},
+        {"type": "command", "command": "~/.claude/hooks/block-drive-spec-pipe.py"}
+      ]}
+    ],
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "~/.claude/hooks/check-hooks-installed.py", "timeout": 5}]}
+    ]
+  }
 }
 EOF
+
+rm -rf "$src"

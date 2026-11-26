@@ -6,7 +6,7 @@
 #
 #   #!/bin/bash
 #   set -euo pipefail
-#   export SKILLS_REF=<commit sha>
+#   export SKILLS_REF=<full commit sha>
 #   f=$(mktemp)
 #   curl -fsSL "https://raw.githubusercontent.com/michaelloistl/skills/$SKILLS_REF/scripts/cloud-setup-rails.sh" -o "$f"
 #   bash "$f" </dev/null
@@ -14,10 +14,15 @@
 # Also set in the environment's "Environment variables" field:
 #   LANG=C.UTF-8
 #   LC_ALL=C.UTF-8
+#
+# Network: the default Limited level with "Allow package managers" checked
+# reaches every host used here and in cloud-setup.sh: GitHub and its release
+# downloads (rv and its Rubies), nodejs.org (n), registry.npmjs.org, Ubuntu apt.
 
 set -euo pipefail
 
-# SKILLS_REF pins the base script to the same commit as this one.
+# SKILLS_REF pins the base script, and the skills and hooks it installs, to the
+# same commit as this one.
 SCRIPTS=https://raw.githubusercontent.com/michaelloistl/skills/${SKILLS_REF:-main}/scripts
 
 pids=()
