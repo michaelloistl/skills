@@ -88,7 +88,7 @@ EOF
 # Hooks as hooks/README.md registers them; the mods' folders go in `env` after.
 cat > ~/.claude/settings.json <<'EOF'
 {
-  "attribution": { "commit": "", "pr": "", "sessionUrl": false },
+  "attribution": false,
   "hooks": {
     "PreToolUse": [
       {"matcher": "Bash", "hooks": [
