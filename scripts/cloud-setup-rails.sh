@@ -37,7 +37,7 @@ pids+=($!)
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     libvips42 libvips-dev imagemagick libpq-dev xz-utils >/dev/null
 ) &
-pids+=($!)
+apt_pid=$!
 
 # Rubies come from each repo's .ruby-version: ruby-up installs whichever are
 # missing, as rv prebuilts (seconds, not minutes) linked into rbenv.
@@ -46,10 +46,13 @@ cat > /usr/local/bin/ruby-up <<'EOF'
 # Idempotent: install the Rubies this repo's .ruby-version files ask for.
 set -euo pipefail
 versions="$(rbenv root)/versions"
+# rv's installer puts it in ~/.local/bin since 0.7; older ones used ~/.cargo/bin.
+rv=$(command -v rv || ls "$HOME/.local/bin/rv" "$HOME/.cargo/bin/rv" 2>/dev/null | head -1 || true)
 mkdir -p "$versions"
 for v in $(git ls-files 2>/dev/null | grep -E '(^|/)\.ruby-version$' | xargs -r cat | sed 's/^ruby-//' | sort -u); do
   [ -x "$versions/$v/bin/ruby" ] && continue
-  "$HOME/.cargo/bin/rv" ruby install "$v" >/dev/null
+  [ -n "$rv" ] || { echo "ruby-up: rv is not installed, so Ruby $v cannot be" >&2; exit 1; }
+  "$rv" ruby install "$v" >/dev/null
   ln -sfn "$HOME/.local/share/rv/rubies/ruby-$v" "$versions/$v"
   "$versions/$v/bin/ruby" -ropenssl -rpsych -e '' # fail now, not mid-test
 done
@@ -96,6 +99,8 @@ command -v yarn >/dev/null || npm install -g yarn >/dev/null
 EOF
 chmod +x /usr/local/bin/node-up
 
+# rv's installer unpacks with xz, which apt installs: wait for it first.
+wait "$apt_pid"
 (
   curl --proto '=https' --tlsv1.2 -LsSf \
     https://github.com/spinel-coop/rv/releases/latest/download/rv-installer.sh | sh >/dev/null
