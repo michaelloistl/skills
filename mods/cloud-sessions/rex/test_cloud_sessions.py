@@ -170,6 +170,22 @@ class ClickTest(unittest.TestCase):
         data = '\033[<0;12;5M\033[<0;12;5m' + 'r' + '\033[<2;3;4M' + '\033[<64;1;1M'
         self.assertEqual(c.parse_input(data), [('click', 5), ('key', 'r')])
 
+    def test_parse_input_reads_motion_without_a_button(self):
+        self.assertEqual(c.parse_input('\033[<35;4;7M\033[<32;4;7M'), [('move', 7)])
+
+    def test_hovered_row_underlines_its_title_only(self):
+        items = c.rows([session('a', 'running'), session('b', 'running', age=120)], NOW)
+        lines = c.render(items, 80, hover=1)
+        [a_line] = [l for l in lines if 'Session a' in l]
+        [b_line] = [l for l in lines if 'Session b' in l]
+        self.assertNotIn('\033[4m', a_line)
+        self.assertIn('\033[4mSession b\033[0m', b_line)
+
+    def test_underline_keeps_the_columns(self):
+        items = c.rows([session('a', 'running')], NOW)
+        plain = lambda ls: [__import__('re').sub(r'\033\[[0-9;?]*[A-Za-z]', '', l) for l in ls]
+        self.assertEqual(plain(c.render(items, 80, hover=0)), plain(c.render(items, 80)))
+
     def test_parse_input_drops_other_escapes(self):
         self.assertEqual(c.parse_input('q\033[A'), [('key', 'q')])
 

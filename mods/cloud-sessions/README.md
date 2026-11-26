@@ -18,7 +18,7 @@ Your Claude Code cloud sessions at a glance: which need you, which are working. 
 - Each row shows the session's title, its state, `· offline` when its connection is `disconnected`, and the time since it was last updated.
 - **Refresh:** every 30 seconds (`--interval`). A failed fetch shows the error and keeps the last list.
 - **Notification:** a macOS notification when a session starts needing you, or moves to another needs-you state. Not on the first fetch. `--no-notify` turns it off.
-- **Open:** a click on a session's row or the line under it, or the key before the row, opens that session on claude.ai/code. The pane turns on the terminal's SGR mouse reporting while it runs.
+- **Open:** a session behaves like a link. Under the pointer, its title is underlined and the pointer becomes a hand, where the terminal supports OSC 22. A click on its row or the line under it, or the key before the row, opens it on claude.ai/code. The pane turns on the terminal's SGR mouse reporting, clicks and motion, while it runs.
 - **Keys:** `r` refreshes, `q` quits.
 - `--once` prints the list and exits, without colours when not printing to a terminal. `--json` prints the rows instead.
 

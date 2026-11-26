@@ -200,12 +200,19 @@ C = {'needs': '\033[33m', 'failed': '\033[31m', 'working': '\033[36m', 'dim': '\
 GLYPH = {'requires_action': '⚠', 'failed': '✗', 'idle': '●', 'running': '↻', 'pending': '◌'}
 
 
+def link(text, hovered):
+    return f'{C["bold"]}\033[4m{text}{C["off"]}' if hovered else text
+
+
 def cut(text, n):
     return text if len(text) <= n else text[:max(0, n - 1)] + '…'
 
 
-def render(items, width, errors=(), fetched=None, now=None, hits=None):
-    """The screen's lines. Pass `hits` to get, per line, the index of the item it shows, or None."""
+def render(items, width, errors=(), fetched=None, now=None, hits=None, hover=None):
+    """The screen's lines. Pass `hits` to get, per line, the index of the item it shows, or None.
+
+    The item at index `hover` shows its title underlined, like a link under the pointer.
+    """
     lines = []
     tagged = len({r.get('account') for r in items}) > 1
     head = f'{C["bold"]}Cloud sessions{C["off"]}'
@@ -233,7 +240,8 @@ def render(items, width, errors=(), fetched=None, now=None, hits=None):
             if hits is not None:
                 hits.extend([None] * (len(lines) - len(hits)))
             lines.append(f' {C["dim"]}{key}{C["off"]} {colour}{GLYPH[r["status"]]}{C["off"]} '
-                         f'{cut(r["title"], title_w):<{title_w}}  {colour}{label}{C["off"]}  {C["dim"]}{right}{C["off"]}')
+                         f'{link(cut(r["title"], title_w), i == hover)}{" " * (title_w - len(cut(r["title"], title_w)))}'
+                         f'  {colour}{label}{C["off"]}  {C["dim"]}{right}{C["off"]}')
             if r['detail']:
                 lines.append(f'      {C["dim"]}{cut(r["detail"], max(10, width - 7))}{C["off"]}')
             if hits is not None:
@@ -245,11 +253,14 @@ def render(items, width, errors=(), fetched=None, now=None, hits=None):
     return lines
 
 
+# OSC 22 sets the mouse pointer's shape where the terminal supports it; others ignore it.
+POINTER = {'pointer': '\033]22;pointer\033\\', 'default': '\033]22;default\033\\'}
 MOUSE = re.compile(r'\033\[<(\d+);(\d+);(\d+)([Mm])')
 
 
 def parse_input(data):
-    """Events in a read from the terminal: ('click', row) for a left press, ('key', ch) otherwise."""
+    """Events in a read from the terminal: ('click', row) for a left press, ('move', row) for the
+    pointer moving with no button held, ('key', ch) otherwise."""
     events, pos = [], 0
     while pos < len(data):
         m = MOUSE.match(data, pos)
@@ -257,6 +268,8 @@ def parse_input(data):
             button, row, press = int(m.group(1)), int(m.group(3)), m.group(4) == 'M'
             if button == 0 and press:
                 events.append(('click', row))
+            elif button & 32 and button & 3 == 3:  # motion with no button held
+                events.append(('move', row))
             pos = m.end()
         elif data[pos] == '\033':
             pos = len(data)  # another escape sequence: ignore the rest of the read
@@ -280,7 +293,8 @@ def loop(args):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     tty.setcbreak(fd)
-    sys.stdout.write('\033[?25l\033[?1000h\033[?1006h')  # hide cursor, report clicks (SGR)
+    sys.stdout.write('\033[2J\033[?25l\033[?1003h\033[?1006h')  # hide cursor, report clicks and motion (SGR)
+    hover = None
     first = True
     try:
         while True:
@@ -297,15 +311,23 @@ def loop(args):
                 items, fetched, first = new, time.time(), False
             width = shutil.get_terminal_size((80, 24)).columns
             hits = []
-            sys.stdout.write('\033[H\033[2J' + '\n'.join(render(items, width, errors, fetched, time.time(), hits)))
+            frame = render(items, width, errors, fetched, time.time(), hits, hover)
+            # Draw over the last frame, clearing each line's tail and below: no flicker on hover.
+            sys.stdout.write('\033[H' + '\n'.join(l + '\033[K' for l in frame) + '\033[J')
             sys.stdout.flush()
             ready, _, _ = select.select([sys.stdin], [], [], 1.0)
             if not ready:
                 continue
             for kind, value in parse_input(os.read(fd, 256).decode(errors='ignore')):
                 pick = None
-                if kind == 'click':
-                    pick = hits[value - 1] if 0 < value <= len(hits) else None
+                if kind in ('click', 'move'):
+                    under = hits[value - 1] if 0 < value <= len(hits) else None
+                    if kind == 'move':
+                        if under != hover:
+                            sys.stdout.write(POINTER['pointer' if under is not None else 'default'])
+                        hover = under
+                        continue
+                    pick = under
                 elif value == 'q':
                     return
                 elif value == 'r':
@@ -316,7 +338,7 @@ def loop(args):
                     subprocess.run(['open', items[pick]['url']], capture_output=True)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        sys.stdout.write('\033[?1006l\033[?1000l\033[?25h\n')
+        sys.stdout.write(POINTER['default'] + '\033[?1006l\033[?1003l\033[?25h\n')
 
 
 def main():
