@@ -7,6 +7,7 @@
   "maxReds": 3,
   "parallel": false,
   "maxSlices": 5,
+  "cloudMaxParallel": 2,
   "worktreeRoot": ".claude/worktrees",
   "agent": ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
             "--permission-prompts", "none"],

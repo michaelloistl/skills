@@ -307,8 +307,15 @@ class Run:
         return base or self.config.get("baseBranch") or gh(f"repos/{self.repo}", "--jq", ".default_branch").strip()
 
     def mode(self, sequential, max_slices):
+        """Parallel or not, the landing ceiling, and the cap on slices running at once: `cloudMaxParallel` (default
+        2) in a cloud session, whose one VM runs every agent and gate, and none on the operator's machine."""
         parallel = not sequential and self.config.get("parallel", True) is not False
-        return parallel, self.config.get("maxSlices") if max_slices is None else max_slices
+        cap = None
+        if self.cloud and parallel:
+            cap = self.config.get("cloudMaxParallel", 2)
+            if not (type(cap) is int and cap >= 1):
+                raise Failed(".claude/drive-spec.json: `cloudMaxParallel` is a whole number of at least 1", REFUSE)
+        return parallel, self.config.get("maxSlices") if max_slices is None else max_slices, cap
 
     def status(self, **fields):
         script = Path(__file__).resolve().with_name("status.sh")
@@ -1276,7 +1283,7 @@ def landed_this_run(run):
     return len({r["slice"] for r in rows if r["at"] >= started})
 
 
-def pick(plan, running=(), parallel=True, max_slices=None, landed=0, local_label=None):
+def pick(plan, running=(), parallel=True, max_slices=None, landed=0, local_label=None, cap=None):
     """What to do next from the plan alone: picks with their action, or why the run stops."""
     by = {s["number"]: s for s in plan["slices"]}
     open_ = [s for s in plan["slices"] if s["state"] != "closed"]
@@ -1297,6 +1304,8 @@ def pick(plan, running=(), parallel=True, max_slices=None, landed=0, local_label
     ready = sorted((s for s in open_ if s["state"] != "held" and s["number"] not in running
                     and all(by[b]["state"] == "closed" for b in s["blockers"])), key=lambda s: s["number"])
     room = None if max_slices is None else max(0, max_slices - landed - len(running))
+    if cap is not None:
+        room = min(x for x in (room, max(0, cap - len(running))) if x is not None)
     local_busy = any(local(by[m]) for m in running)
     if not parallel and running:
         ready = []
@@ -1338,9 +1347,9 @@ def render_picks(f):
 def frontier(run, running, sequential, max_slices):
     """`pick` on the run's plan, in its mode and under its ceiling; refuses a slice carrying `agent:blocked`."""
     plan = checked_plan(run)
-    parallel, max_slices = run.mode(sequential, max_slices)
+    parallel, max_slices, cap = run.mode(sequential, max_slices)
     f = pick(plan, running, parallel, max_slices, landed_this_run(run) if max_slices is not None else 0,
-             (run.config.get("localOnly") or {}).get("label"))
+             (run.config.get("localOnly") or {}).get("label"), cap)
     if f["stop"] == "blocked":
         raise Failed(", ".join(f"#{m}" for m in f["blocked"]) + " carries agent:blocked: the operator removes it "
                      "after fixing, and only then does the run go on", REFUSE)
@@ -2026,10 +2035,10 @@ def cmd_preview(spec, sequential, max_slices, dry_run):
     plan = checked_plan(run)
     base = run.base()
     flags = {"sequential": "true" if sequential else "false", "max": "" if max_slices is None else max_slices}
-    parallel, max_slices = run.mode(sequential, max_slices)
+    parallel, max_slices, cap = run.mode(sequential, max_slices)
     post_progress(run, plan, base, spec_pr_of(run, base, plan["spec_branch"]))
     print(f"base: {base}\nspec branch: {plan['spec_branch']}\nworktree root: {run.root}\n"
-          f"mode: {'parallel' if parallel else 'sequential'}\nceiling: {max_slices or 'none'}\n")
+          f"mode: {'sequential' if not parallel else f'parallel, at most {cap} at once' if cap else 'parallel'}\nceiling: {max_slices or 'none'}\n")
     print(render(plan))
     summary = progress_summary(plan)
     if dry_run:

@@ -1091,6 +1091,14 @@ class Pick(unittest.TestCase):
         self.assertEqual(f["stop"], "ceiling")
         self.assertIn("stop: ceiling, 2 landed this run", ds.render_picks(f))
 
+    def test_cap_limits_how_many_run_at_once(self):
+        plan = slices((11, "todo", [], []), (12, "todo", [], []), (13, "todo", [], []))
+        self.assertEqual(picked(ds.pick(plan, cap=2)), [(11, "build"), (12, "build")])
+        self.assertEqual(picked(ds.pick(plan, running=[11], cap=2)), [(12, "build")])
+        f = ds.pick(plan, running=[11, 12], cap=2)
+        self.assertEqual((picked(f), f["stop"]), ([], None))
+        self.assertEqual(picked(ds.pick(plan, running=[11], cap=3, max_slices=2, landed=0)), [(12, "build")])
+
     def test_only_held_and_what_they_block_stops(self):
         f = ds.pick(slices((11, "closed", [], []), (12, "held", [11], []), (13, "todo", [12], [])))
         self.assertEqual((f["stop"], f["held"]), ("held", [12]))
@@ -1100,6 +1108,25 @@ class Pick(unittest.TestCase):
         self.assertEqual(ds.pick(slices((11, "closed", [], [])))["stop"], "done")
         f = ds.pick(slices((11, "todo", [], ["agent:blocked"])))
         self.assertEqual((f["stop"], f["blocked"]), ("blocked", [11]))
+
+
+class Mode(unittest.TestCase):
+    def mode(self, config, cloud, sequential=False):
+        return ds.Run.mode(types.SimpleNamespace(config=config, cloud=cloud), sequential, None)
+
+    def test_cloud_caps_parallel_slices_at_two_by_default(self):
+        self.assertEqual(self.mode({}, True), (True, None, 2))
+        self.assertEqual(self.mode({"cloudMaxParallel": 4}, True), (True, None, 4))
+
+    def test_no_cap_locally_or_when_sequential(self):
+        self.assertEqual(self.mode({"cloudMaxParallel": 4}, False), (True, None, None))
+        self.assertEqual(self.mode({}, True, sequential=True), (False, None, None))
+
+    def test_a_cap_that_is_not_a_whole_number_of_at_least_one_refuses(self):
+        for bad in (0, "2", True, 1.5):
+            with self.assertRaises(ds.Failed) as e:
+                self.mode({"cloudMaxParallel": bad}, True)
+            self.assertEqual(e.exception.code, ds.REFUSE)
 
 
 class Brief(unittest.TestCase):
