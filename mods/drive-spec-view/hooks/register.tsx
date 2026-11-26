@@ -437,12 +437,10 @@ export const register: Register = on => {
         <Box key={`slice-${s.number}`} flexDirection="column" borderStyle="round" borderColor={s.state === 'todo' ? 'subtle' : c} paddingX={1}>
           <Box flexDirection="row" gap={1}>
             <Box flexShrink={0}><Text color={c} bold>{glyph}</Text></Box>
-            <Box flexShrink={0}>{ref(s.number, s.pr && m.repoUrl ? `${m.repoUrl}/pull/${s.pr}` : issue(s.number), `ref-${s.number}`)}</Box>
-            <Box flexGrow={1} flexShrink={1}>
-              <Text dimColor={s.state === 'landed'} wrap="truncate-end">{s.title || '(title not read yet)'}</Text>
-            </Box>
+            <Box flexGrow={1}>{ref(s.number, s.pr && m.repoUrl ? `${m.repoUrl}/pull/${s.pr}` : issue(s.number), `ref-${s.number}`)}</Box>
             <Box flexShrink={0}><Text color={s.state === 'todo' ? 'subtle' : c}>{right}</Text></Box>
           </Box>
+          <Text dimColor={s.state === 'landed'} wrap="wrap">{s.title || '(title not read yet)'}</Text>
           {a && (
             <Box flexDirection="row" gap={1}>
               <Text color="subtle">⤷</Text>
