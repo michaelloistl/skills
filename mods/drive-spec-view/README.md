@@ -5,6 +5,7 @@ One drive-spec run at a glance: its step, state and question, and each slice wit
 ## Mod
 
 - `/drive-spec-view` opens the pane, or closes it. `/drive-spec-view <spec>` shows that spec; `/drive-spec-view follow` goes back to following.
+- **Opens on its own** once per session, when a run whose status file names this session appears: the web app holds a typed command until the turn ends. Closed, it stays closed.
 - **Which run**, first match wins: the spec picked with `/drive-spec-view <spec>` or in the list; the run whose status file names this session in `session_id`; the repo's only `running` or `waiting` run. With none, the pane lists the repo's runs, waiting first, each a button that shows it.
 - **Status line:** while a run is picked, the session's status line reads `drive-spec #<n> · <state> · <step> <i>/11 · <landed>/<total> landed`, with `▲ waiting on you` while a blocking question waits. It shows with the pane closed.
 - **Pane:** the spec and why it is shown, then cards for the question, the run (state, step, `updated … ago`, red once a `running` run is quiet for 10 minutes, summary, next), the 11 steps, progress (landed bar, spec PR, base, branch) and one card per slice. Slice states, glyphs and agent rows are the Rex pane's below. Issue and PR numbers are links.

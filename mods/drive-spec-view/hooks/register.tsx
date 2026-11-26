@@ -21,6 +21,9 @@ const EMPTY: Model = { repoUrl: '', runs: [] }
 const model = atom({ plugin: 'drive-spec-view', key: 'model' } as const, EMPTY, { shape: 'model-1' })
 // A spec the person picked for this session; 0 to follow the session's own run.
 const pinned = atom({ plugin: 'drive-spec-view', key: 'pinned' } as const, 0, { shape: 'pinned-1' })
+// The spec whose run this session drives that the pane already opened for on its own; 0 for none. Kept in the
+// session's state so a reload does not open it again once the person has closed it.
+const autoOpened = atom({ plugin: 'drive-spec-view', key: 'autoOpened' } as const, 0, { shape: 'auto-opened-1' })
 
 // ── pure: the status file and plan as the view shows them ──────────────────
 
@@ -320,6 +323,11 @@ async function load($: EngineInterface, forcePlan: boolean): Promise<void> {
     }
     await update($, model, () => ({ repoUrl: githubUrl(str(status.repo)) || repoUrl, run, runs: runRows(runs) }))
     $.ui.status(statusLine(run))
+    // The web app queues a typed command behind the turn: open the pane unasked once this session's run shows up.
+    if (why === 'this session' && (await read($, autoOpened)) !== spec) {
+      await update($, autoOpened, () => spec)
+      if (!(await isOpen($))) void $.ui.open({ id: PANE, title: TITLE })
+    }
   } catch (err) {
     await update($, model, m => ({ ...m, error: err instanceof Error ? err.message : String(err) }))
   }

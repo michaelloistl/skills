@@ -49,6 +49,6 @@ export type Model = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'drive-spec-view': { model: Shaped<Model>; pinned: Shaped<number> }
+    'drive-spec-view': { model: Shaped<Model>; pinned: Shaped<number>; autoOpened: Shaped<number> }
   }
 }

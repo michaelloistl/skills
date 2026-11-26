@@ -1,5 +1,5 @@
 import type { CommandRunInput, UiPane } from 'claude-code'
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { boardSlices, githubUrl, lastAction, pickRun, statusLine } from './register'
 
@@ -146,6 +146,50 @@ test('shows the run this session drives, with its steps, slices and agent, and p
   await until(() => Boolean(lines.at(-1)?.includes('#10')))
   expect(await $.command.run(CMD(''))).toEqual({ text: 'drive-spec pane closed.' })
   expect(panes).toEqual([])
+})
+
+test('opens the pane on its own once this session drives a run, and not again once closed', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'drive-spec-view' } }))
+  let panes: UiPane[] = []
+  let opens = 0
+  on('ui.open', (_, e) => {
+    opens++
+    panes = [{ id: e.id, title: 'drive-spec', isShown: true, isFocused: false, isPlaced: true }]
+    return { value: { isPlaced: true } }
+  })
+  on('ui.panes', () => ({ value: panes }))
+  const lines: (string | undefined)[] = []
+  on('ui.status', (_, e) => {
+    lines.push(e.text)
+    return { value: undefined }
+  })
+  const clock = mock.clock(on, { now: NOW })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('env.get', () => ({ value: undefined }))
+  on('fs.exists', (_, e) => ({ value: e.path === STATUS }))
+  on('fs.list', () => ({ value: [{ name: 'spec-10.json', kind: 'file' as const, size: 1, mtimeMs: NOW, isLink: false }] }))
+  on('fs.stat', () => ({ value: { kind: 'file' as const, size: 0, mtimeMs: NOW, isLink: false } }))
+  on('fs.read', (_, e) => {
+    const text = FILES[e.path]
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('process.run', () => ({
+    value: { exitCode: 0, stdout: `${COMMON}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await until(() => opens > 0)
+  expect(opens).toBe(1)
+
+  panes = []
+  lines.length = 0
+  await clock.advance(2_000)
+  await until(() => lines.length > 0)
+  expect(lines.at(-1)).toContain('drive-spec #10')
+  expect(opens).toBe(1)
 })
 
 describe('which run', () => {
