@@ -1,0 +1,6 @@
+{
+  "name": "drive-spec-view",
+  "version": "0.1.0",
+  "description": "Pane and status line for one drive-spec run: its step, question and slices with their agents",
+  "types": "./types/index.d.ts"
+}

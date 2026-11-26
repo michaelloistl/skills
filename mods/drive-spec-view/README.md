@@ -1,6 +1,23 @@
 # drive-spec-view
 
-A Rex pane showing one drive-spec run: its step, state and question, and each slice with the agent building it. It's read-only. It has no Claude Code mod; `rex/drive_spec_view.py` is a terminal program using only the Python 3 standard library.
+One drive-spec run at a glance: its step, state and question, and each slice with the agent building it. It's read-only. It comes two ways: a Claude Code mod, for any session including cloud sessions, and a Rex pane, `rex/drive_spec_view.py`, a terminal program using only the Python 3 standard library.
+
+## Mod
+
+- `/drive-spec-view` opens the pane, or closes it. `/drive-spec-view <spec>` shows that spec; `/drive-spec-view follow` goes back to following.
+- **Which run**, first match wins: the spec picked with `/drive-spec-view <spec>` or in the list; the run whose status file names this session in `session_id`; the repo's only `running` or `waiting` run. With none, the pane lists the repo's runs, waiting first, each a button that shows it.
+- **Status line:** while a run is picked, the session's status line reads `drive-spec #<n> · <state> · <step> <i>/11 · <landed>/<total> landed`, with `▲ waiting on you` while a blocking question waits. It shows with the pane closed.
+- **Pane:** the spec and why it is shown, then cards for the question, the run (state, step, `updated … ago`, red once a `running` run is quiet for 10 minutes, summary, next), the 11 steps, progress (landed bar, spec PR, base, branch) and one card per slice. Slice states, glyphs and agent rows are the Rex pane's below. Issue and PR numbers are links.
+- **Refresh:** the status files every 2 seconds, from `$GIT_COMMON_DIR/drive-spec/status/` of the session's folder. The plan comes from `drive-spec plan <spec> --json` every 60 seconds, with the script from `~/.claude-on/skills` or `~/.claude/skills`. Once every slice is closed it is read only on `↻ refresh`, and after a failed read the next waits 10 minutes.
+- **Cloud sessions:** `scripts/cloud-setup.sh` copies the mod to `~/.claude/mods/` and names it in `CLAUDE_CODE_PLUGIN_DIRS`. Locally, add this folder to `CLAUDE_CODE_PLUGIN_DIRS` in the `env` of `settings.json`.
+
+```sh
+claude plugin validate mods/drive-spec-view
+claude plugin test mods/drive-spec-view
+```
+
+## Rex pane
+
 
 - `alt+cmd+r`, or Toggle drive-spec Run in the command palette, opens the view to the right of the focused pane, or closes it. The action is `drive_spec_view` in `rex/drive_spec_view.lua`.
 - **Which run:** it follows the pane it opened beside, reading that pane's folder every 5 seconds through the Rex API. The run shown is, first match wins:

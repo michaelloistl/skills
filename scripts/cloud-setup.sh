@@ -43,6 +43,18 @@ for hook in "$src"/hooks/*; do
   [ -f "$hook" ] && [ -x "$hook" ] && install -m 755 "$hook" ~/.claude/hooks/
 done
 
+# Mods that work in a cloud session, loaded through CLAUDE_CODE_PLUGIN_DIRS in
+# settings.json below. Their Rex panes stay behind: no Rex here.
+CLOUD_MODS=(drive-spec-view)
+mkdir -p ~/.claude/mods
+for mod in "${CLOUD_MODS[@]}"; do
+  rm -rf ~/.claude/mods/"$mod"
+  cp -R "$src/mods/$mod" ~/.claude/mods/
+  rm -rf ~/.claude/mods/"$mod"/rex
+done
+plugin_dirs=$(printf "$HOME/.claude/mods/%s:" "${CLOUD_MODS[@]}")
+plugin_dirs=${plugin_dirs%:}
+
 cat > ~/.claude/CLAUDE.md <<'EOF'
 Be extremely concise. Sacrifice grammar for the sake of concision.
 
@@ -73,7 +85,7 @@ The GitHub proxy rejects GraphQL, so `gh issue …` and `gh pr …` fail with 40
 The proxy also rejects remote branch deletion: leave merged branches on origin.
 EOF
 
-# Hooks as hooks/README.md registers them.
+# Hooks as hooks/README.md registers them; the mods' folders go in `env` after.
 cat > ~/.claude/settings.json <<'EOF'
 {
   "attribution": { "commit": "", "pr": "", "sessionUrl": false },
@@ -92,5 +104,8 @@ cat > ~/.claude/settings.json <<'EOF'
   }
 }
 EOF
+settings=~/.claude/settings.json
+jq --arg dirs "$plugin_dirs" '.env.CLAUDE_CODE_PLUGIN_DIRS = $dirs' "$settings" > "$settings.tmp" \
+  && mv "$settings.tmp" "$settings"
 
 rm -rf "$src"
