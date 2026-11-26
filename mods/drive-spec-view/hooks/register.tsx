@@ -450,7 +450,11 @@ export const register: Register = on => {
               {a.quiet !== undefined && a.quiet > STALE_AGENT_S && !a.isQueued && (
                 <Box flexShrink={0}><Text color="warning" bold>{`⚠ quiet ${ago(a.quiet)}`}</Text></Box>
               )}
-              <Text dimColor wrap="truncate-end">{a.isQueued ? 'waiting to integrate' : (a.action ?? '')}</Text>
+            </Box>
+          )}
+          {a && (a.isQueued || a.action) && (
+            <Box paddingLeft={2}>
+              <Text dimColor wrap="wrap">{a.isQueued ? 'waiting to integrate' : a.action}</Text>
             </Box>
           )}
         </Box>
