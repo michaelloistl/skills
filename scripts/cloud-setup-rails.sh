@@ -7,6 +7,7 @@
 #   #!/bin/bash
 #   set -euo pipefail
 #   export SKILLS_REF=<full commit sha>
+#   export RUBIES="3.4.13"   # optional: Rubies baked into the cached image
 #   f=$(mktemp)
 #   curl -fsSL "https://raw.githubusercontent.com/michaelloistl/skills/$SKILLS_REF/scripts/cloud-setup-rails.sh" -o "$f"
 #   bash "$f" </dev/null
@@ -43,13 +44,20 @@ apt_pid=$!
 # missing, as rv prebuilts (seconds, not minutes) linked into rbenv.
 cat > /usr/local/bin/ruby-up <<'EOF'
 #!/usr/bin/env bash
-# Idempotent: install the Rubies this repo's .ruby-version files ask for.
+# Idempotent: install the Rubies named as arguments, or with none, those this
+# repo's .ruby-version files ask for.
 set -euo pipefail
 versions="$(rbenv root)/versions"
 # rv's installer puts it in ~/.local/bin since 0.7; older ones used ~/.cargo/bin.
 rv=$(command -v rv || ls "$HOME/.local/bin/rv" "$HOME/.cargo/bin/rv" 2>/dev/null | head -1 || true)
 mkdir -p "$versions"
-for v in $(git ls-files 2>/dev/null | grep -E '(^|/)\.ruby-version$' | xargs -r cat | sed 's/^ruby-//' | sort -u); do
+if [ $# -gt 0 ]; then
+  wanted="$*"
+else
+  # Outside a repo, or with no .ruby-version, there is nothing to install.
+  wanted=$(git ls-files 2>/dev/null | grep -E '(^|/)\.ruby-version$' | xargs -r cat | sed 's/^ruby-//' | sort -u) || true
+fi
+for v in $wanted; do
   [ -x "$versions/$v/bin/ruby" ] && continue
   [ -n "$rv" ] || { echo "ruby-up: rv is not installed, so Ruby $v cannot be" >&2; exit 1; }
   "$rv" ruby install "$v" >/dev/null
@@ -104,7 +112,10 @@ wait "$apt_pid"
 (
   curl --proto '=https' --tlsv1.2 -LsSf \
     https://github.com/spinel-coop/rv/releases/latest/download/rv-installer.sh | sh >/dev/null
-  ruby-up # warms the cache when the setup runs inside the repo; no-op otherwise
+  # The setup runs outside the repo, so it bakes in only the Rubies RUBIES
+  # names; a session installs any other its repo asks for, at session start.
+  # shellcheck disable=SC2086 # RUBIES is a space-separated list
+  ruby-up ${RUBIES:-}
 ) &
 pids+=($!)
 
