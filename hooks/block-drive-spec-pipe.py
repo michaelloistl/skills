@@ -37,8 +37,23 @@ def pipes_out(rest):
 # Only where a command starts (a line, or after `;`, `&`, `|`, `(`, `$(`, past any VAR=value prefixes), so a
 # mention inside text, such as a heredoc or a commit message, is not read as a call.
 START = r"(?:^|[;&|(\n])\s*(?:[A-Za-z_]\w*=\S*\s+)*"
+def quoted(upto):
+    """True when position `upto` of the command sits inside a quoted string, such as a grep pattern."""
+    quote, i = None, 0
+    while i < upto:
+        c = cmd[i]
+        if quote:
+            quote = None if c == quote else quote
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        i += 1
+    return quote is not None
+
+
 for m in re.finditer(rf"{START}(?:{callee})\s+(?:{COMMANDS})\b", cmd, re.M):
-    if pipes_out(cmd[m.end():]):
+    if not quoted(m.start() + 1) and pipes_out(cmd[m.end():]):
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
             "permissionDecisionReason": (

@@ -1351,8 +1351,9 @@ def frontier(run, running, sequential, max_slices):
     f = pick(plan, running, parallel, max_slices, landed_this_run(run) if max_slices is not None else 0,
              (run.config.get("localOnly") or {}).get("label"), cap)
     if f["stop"] == "blocked":
-        raise Failed(", ".join(f"#{m}" for m in f["blocked"]) + " carries agent:blocked: the operator removes it "
-                     "after fixing, and only then does the run go on", REFUSE)
+        raise Failed(", ".join(f"#{m}" for m in f["blocked"]) + " carries agent:blocked: once the operator says "
+                     "it is fixed, " + ", ".join(f"`drive-spec unblock {run.spec} {m}`" for m in f["blocked"])
+                     + ", and only then does the run go on", REFUSE)
     if f["stop"] == "done" and run.current().get("step") == "build":
         # The last slice closed outside `land` (closed by hand, or on a resume): mark review begun here.
         run.status(step="review", state="running", summary=f"{progress_summary(plan)}; reviewing the spec branch",
@@ -1386,31 +1387,68 @@ def ensure_excluded(run):
             f.write(rel + "\n")
 
 
-def bootstrap(run, wt):
+def bootstrap(run, wt, wait=None):
     """Bootstrap a worktree until it has succeeded once with this command: a marker in the worktree's own git dir
-    records it, so a worktree whose bootstrap failed is bootstrapped again on the next try. Output goes to a log."""
+    records it, so a worktree whose bootstrap failed is bootstrapped again on the next try. Output goes to a log.
+    The command runs detached: with `wait`, the call returns PENDING after that many minutes while it runs on, and
+    the next call waits on the same run rather than starting another."""
     command = run.config.get("bootstrap")
     if not command:
-        return
-    marker = Path(git(wt, "rev-parse", "--absolute-git-dir")) / "drive-spec-bootstrap"
+        return 0
+    gitdir = Path(git(wt, "rev-parse", "--absolute-git-dir"))
+    marker = gitdir / "drive-spec-bootstrap"
     digest = hashlib.sha256(command.encode()).hexdigest()
     try:
         if marker.read_text().strip() == digest:
-            return
+            return 0
     except OSError:
         pass
-    logs = run.notes / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    log = logs / f"bootstrap-{Path(wt).name}.log"
-    with open(log, "w") as out:
-        code = subprocess.run(["sh", "-c", command], cwd=wt, stdin=subprocess.DEVNULL, stdout=out,
-                              stderr=subprocess.STDOUT).returncode
+    state, done = gitdir / "drive-spec-bootstrap.pid", gitdir / "drive-spec-bootstrap.exit"
+    log = run.notes / "logs" / f"bootstrap-{Path(wt).name}.log"
+    proc = None
+    try:
+        pid, ran = state.read_text().split()[:2]
+        pid = int(pid)
+        running = ran == digest and (done.is_file() or alive(pid))
+    except (OSError, ValueError):
+        running = False
+    if not running:
+        done.unlink(missing_ok=True)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "w") as out:
+            proc = subprocess.Popen(["sh", "-c", f'( {command}\n); echo $? > "$DRIVE_SPEC_BOOTSTRAP_EXIT"'], cwd=wt,
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=True, env=dict(os.environ, DRIVE_SPEC_BOOTSTRAP_EXIT=str(done)))
+        pid = proc.pid
+        state.write_text(f"{pid} {digest}\n")
+    deadline = None if wait is None else time.monotonic() + wait * 60
+    while not (done.is_file() and done.read_text().strip()):
+        if (proc.poll() is not None) if proc else not alive(pid):
+            time.sleep(0.2)
+            if not (done.is_file() and done.read_text().strip()):
+                state.unlink(missing_ok=True)
+                raise Failed(f"bootstrap in {wt} died without an exit code; log {log}. Run this command again: it "
+                             "bootstraps again")
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            last = next((x.strip() for x in reversed(log.read_text(errors="replace").splitlines()) if x.strip()), "")
+            print(f"bootstrap of {Path(wt).name} still running after {wait:g} minutes (pid {pid}); log {log}"
+                  + (f"; last line: {last[:200]}" if last else "")
+                  + "; run this same command again to keep waiting", flush=True)
+            return PENDING
+        time.sleep(max(POLL_SECONDS, 0.1))
+    if proc:
+        proc.wait()
+    code = int(done.read_text().strip())
+    state.unlink(missing_ok=True)
+    done.unlink(missing_ok=True)
     if code != 0:
-        print("".join(log.read_text().splitlines(keepends=True)[-40:]), end="")
+        print("".join(log.read_text(errors="replace").splitlines(keepends=True)[-40:]), end="")
         raise Failed(f"bootstrap exited {code} in {wt}; log {log}. Fix the cause, then run this command again: "
                      "it bootstraps again until one succeeds")
     marker.write_text(digest + "\n")
     print(f"bootstrapped {Path(wt).name}; log {log}")
+    return 0
 
 
 def fill(name, values, conditions=None):
@@ -1491,7 +1529,7 @@ def write_brief(run, name, text):
     return path
 
 
-def cmd_start(spec, m):
+def cmd_start(spec, m, wait=None):
     run = Run(spec)
     plan = checked_plan(run)
     by = {s["number"]: s for s in plan["slices"]}
@@ -1503,7 +1541,8 @@ def cmd_start(spec, m):
     if s["state"] == "held":
         raise Failed(f"#{m} is held: only a local session builds it", REFUSE)
     if "agent:blocked" in s["labels"]:
-        raise Failed(f"#{m} carries agent:blocked: the operator removes it after fixing", REFUSE)
+        raise Failed(f"#{m} carries agent:blocked: once the operator says it is fixed, "
+                     f"`drive-spec unblock {spec} {m}`", REFUSE)
     waiting = [f"#{b}" for b in s["blockers"] if by[b]["state"] != "closed"]
     if waiting:
         raise Failed(f"#{m} is not on the frontier: blocked by {', '.join(waiting)}", REFUSE)
@@ -1534,7 +1573,8 @@ def cmd_start(spec, m):
             else:
                 start = f"origin/{plan['spec_branch']}"
             git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, start)
-    bootstrap(run, wt)
+    if bootstrap(run, wt, wait) == PENDING:
+        return PENDING
     clear_reds(run, wt)
     if "agent:in-progress" not in s["labels"]:
         add_label(run, m, "agent:in-progress")
@@ -1980,7 +2020,7 @@ def cmd_build(spec, sequential, max_slices, wait=None):
 
 # open, confirm, cleanup
 
-def cmd_open(spec, base):
+def cmd_open(spec, base, wait=None):
     run = Run(spec)
     plan = make_plan(run)
     if plan["refuse"]:
@@ -2019,7 +2059,8 @@ def cmd_open(spec, base):
         git(wt, "push", "--quiet", "-u", "origin", branch)
     if git(wt, "rev-parse", "HEAD") != git(wt, "rev-parse", f"origin/{branch}"):
         raise Failed(f"{wt} is not at origin/{branch}: it has diverged; settle it by hand", REFUSE)
-    bootstrap(run, wt)
+    if bootstrap(run, wt, wait) == PENDING:
+        return PENDING
     run.status(step="preview", state="running", summary=f"spec worktree {how}: {branch}", next="drive-spec preview",
                branch=branch, base=base)
     print(f"worktree {wt} on {branch} ({how})")
@@ -2088,7 +2129,9 @@ def coverage(run):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         item = COVERAGE_ITEM.match(line)
-        arrows = list(COVERAGE_ARROW.finditer(item.group(1))) if item else []
+        if not item:
+            continue
+        arrows = list(COVERAGE_ARROW.finditer(item.group(1)))
         for arrow in reversed(arrows):
             requirement, target = item.group(1)[:arrow.start()].strip(), item.group(1)[arrow.end():].strip()
             if requirement and (target := coverage_target(target)) is not None:
@@ -2120,9 +2163,36 @@ def answered_refs(run):
     return {ref.strip() for group in re.findall(r"^- \[([^\]]+)\]", text, re.M) for ref in group.split(",")}
 
 
+EXPLORED_NOTES = ("conflicts.md", "coverage.md", "questions.md")
+
+
+def issues_digest(run, plan):
+    """A digest of the spec and its open slices as the tracker has them. Notes explored against the same digest
+    still hold however far the base branch has moved, so a resumed run keeps them."""
+    open_ = {x["number"] for x in plan["slices"] if x["state"] != "closed"}
+    spec_issue = json.loads(gh(f"repos/{run.repo}/issues/{run.spec}", "--jq", "{title,body}"))
+    slices = sorted([i["number"], i.get("title") or "", i.get("body") or ""] for i in spec_issues(run)
+                    if i["number"] in open_)
+    text = json.dumps({"spec": [spec_issue.get("title") or "", spec_issue.get("body") or ""], "slices": slices})
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def notes_match(run, plan):
+    """True when every note explore writes is there, explored against the spec and open slices as they stand."""
+    try:
+        kept = json.loads((run.notes / "explored.json").read_text())["digest"]
+    except (OSError, ValueError, KeyError):
+        return False
+    names = list(EXPLORED_NOTES) + [f"issue-{x['number']}.md" for x in plan["slices"] if x["state"] != "closed"]
+    return all((run.notes / name).is_file() for name in names) and kept == issues_digest(run, plan)
+
+
 def cmd_explore(spec):
     run = Run(spec)
     plan = checked_plan(run)
+    if notes_match(run, plan):
+        print(f"notes still match the spec and its open slices as last explored: next `drive-spec explored {spec}`")
+        return 0
     open_ = [x["number"] for x in plan["slices"] if x["state"] != "closed"]
     todo = [m for m in open_ if not (run.notes / f"issue-{m}.md").is_file()]
     wt = run.root / f"spec-{spec}"
@@ -2153,13 +2223,13 @@ def cmd_explored(spec):
     started = run_started(run)
     missing = [f"issue-{x['number']}.md" for x in plan["slices"]
                if x["state"] != "closed" and not (run.notes / f"issue-{x['number']}.md").is_file()]
-    fresh = ["conflicts.md", "coverage.md", "questions.md"]
+    fresh = list(EXPLORED_NOTES)
     missing += [name for name in fresh if not (run.notes / name).is_file()]
     if missing:
         raise Failed(f"explore is not done: no {', '.join(missing)} in {run.notes}", REFUSE)
     stale = [name for name in fresh
              if datetime.fromtimestamp((run.notes / name).stat().st_mtime, timezone.utc) < started]
-    if stale:
+    if stale and not notes_match(run, plan):
         raise Failed(f"{', '.join(stale)} in {run.notes} predate this run: check the spec and the open slices "
                      "again and write them fresh", REFUSE)
     if conflicts_in(run):
@@ -2190,6 +2260,7 @@ def cmd_explored(spec):
                      + "; ".join(f"{ref}: {q}" for ref, q in waiting)
                      + f". Ask them before any build: `drive-spec ask {spec} '<question>' --ref "
                      + ",".join(ref for ref, _ in waiting) + "`", REFUSE)
+    (run.notes / "explored.json").write_text(json.dumps({"digest": issues_digest(run, plan), "at": stamp()}))
     open_ = sum(x["state"] != "closed" for x in plan["slices"])
     run.status(step="build", state="running", summary=f"explored {open_} open slice(s), no conflicts; "
                f"{progress_summary(plan)}", next="drive-spec frontier", branch=plan["spec_branch"])
@@ -2223,6 +2294,66 @@ def checklist(run, wt):
     if shown.returncode != 0:
         return None
     return [m.group(1).strip() for m in re.finditer(r"^## +(.+)$", shown.stdout, re.M)]
+
+
+MD_LINK = re.compile(r"\]\(([^)\s#]+)(?:#[^)]*)?\)")
+
+
+def base_blob(run, wt, path):
+    """`path`'s text on base, or None when base has no such file."""
+    ref = f"origin/{run.base()}:{path}"
+    kind = subprocess.run(["git", "-C", str(wt), "cat-file", "-t", ref], capture_output=True, text=True)
+    if kind.stdout.strip() != "blob":
+        return None
+    return subprocess.run(["git", "-C", str(wt), "show", ref], capture_output=True, text=True).stdout
+
+
+def md_links(src, text):
+    """The repo-relative paths of the Markdown files `text`, the body of `src`, links to."""
+    out = []
+    for link in MD_LINK.findall(text):
+        if re.match(r"[a-z]+:", link) or not link.endswith(".md"):
+            continue
+        out.append(os.path.normpath(link.lstrip("/") if link.startswith("/")
+                                    else os.path.join(os.path.dirname(src), link)))
+    return out
+
+
+def rule_docs(run, wt):
+    """The written rules a reviewer reads in full, as repo-relative paths on base: `ruleDocs` from the config, else
+    the instruction files (`CLAUDE.md`, `AGENTS.md`, what `CLAUDE.md` imports), `CODING_STANDARDS.md`, and the docs
+    they link. With `CODING_STANDARDS.md` on base, an instruction file's links count only under a `## ` heading
+    that it names, so a list of records or prototypes is no rule."""
+    if run.config.get("ruleDocs"):
+        return sorted(run.config["ruleDocs"])
+    texts = {}
+
+    def take(path):
+        if path not in texts and (text := base_blob(run, wt, path)) is not None:
+            texts[path] = text
+        return texts.get(path)
+
+    instructions = [x for x in ("CLAUDE.md", "AGENTS.md") if take(x) is not None]
+    for imported in re.findall(r"^@(\S+\.md)\s*$", texts.get("CLAUDE.md", ""), re.M):
+        if take(imported) is not None and imported not in instructions:
+            instructions.append(imported)
+    standards = take("CODING_STANDARDS.md")
+    for link in md_links("CODING_STANDARDS.md", standards or ""):
+        take(link)
+    for doc in instructions:
+        if standards is None:
+            sections = [texts[doc]]
+        else:
+            sections = [body for title, body in re.findall(r"^## +(.+?)\s*\n(.*?)(?=^## |\Z)", texts[doc], re.M | re.S)
+                        if title.strip().lower() in standards.lower()]
+        for body in sections:
+            for link in md_links(doc, body):
+                take(link)
+    return sorted(texts)
+
+
+def changed_files(run, wt, head):
+    return git(wt, "diff", "--name-only", "--diff-filter=d", f"origin/{run.base()}...{head}").split()
 
 
 def read_round(run, k, wt):
@@ -2259,6 +2390,14 @@ def read_round(run, k, wt):
             faults.append(f"finding {n}: a pre-existing finding names no file base has (`path`)")
         if x["kind"] == "judgement" and not str(x.get("recommend") or "").strip():
             faults.append(f"finding {n}: a judgement call recommends nothing (`recommend`)")
+    checked = data.get("checked")
+    if not isinstance(checked, dict) or not all(isinstance(v, list) for v in checked.values()):
+        faults.append("no `checked` map of each rule doc, read in full, to the changed files it was applied to")
+    else:
+        faults += [f"checked: no entry for {doc}: read it in full" for doc in rule_docs(run, wt) if doc not in checked]
+        covered = {f for v in checked.values() for f in v}
+        faults += [f"checked: {f} is in the change, under no rule doc: read it in full"
+                   for f in changed_files(run, wt, head) if f not in covered]
     items = checklist(run, wt)
     if items is not None:
         triggered = data.get("triggered")
@@ -2279,6 +2418,31 @@ def where(x):
 
 def to_fix(findings):
     return [x for x in findings if x["kind"] in ("rule", "bug")]
+
+
+def finding_key(x):
+    """What makes two rounds' findings the same: the rule and the file for a rule finding, the file for a bug."""
+    return (x["kind"], " ".join(str(x.get("rule") or "").split()).lower(), x.get("path") or "")
+
+
+def review_stop(run, k, rules, result):
+    """Why round k's fixes wait for the operator, or "". Past the cap a round goes on while each raises findings
+    the last did not, since that is a review still finding things rather than fixes that do not hold; a finding
+    raised again, a cap of one, or twice the cap stops it. An answer recorded after the round lets it go on."""
+    cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
+    decisions = run.notes / "decisions.md"
+    if k < cap or (decisions.is_file() and decisions.stat().st_mtime > result.stat().st_mtime):
+        return ""
+    ask = (f"ask the operator whether to go on (`drive-spec ask {run.spec} ...`); once answered, "
+           f"`drive-spec review {run.spec}` hands the round to its fixer")
+    if k >= 2 * cap or k == 1:
+        return f"{k} review rounds, and round {k} raised {len(rules)} finding(s) to fix: {ask}"
+    earlier = {finding_key(x) for x in to_fix(json.loads(round_file(run, k - 1, "json").read_text())["findings"])}
+    again = [x for x in rules if finding_key(x) in earlier]
+    if again:
+        return (f"round {k} raised again what round {k - 1} did: {', '.join(where(x) for x in again)}; its fixes "
+                f"did not hold: {ask}")
+    return ""
 
 
 def judgement_calls(round_, base):
@@ -2381,6 +2545,9 @@ def cmd_review(spec):
         if data["head"] == head:
             fix = round_file(run, k, "fix.md")
             if not fix.is_file():
+                stop = review_stop(run, k, rules, result)
+                if stop:
+                    raise Failed(stop, REFUSE)
                 findings = "\n".join(f"{n}. {where(x)}: {' '.join(x['finding'].split())}\n   "
                                      + (f"Rule: {x['rule']}" if x["kind"] == "rule" else f"Fails: {x['fails']}")
                                      for n, x in enumerate(rules, 1))
@@ -2394,15 +2561,6 @@ def cmd_review(spec):
             print(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`; then "
                   f"`drive-spec review {spec}` again")
             return 0
-        cap = run.config.get("reviewRounds") or REVIEW_ROUNDS
-        answered = decided and (run.notes / "decisions.md").stat().st_mtime > result.stat().st_mtime
-        before = len(to_fix(json.loads(round_file(run, k - 1, "json").read_text())["findings"])) if k > 1 else None
-        shrinking = before is not None and len(rules) < before
-        if k >= cap and rules and not answered and not shrinking:
-            than = f", no fewer than round {k - 1}" if before is not None else ""
-            raise Failed(f"{k} review rounds, and round {k} raised {len(rules)} finding(s) to fix{than}: ask the "
-                         f"operator whether to go on (`drive-spec ask {spec} ...`); once answered, "
-                         f"`drive-spec review {spec}` starts another round", REFUSE)
     k += 1
     (run.notes / "review").mkdir(parents=True, exist_ok=True)
     round_file(run, k, "meta.json").write_text(json.dumps({"head": head, "at": stamp()}))
@@ -2414,7 +2572,9 @@ def cmd_review(spec):
         "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
         "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
         "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
-        "out": round_file(run, k, "json"), "key": key, "guarded": "; ".join(guarded)}, {
+        "out": round_file(run, k, "json"), "key": key, "guarded": "; ".join(guarded),
+        "rules": ", ".join(f"`{x}`" for x in rule_docs(run, wt))
+        or "none found on base: read `CLAUDE.md` or `AGENTS.md` and every document they point at"}, {
         "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier),
         "keyed": bool(key), "guarded": bool(guarded), "checklisted": checklist(run, wt) is not None}) + "\n")
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
@@ -2840,6 +3000,19 @@ def cmd_finish(spec, outcome, why, slice_, step, resume, left):
     return finish(Run(spec), outcome, why, slice_, step, resume, sys.stdin.read() if left == "-" else left)
 
 
+def cmd_unblock(spec, m):
+    run = Run(spec)
+    plan = checked_plan(run)
+    s = next((x for x in plan["slices"] if x["number"] == m), None)
+    if not s:
+        raise Failed(f"#{m} is not a slice of #{spec}", REFUSE)
+    if "agent:blocked" not in s["labels"]:
+        raise Failed(f"#{m} is not blocked", REFUSE)
+    remove_label(run, m, "agent:blocked")
+    print(f"unblocked #{m}")
+    return 0
+
+
 def cmd_halt(spec, m, why):
     run = Run(spec)
     add_label(run, m, "agent:blocked")
@@ -2888,6 +3061,8 @@ def main():
     st = sub.add_parser("start", help="open a frontier slice's worktree, label it, print the implementer brief")
     st.add_argument("spec")
     st.add_argument("slice")
+    st.add_argument("--wait-minutes", type=float, dest="wait",
+                    help="return after this long, exit 6, while the bootstrap runs on; run again to keep waiting")
     bu = sub.add_parser("build", help="step 6: start each frontier slice, run its implementer agent, integrate and "
                                       "land it, until the frontier stops; exit 0 at done")
     bu.add_argument("spec")
@@ -2902,6 +3077,11 @@ def main():
     op = sub.add_parser("open", help="open the spec worktree: resume the spec branch from origin, or cut and push it")
     op.add_argument("spec")
     op.add_argument("--base", help="base branch; default from the status file, config, or the repo")
+    op.add_argument("--wait-minutes", type=float, dest="wait",
+                    help="return after this long, exit 6, while the bootstrap runs on; run again to keep waiting")
+    ub = sub.add_parser("unblock", help="remove agent:blocked from a slice, once the operator says it is fixed")
+    ub.add_argument("spec")
+    ub.add_argument("slice")
     co = sub.add_parser("confirm", help="with every slice closed: the spec PR closes the spec, with verification, unverified and deviations")
     co.add_argument("spec")
     co.add_argument("--left", help="what the last review left open, or `-` for stdin")
@@ -2963,7 +3143,7 @@ def main():
         elif args.cmd == "progress":
             code = cmd_progress(spec)
         elif args.cmd == "open":
-            code = cmd_open(spec, args.base)
+            code = cmd_open(spec, args.base, args.wait)
         elif args.cmd == "confirm":
             code = cmd_confirm(spec, sys.stdin.read() if args.left == "-" else args.left)
         elif args.cmd == "cleanup":
@@ -2990,7 +3170,9 @@ def main():
             running = [int(x.strip().lstrip("#")) for x in args.running.split(",") if x.strip()]
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
         elif args.cmd == "start":
-            code = cmd_start(spec, int(args.slice.lstrip("#")))
+            code = cmd_start(spec, int(args.slice.lstrip("#")), args.wait)
+        elif args.cmd == "unblock":
+            code = cmd_unblock(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "build":
             code = cmd_build(spec, args.sequential, args.max_slices, args.wait)
         elif args.cmd == "halt":

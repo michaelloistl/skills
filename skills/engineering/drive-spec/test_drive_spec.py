@@ -1189,6 +1189,13 @@ class Frontier(Cli):
         out = self.run_ds("frontier", "10")
         self.assertEqual(out.returncode, 2)
         self.assertIn("#11 carries agent:blocked", out.stderr)
+        self.assertIn("drive-spec unblock 10 11", out.stderr)
+        self.assertIn("is not blocked", self.run_ds("unblock", "10", "12").stderr)
+        self.assertIn("is not a slice of #10", self.run_ds("unblock", "10", "99").stderr)
+        out = self.run_ds("unblock", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("agent:blocked", self.gh_state()["issues"]["11"]["labels"])
+        self.assertEqual(self.run_ds("frontier", "10").returncode, 0)
 
     def test_ceiling_counts_landings_since_the_gate_was_pinned(self):
         out = self.run_ds("frontier", "10", "--max", "1")
@@ -2293,6 +2300,36 @@ class Open(DispatcherCase):
         self.run_ds("open", "10")
         self.assertEqual(boot.read_text(), "b\nb\nb\n")
 
+    WAIT = 'for i in $(seq 600); do test -f "$FIX/go" && break; sleep 0.1; done'
+
+    def test_open_waits_a_bounded_time_for_a_long_bootstrap(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
+            {"bootstrap": 'echo b >> "$COUNTER.boot"; echo installing gems; ' + self.WAIT}))
+        out = self.run_ds("open", "10", "--wait-minutes", "0.01")
+        self.assertEqual(out.returncode, 6, out.stderr)
+        self.assertIn("bootstrap of spec-10 still running", out.stdout)
+        self.assertIn("installing gems", out.stdout)
+        out = self.run_ds("open", "10", "--wait-minutes", "0.01")
+        self.assertEqual(out.returncode, 6, out.stderr)
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("open", "10", "--wait-minutes", "1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("bootstrapped spec-10", out.stdout)
+        self.assertEqual(Path(f"{self.counter}.boot").read_text(), "b\n")
+        self.assertEqual(self.status_file()["step"], "preview")
+
+    def test_start_waits_a_bounded_time_for_a_long_bootstrap(self):
+        self.run_ds("gate", "10", GATE)
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "bootstrap": self.WAIT}))
+        self.git(self.repo, "worktree", "remove", "--force", str(self.wt))
+        out = self.run_ds("start", "10", "11", "--wait-minutes", "0.01")
+        self.assertEqual(out.returncode, 6, out.stderr)
+        self.assertIn("bootstrap of issue-11 still running", out.stdout)
+        (self.tmp / "go").write_text("")
+        out = self.run_ds("start", "10", "11", "--wait-minutes", "1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("next: an implementer subagent", out.stdout)
+
     def test_refusals(self):
         self.git(self.spec_wt, "checkout", "-q", "-b", "elsewhere")
         out = self.run_ds("open", "10")
@@ -2522,6 +2559,29 @@ class Boundaries(DispatcherCase):
                            "- A UI → out of scope: Showing the version anywhere new in the UI\n")
         self.assertEqual(self.run_ds("explored", "10").returncode, 0)
 
+    def test_explored_reads_past_a_prose_line_in_coverage(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("# Coverage\n\nTwo requirements, both mapped.\n\n- Export → #11\n- Route → #12\n")
+        out = self.run_ds("explored", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_a_resumed_run_keeps_notes_when_only_the_base_moved(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export → #11\n- Route → #12\n")
+        self.assertEqual(self.run_ds("explored", "10").returncode, 0)
+        self.run_ds("gate", "10", GATE)
+        for name in ("conflicts.md", "coverage.md", "questions.md"):
+            os.utime(self.notes() / name, (0, 0))
+        out = self.run_ds("explore", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("notes still match the spec and its open slices", out.stdout)
+        self.assertEqual(self.run_ds("explored", "10").returncode, 0)
+        self.edit_state(lambda st: st["issues"]["12"].update(body=st["issues"]["12"]["body"] + "\nAlso JSON.\n"))
+        self.run_ds("gate", "10", GATE)
+        out = self.run_ds("explore", "10")
+        self.assertNotIn("notes still match", out.stdout)
+        self.assertIn("predate this run", self.run_ds("explored", "10").stderr)
+
     def test_explored_refuses_malformed_or_foreign_coverage(self):
         self.run_ds("gate", "10", GATE)
         self.write_explore("- Export to CSV\n")
@@ -2606,10 +2666,15 @@ class Boundaries(DispatcherCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("no conflicts", out.stdout)
 
-    def round_(self, k, *findings):
+    def checked(self, head):
+        changed = self.git(self.spec_wt, "diff", "--name-only", "--diff-filter=d", f"origin/main...{head}").split()
+        return {"AGENTS.md": changed}
+
+    def round_(self, k, *findings, **extra):
         meta = json.loads((self.notes() / "review" / f"round-{k}.meta.json").read_text())
         (self.notes() / "review" / f"round-{k}.json").write_text(
-            json.dumps({"head": meta["head"], "findings": list(findings)}))
+            json.dumps({"head": meta["head"], "findings": list(findings), "checked": self.checked(meta["head"]),
+                        **extra}))
 
     RULE = {"kind": "rule", "rule": "spec #10: Export to CSV", "path": "README", "line": 1,
             "finding": "No CSV export."}
@@ -2715,12 +2780,10 @@ class Boundaries(DispatcherCase):
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 2, out.stdout)
         self.assertIn("no `triggered` list", out.stderr)
-        meta = json.loads((self.notes() / "review" / "round-1.meta.json").read_text())
-        result = self.notes() / "review" / "round-1.json"
-        result.write_text(json.dumps({"head": meta["head"], "findings": [], "triggered": ["Old reports load"]}))
+        self.round_(1, triggered=["Old reports load"])
         self.assertIn("'Old reports load' is no REVIEW.md item", self.run_ds("review", "10").stderr)
-        result.write_text(json.dumps({"head": meta["head"], "triggered": ["Old exports load"], "findings": [
-            dict(self.RULE, rule="REVIEW.md: Old exports load: an export written before still loads.")]}))
+        self.round_(1, dict(self.RULE, rule="REVIEW.md: Old exports load: an export written before still loads."),
+                    triggered=["Old exports load"])
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("round 1 raised 1 finding(s) to fix", out.stdout)
@@ -2859,47 +2922,113 @@ class Boundaries(DispatcherCase):
         self.run_ds("verify", "10", str(self.spec_wt))
         self.assertNotIn("no file old.rb", self.run_ds("review", "10").stderr)
 
-    def test_rounds_past_the_cap_wait_for_the_operator(self):
+    def test_rounds_past_the_cap_wait_for_the_operator_before_any_fix(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 1}))
         self.run_ds("gate", "10", GATE)
         self.close_all()
         self.run_ds("verify", "10", str(self.spec_wt))
         self.run_ds("review", "10")
         self.round_(1, self.RULE)
-        self.run_ds("review", "10")
-        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
-        self.run_ds("verify", "10", str(self.spec_wt))
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 2)
         self.assertIn("ask the operator whether to go on", out.stderr)
+        self.assertFalse((self.notes() / "review" / "round-1.fix.md").exists())
         self.run_ds("ask", "10", "Round 1 still raised a rule finding; go on?")
         self.run_ds("answered", "10", "go on")
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue((self.notes() / "review" / "round-1.fix.md").exists())
+        self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-2.brief.md").exists())
 
-    def test_rounds_past_the_cap_go_on_while_their_findings_shrink(self):
+    def test_rounds_past_the_cap_go_on_while_each_raises_new_findings(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 2}))
         self.run_ds("gate", "10", GATE)
         self.close_all()
         self.run_ds("verify", "10", str(self.spec_wt))
+        other = dict(self.RULE, rule="spec #10: A total row", finding="The total row is missing.")
 
         def fixed_round(k, *findings):
             self.run_ds("review", "10")
             self.round_(k, *findings)
-            self.run_ds("review", "10")
+            out = self.run_ds("review", "10")
+            if out.returncode:
+                return out
             self.commit(self.spec_wt, f"fix-{k}.txt", "x\n", f"Fix round {k}")
             self.run_ds("verify", "10", str(self.spec_wt))
             return self.run_ds("review", "10")
 
-        out = fixed_round(1, self.RULE, dict(self.RULE, finding="The total row is missing."))
-        self.assertEqual(out.returncode, 0, out.stderr)
-        out = fixed_round(2, self.RULE)
+        self.assertEqual(fixed_round(1, self.RULE).returncode, 0)
+        out = fixed_round(2, other)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-3.brief.md").exists())
-        out = fixed_round(3, self.RULE)
+        out = fixed_round(3, dict(other, line=2, finding="Still no total row."))
         self.assertEqual(out.returncode, 2)
-        self.assertIn("round 3 raised 1 finding(s) to fix, no fewer than round 2", out.stderr)
+        self.assertIn("round 3 raised again what round 2 did: `README:2`", out.stderr)
+        self.assertFalse((self.notes() / "review" / "round-3.fix.md").exists())
+
+    def test_rounds_stop_at_twice_the_cap_however_new_their_findings(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 1}))
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE)
+        self.run_ds("ask", "10", "Go on?")
+        self.run_ds("answered", "10", "go on")
+        self.run_ds("review", "10")
+        self.commit(self.spec_wt, "fix-1.txt", "x\n", "Fix round 1")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(2, dict(self.RULE, rule="spec #10: A total row"))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("2 review rounds", out.stderr)
+
+    def test_a_round_names_the_rule_docs_and_changed_files_it_applied(self):
+        work = self.tmp / "rules"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        (work / "docs").mkdir()
+        (work / "docs" / "services.md").write_text("Components read `current_user`.\n")
+        (work / "docs" / "prototype.md").write_text("A record.\n")
+        (work / "GLOSSARY.md").write_text("Terms.\n")
+        (work / "CLAUDE.md").write_text("@AGENTS.md\n")
+        (work / "AGENTS.md").write_text("# Agents\n\n## Patterns\n\n- [Services](docs/services.md)\n\n"
+                                        "## Prototype records\n\n- [One](docs/prototype.md)\n")
+        (work / "CODING_STANDARDS.md").write_text("- [`AGENTS.md`](AGENTS.md): the docs under Patterns.\n"
+                                                  "- [`GLOSSARY.md`](GLOSSARY.md)\n- [ADRs](docs/adr/)\n")
+        for name in ("docs/services.md", "docs/prototype.md", "GLOSSARY.md", "CLAUDE.md", "AGENTS.md",
+                     "CODING_STANDARDS.md"):
+            self.git(work, "add", name)
+        self.git(work, "commit", "-qm", "Add rules")
+        self.git(work, "push", "-q", "origin", "main")
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        brief = (self.notes() / "review" / "round-1.brief.md").read_text()
+        self.assertIn("`AGENTS.md`, `CLAUDE.md`, `CODING_STANDARDS.md`, `GLOSSARY.md`, `docs/services.md`", brief)
+        self.assertNotIn("docs/prototype.md", brief)
+        self.assertIn("top-level `checked` map", brief)
+        self.round_(1, checked={"AGENTS.md": []})
+        err = self.run_ds("review", "10").stderr
+        self.assertIn("checked: no entry for docs/services.md", err)
+        self.assertIn("checked: a.txt is in the change, under no rule doc", err)
+        self.round_(1, checked=dict.fromkeys(["AGENTS.md", "CLAUDE.md", "CODING_STANDARDS.md", "GLOSSARY.md",
+                                              "docs/services.md"], ["a.txt"]))
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("review clean at round 1", out.stdout)
+
+    def test_a_round_with_no_checked_map_is_sent_back(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("review", "10")
+        meta = json.loads((self.notes() / "review" / "round-1.meta.json").read_text())
+        (self.notes() / "review" / "round-1.json").write_text(json.dumps({"head": meta["head"], "findings": []}))
+        self.assertIn("no `checked` map", self.run_ds("review", "10").stderr)
 
     def test_a_merge_commit_with_a_verified_tree_needs_no_gate(self):
         self.run_ds("gate", "10", GATE)

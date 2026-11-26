@@ -37,6 +37,8 @@ class BlockDriveSpecPipe(unittest.TestCase):
             "python3 - <<'PY'\ns = 'run `drive-spec verify` and quote it'\nPY\nrg -n \"a|b\" x",
             'git commit -m "Run drive-spec open bare, not | tail"',
             "python3 - <<'PY'\nedit('STATUS.md', '| `review` | `drive-spec frontier` as it stops |', 'x')\nPY",
+            'ps -eo pid,args | grep -E "rails|drive-spec verify|minitest" | grep -v grep | head',
+            "ps aux | grep -v grep | grep -E '(drive-spec verify|bin/rails test)' | head -5",
         ):
             self.assertFalse(denied(command), command)
 

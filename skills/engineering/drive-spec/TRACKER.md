@@ -24,7 +24,7 @@ REST reports state in lowercase: `open`, `closed`. The issues endpoints also ret
 
 ## Labels
 
-Created on first use, never assumed. `agent:in-progress` (green) goes on in `drive-spec start` and comes off in `drive-spec land` or `drive-spec halt`. `agent:blocked` (red) goes on in `drive-spec halt`; the operator removes it after fixing, and until then `frontier` and `start` refuse to go on.
+Created on first use, never assumed. `agent:in-progress` (green) goes on in `drive-spec start` and comes off in `drive-spec land` or `drive-spec halt`. `agent:blocked` (red) goes on in `drive-spec halt`; `drive-spec unblock <spec> <m>` removes it once the operator says the slice is fixed, and until then `frontier` and `start` refuse to go on.
 
 ## Progress comment
 

@@ -43,7 +43,7 @@ A branch already on origin keeps whatever slug it has; look it up with `git ls-r
 
 ## Bootstrap
 
-Run `bootstrap` from the config in every worktree `open` or `start` touches, from that worktree's directory, until one succeeds: a marker in the worktree's own git dir, holding the command's hash, records the success, so a failed or changed bootstrap runs again on the next call. Output goes to `logs/bootstrap-<worktree>.log`; a non-zero exit prints its tail and fails the command before any agent starts. Absent config means no bootstrap step.
+Run `bootstrap` from the config in every worktree `open` or `start` touches, from that worktree's directory, until one succeeds: a marker in the worktree's own git dir, holding the command's hash, records the success, so a failed or changed bootstrap runs again on the next call. Output goes to `logs/bootstrap-<worktree>.log`; a non-zero exit prints its tail and fails the command before any agent starts. The bootstrap runs detached, its pid in `drive-spec-bootstrap.pid` beside the marker: `open` and `start` with `--wait-minutes` return exit 6 while it runs on, and the next call waits on that run rather than starting another. Absent config means no bootstrap step.
 
 ## Remove
 
