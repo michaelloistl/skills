@@ -151,6 +151,11 @@ class States(unittest.TestCase):
         self.assertEqual(states(plan(issues, held_label="needs:desktop", cloud=True)), {11: "held", 12: "closed"})
         self.assertEqual(states(plan(issues, held_label="needs:desktop", cloud=False)), {11: "todo", 12: "closed"})
 
+    def test_deferred_slice_leaves_the_plan(self):
+        p = plan([issue(11, 10, labels=["agent:deferred"]), issue(12, 10, [11])], sub_issues=[11, 12])
+        self.assertEqual((numbers(p), p["deferred"], p["invisible"]), ([12], [11], []))
+        self.assertIn("deferred (agent:deferred, ships in its own PR, not built): #11", ds.render(p))
+
     def test_two_spec_branches_fail(self):
         with self.assertRaises(ds.Failed):
             plan([issue(11, 10)], ["agent/local-spec-10-a", "agent/local-spec-10-b"])
@@ -1208,6 +1213,29 @@ class Frontier(Cli):
         self.assertEqual(self.run_ds("frontier", "10", "--max", "1").stdout, "build #12 Wire the route\n")
 
 
+class Defer(Cli):
+    def test_takes_the_slice_out_of_the_run(self):
+        out = self.run_ds("defer", "10", "12", "--why", "ships after #10 merges")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "deferred #12\n")
+        self.assertIn("agent:deferred", self.gh_state()["issues"]["12"]["labels"])
+        self.assertIn("ships after #10 merges", self.comments(12)[0])
+        self.assertNotIn("#12", self.run_ds("frontier", "10").stdout)
+
+    def test_refuses_a_slice_being_built(self):
+        out = self.run_ds("defer", "10", "11", "--why", "later")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("#11 is building", out.stderr)
+
+    def test_refuses_a_slice_another_one_waits_on(self):
+        self.state["issues"]["11"]["labels"] = []
+        self.save()
+        out = self.run_ds("defer", "10", "11", "--why", "later")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("#12 (blocked by #11) would build without what blocks it", out.stderr)
+        self.assertEqual(self.run_ds("defer", "10", "11", "12", "--why", "later").returncode, 0)
+
+
 class Start(Cli):
     def test_fresh_slice_from_the_spec_head(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(
@@ -1237,6 +1265,24 @@ class Start(Cli):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("carry on", (self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md").read_text())
         self.assertEqual(self.gh_state()["issues"]["11"]["labels"], ["agent:in-progress"])
+
+    def test_reused_worktree_merges_what_landed_on_the_spec_branch(self):
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        self.advance_spec("fix.txt", "fix\n")
+        out = self.run_ds("start", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("merged origin/agent/local-spec-10-export into", out.stdout)
+        self.assertEqual((self.wt / "fix.txt").read_text(), "fix\n")
+        self.git(self.wt, "merge-base", "--is-ancestor", head, "HEAD")
+
+    def test_reused_worktree_that_conflicts_with_the_spec_branch_leaves_it_to_integrate(self):
+        self.commit(self.wt, "fix.txt", "mine\n", "Add fix.txt")
+        head = self.git(self.wt, "rev-parse", "HEAD")
+        self.advance_spec("fix.txt", "theirs\n")
+        out = self.run_ds("start", "10", "11")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("it conflicts, so `integrate` merges it", out.stdout)
+        self.assertEqual((self.git(self.wt, "rev-parse", "HEAD"), self.git(self.wt, "status", "--porcelain")), (head, ""))
 
     def test_local_branch_without_worktree_keeps_its_commits(self):
         head = self.git(self.wt, "rev-parse", "HEAD")
@@ -1285,8 +1331,8 @@ def result(session, text):
     print(json.dumps({"type": "result", "subtype": "success", "session_id": session, "result": text}), flush=True)
 
 
-def block(sha, verdict, line):
-    return "<report>" + json.dumps({"sha": sha, "verdict": verdict, "verdictLine": line, "deviations": [],
+def block(sha, verdict, line, deviations=()):
+    return "<report>" + json.dumps({"sha": sha, "verdict": verdict, "verdictLine": line, "deviations": list(deviations),
                                     "unverified": [], "proof": proof}) + "</report>"
 
 
@@ -1322,7 +1368,10 @@ if "--resume" in sys.argv:
     with open(os.path.join(fix, f"resumes-{m}"), "a") as f:
         f.write(json.dumps(sys.argv[1:]) + "\n")
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session}), flush=True)
-    result(session, block(head(), "green", verify()) if mode == "malformed" else "I have nothing more to add.")
+    if mode == "undeclared":
+        result(session, block(head(), "green", verify(), ["test_old.py: superseded by work-11.txt"]))
+    else:
+        result(session, block(head(), "green", verify()) if mode == "malformed" else "I have nothing more to add.")
     sys.exit(0)
 with open(os.path.join(fix, f"agent-{m}.json"), "w") as f:
     json.dump({"argv": sys.argv[1:], "stdin": sys.stdin.read(), "detached": os.getsid(0) == os.getpid(),
@@ -1347,6 +1396,8 @@ if mode == "red-ungated":
     sys.exit(0)
 if mode == "red":
     open("RED", "w").close()
+if mode == "undeclared":
+    subprocess.run(["git", "rm", "-q", "test_old.py"], check=True)
 with open(f"work-{m}.txt", "w") as f:
     f.write(m + "\n")
 subprocess.run(["git", "add", "-A"], check=True)
@@ -1559,6 +1610,18 @@ class Build(BuildCase):
         self.assertIn(str(self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md"), argv[-1])
         self.assertEqual(len(self.spawns(11)), 1)
 
+    def test_a_report_leaving_out_a_deleted_test_resumes_the_session_for_it(self):
+        self.advance_spec("test_old.py", "x\n")
+        self.git(self.wt, "pull", "-q", "--no-rebase", "origin", "agent/local-spec-10-export")
+        self.mode(11, "undeclared")
+        out = self.run_ds("build", "10", "--sequential")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertRegex(lines[1], r"^resumed #11: .*leave out what judges the change: test_old.py \(a test, "
+                                   r"deleted\): name each by its full repo-relative path")
+        self.assertEqual(lines[3:5], ["integrated #11: merged #100", "landed #11"])
+        self.assertEqual(len(self.resumes(11)), 1)
+
     def test_still_no_report_after_the_resume_halts_naming_the_log(self):
         self.mode(11, "none")
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps(
@@ -1687,8 +1750,17 @@ class Build(BuildCase):
         self.assertEqual(len(self.spawns(11)), 2)
 
     def test_integrate_red_halts_without_a_retry(self):
-        self.advance_spec("RED", "")
-        out = self.run_ds("build", "10", "--sequential")
+        (self.tmp / "hold-11").write_text("")
+        proc = subprocess.Popen([str(SCRIPT), "build", "10", "--sequential"], cwd=self.repo, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(400):
+            if self.spawns(11):
+                break
+            time.sleep(0.05)
+        self.advance_spec("RED", "")  # lands while the implementer works, so only integrate's merge brings it in
+        (self.tmp / "go").write_text("")
+        stdout, stderr = proc.communicate(timeout=120)
+        out = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         self.assert_halted(out, 11, "integrate: #11 is red on the spec branch")
         self.assertEqual([p["state"] for p in self.gh_state()["pulls"]], ["open"])
         self.assertEqual(len(self.spawns(11)), 1)
@@ -3053,7 +3125,7 @@ class Boundaries(DispatcherCase):
         self.assertIn("the operator's answer to: Public or sign-in?", nxt())
         self.run_ds("answered", "10", "public")
         self.close_all()
-        self.assertEqual(nxt(), "step: build\nnext: `drive-spec build 10 --wait-minutes 9`\n")
+        self.assertEqual(nxt(), "step: build\nnext: `drive-spec build 10`\n")
         self.run_ds("frontier", "10")
         self.assertEqual(nxt(), "step: review\nnext: `drive-spec review 10`\n")
 
@@ -3063,7 +3135,7 @@ class Boundaries(DispatcherCase):
         self.run_ds("explore", "10")
         self.close_all()
         self.assertEqual(self.run_ds("next", "10").stdout,
-                         "step: build\nnext: `drive-spec build 10 --wait-minutes 9 --sequential --max 2`\n")
+                         "step: build\nnext: `drive-spec build 10 --sequential --max 2`\n")
 
     def test_confirm_and_cleanup_read_the_inbox_first(self):
         self.close_all()

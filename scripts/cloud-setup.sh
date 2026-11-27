@@ -100,7 +100,10 @@ cat > ~/.claude/settings.json <<'EOF'
       ]}
     ],
     "SessionStart": [
-      {"hooks": [{"type": "command", "command": "~/.claude/hooks/check-hooks-installed.py", "timeout": 5}]}
+      {"hooks": [
+        {"type": "command", "command": "~/.claude/hooks/check-hooks-installed.py", "timeout": 5},
+        {"type": "command", "command": "~/.claude/hooks/check-cloud-rails.py", "timeout": 5}
+      ]}
     ]
   }
 }

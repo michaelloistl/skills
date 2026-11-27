@@ -35,7 +35,7 @@ TEST_PATH = re.compile(r"(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]*$|_test\.[
 RUNNER_FILES = {"yarn": "package.json", "npm": "package.json", "pnpm": "package.json", "bun": "package.json",
                 "make": "Makefile", "rake": "Rakefile", "just": "justfile"}
 REFUSE, CONFLICT, RED, INBOX, PENDING, PAUSED = 2, 3, 4, 5, 6, 7
-LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205"}
+LABEL_COLORS = {"agent:in-progress": "0E8A16", "agent:blocked": "B60205", "agent:deferred": "C5DEF5"}
 
 
 class Failed(Exception):
@@ -119,6 +119,10 @@ def cycle_members(edges, nodes):
     return sorted(found)
 
 
+# The label `drive-spec defer` sets: the slice leaves the run, to ship in a PR of its own.
+DEFERRED = "agent:deferred"
+
+
 def build_plan(spec, issues, heads, open_prs, sub_issues=(), held_label=None, cloud=False):
     """The run's plan from tracker and branch facts alone.
 
@@ -137,9 +141,11 @@ def build_plan(spec, issues, heads, open_prs, sub_issues=(), held_label=None, cl
         plan["refuse"] = f"#{n} has a ## Parent of its own (#{own_parent}): it is a slice, not a spec"
         return plan
 
-    slices = {i["number"]: i for i in issues
-              if i.get("pull_request") is None and i["number"] != n and parent_of(i.get("body")) == n}
-    plan["invisible"] = sorted(set(sub_issues) - set(slices))
+    named = {i["number"]: i for i in issues
+             if i.get("pull_request") is None and i["number"] != n and parent_of(i.get("body")) == n}
+    plan["deferred"] = sorted(m for m, i in named.items() if DEFERRED in i.get("labels", []))
+    slices = {m: i for m, i in named.items() if m not in plan["deferred"]}
+    plan["invisible"] = sorted(set(sub_issues) - set(named))
     if not slices:
         plan["refuse"] = f"#{n} has no tracer-bullets: no issue names it first under ## Parent"
         return plan
@@ -217,6 +223,9 @@ def render(plan):
     ext = [f"#{b} (for #{s['number']})" for s in plan["slices"] for b in s["external_blockers"]]
     if ext:
         lines.append("outside the spec, ignored: " + ", ".join(ext))
+    if plan.get("deferred"):
+        lines.append(f"deferred ({DEFERRED}, ships in its own PR, not built): "
+                     + ", ".join(f"#{m}" for m in plan["deferred"]))
     if plan["invisible"]:
         lines.append("invisible (sub-issue without ## Parent, not built): "
                      + ", ".join(f"#{m}" for m in plan["invisible"]))
@@ -1550,6 +1559,7 @@ def cmd_start(spec, m, wait=None):
     ensure_excluded(run)
     wt = run.root / f"issue-{m}"
     prefix = f"agent/issue-{m}-"
+    reused = True
     if wt.is_dir():
         branch = git(wt, "branch", "--show-current")
         if not branch.startswith(prefix):
@@ -1565,6 +1575,7 @@ def cmd_start(spec, m, wait=None):
             branch = remote[0]
             git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, f"origin/{branch}")
         else:
+            reused = False
             branch = prefix + slug_of(s["title"])
             spec_wt = run.root / f"spec-{spec}"
             if spec_wt.is_dir():
@@ -1573,6 +1584,8 @@ def cmd_start(spec, m, wait=None):
             else:
                 start = f"origin/{plan['spec_branch']}"
             git(run.repo_dir, "worktree", "add", "-q", str(wt), "-b", branch, start)
+    if reused and s["state"] != "open-pr":
+        catch_up(wt, plan["spec_branch"])
     if bootstrap(run, wt, wait) == PENDING:
         return PENDING
     clear_reds(run, wt)
@@ -1594,6 +1607,24 @@ def cmd_start(spec, m, wait=None):
                              tracker_key(run), proved and proved[1]))
     print(f"next: an implementer subagent with the prompt `Read {path} and follow it.`")
     return 0
+
+
+def catch_up(wt, spec_branch):
+    """Merge into a reused slice worktree what landed on the spec branch since it was cut, such as an operator's fix,
+    so its implementer and gate see it. A conflict is aborted and left to `integrate`, whose merger resolves it."""
+    git(wt, "fetch", "--quiet", "origin")
+    target = f"origin/{spec_branch}"
+    if subprocess.run(["git", "-C", str(wt), "merge-base", "--is-ancestor", target, "HEAD"],
+                      capture_output=True).returncode == 0:
+        return
+    merged = subprocess.run(["git", "-C", str(wt), "merge", "--quiet", "--no-edit", target],
+                            capture_output=True, text=True)
+    if merged.returncode:
+        if Path(git(wt, "rev-parse", "--absolute-git-dir"), "MERGE_HEAD").exists():
+            subprocess.run(["git", "-C", str(wt), "merge", "--abort"], capture_output=True)
+        print(f"left {target} unmerged in {wt}: it conflicts, so `integrate` merges it", flush=True)
+        return
+    print(f"merged {target} into {wt}", flush=True)
 
 
 # build
@@ -1737,8 +1768,10 @@ def parse_report(text, proved, log):
 
 
 def checked_report(run, m, wt, log):
-    """The implementer's report, parsed from its log; a green one with its SHA the worktree's HEAD and green the
-    gate verdict `drive-spec verify` recorded for that commit. A red one halts the slice whatever the gate recorded."""
+    """The implementer's report, parsed from its log; a green one with its SHA the worktree's HEAD, green the gate
+    verdict `drive-spec verify` recorded for that commit, and `deviations` naming each path `integrate` would refuse
+    it for (a BadReport, so `build` resumes the implementer to fix it). A red one halts the slice whatever the gate
+    recorded."""
     results = [e for e in stream(log) if e.get("type") == "result"]
     labels = json.loads(gh(f"repos/{run.repo}/issues/{m}", "--jq", "[.labels[].name]"))
     rep = parse_report(results[-1].get("result") if results else None, bool(proof_of(run, labels)), log)
@@ -1753,6 +1786,11 @@ def checked_report(run, m, wt, log):
     if recorded != rep["verdict"]:
         raise Mismatch(f"#{m}: the report says {rep['verdict']} for {head[:12]}, but `drive-spec verify` recorded "
                      f"{recorded or 'no gate verdict'} for it; log {log}")
+    named = "\n".join(rep["deviations"])
+    undeclared = [g for g in guarded_changes(run, wt, f"origin/{run.spec_branch()}") if g.split(" (")[0] not in named]
+    if undeclared:
+        raise BadReport(f"the implementer's report has `deviations` that leave out what judges the change: "
+                        f"{'; '.join(undeclared)}: name each by its full repo-relative path, and why; log {log}")
     return rep
 
 
@@ -2810,7 +2848,7 @@ STEP_COMMANDS = {
     "guard": "drive-spec plan {spec}",
     "worktree": "drive-spec open {spec}",
     "preview": "drive-spec preview {spec}",
-    "build": "drive-spec build {spec} --wait-minutes 9",
+    "build": "drive-spec build {spec}",
     "review": "drive-spec review {spec}",
     "confirm": "drive-spec confirm {spec}",
     "cleanup": "drive-spec cleanup {spec}",
@@ -3013,6 +3051,35 @@ def cmd_unblock(spec, m):
     return 0
 
 
+def cmd_defer(spec, ms, why):
+    """Take slices out of the run, as the operator decided they ship in PRs of their own."""
+    run = Run(spec)
+    plan = checked_plan(run)
+    by = {x["number"]: x for x in plan["slices"]}
+    for m in ms:
+        s = by.get(m)
+        if not s:
+            raise Failed(f"#{m} is deferred already" if m in plan["deferred"] else f"#{m} is not a slice of #{spec}",
+                         REFUSE)
+        if s["state"] == "closed":
+            raise Failed(f"#{m} is closed: it has landed on the spec branch already", REFUSE)
+        if "agent:in-progress" in s["labels"]:
+            raise Failed(f"#{m} is building: let its agent finish, or halt it, before deferring it", REFUSE)
+    blocked = [f"#{x['number']} (blocked by {', '.join(f'#{b}' for b in x['blockers'] if b in ms)})"
+               for x in plan["slices"] if x["number"] not in ms and x["state"] != "closed"
+               and any(b in ms for b in x["blockers"])]
+    if blocked:
+        raise Failed(f"{', '.join(blocked)} would build without what blocks it: defer it too, in the same call",
+                     REFUSE)
+    for m in ms:
+        add_label(run, m, DEFERRED)
+        gh(f"repos/{run.repo}/issues/{m}/comments", "--silent", "-f",
+           f"body=drive-spec deferred this slice out of #{spec}'s run: {why}. It ships in a PR of its own; "
+           f"remove `{DEFERRED}` to put it back.")
+        print(f"deferred #{m}")
+    return 0
+
+
 def cmd_halt(spec, m, why):
     run = Run(spec)
     add_label(run, m, "agent:blocked")
@@ -3079,6 +3146,10 @@ def main():
     op.add_argument("--base", help="base branch; default from the status file, config, or the repo")
     op.add_argument("--wait-minutes", type=float, dest="wait",
                     help="return after this long, exit 6, while the bootstrap runs on; run again to keep waiting")
+    de = sub.add_parser("defer", help="take slices out of the run, to ship in PRs of their own, as the operator decided")
+    de.add_argument("spec")
+    de.add_argument("slices", nargs="+")
+    de.add_argument("--why", required=True, help="the operator's decision, quoted on each slice")
     ub = sub.add_parser("unblock", help="remove agent:blocked from a slice, once the operator says it is fixed")
     ub.add_argument("spec")
     ub.add_argument("slice")
@@ -3171,6 +3242,8 @@ def main():
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
         elif args.cmd == "start":
             code = cmd_start(spec, int(args.slice.lstrip("#")), args.wait)
+        elif args.cmd == "defer":
+            code = cmd_defer(spec, [int(x.lstrip("#")) for x in args.slices], args.why.rstrip("."))
         elif args.cmd == "unblock":
             code = cmd_unblock(spec, int(args.slice.lstrip("#")))
         elif args.cmd == "build":

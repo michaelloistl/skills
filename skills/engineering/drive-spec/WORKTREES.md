@@ -37,7 +37,7 @@ A branch already on origin keeps whatever slug it has; look it up with `git ls-r
 `drive-spec open` creates the spec worktree and `drive-spec start` a slice's; this is the contract they implement. Both fetch with `--prune` first.
 
 - **Spec**: an existing worktree on the spec branch is reused and fast-forwarded; else the branch on origin is resumed (a local branch already ahead of it is kept, never reset); else it is cut from `origin/<base>` and pushed at once, which is what lets another session, or a later resume, see the spec is underway.
-- **Slice**: an existing worktree is reused; else the local branch, else the branch on origin (with or without an open PR); else a fresh branch from the spec worktree's HEAD after `pull --ff-only`. A crashed run's unpushed commits are never reset away.
+- **Slice**: an existing worktree is reused; else the local branch, else the branch on origin (with or without an open PR); else a fresh branch from the spec worktree's HEAD after `pull --ff-only`. A crashed run's unpushed commits are never reset away. A reused slice without an open PR merges `origin/<spec branch>` first, so a fix that landed there since, such as an operator's, reaches its implementer and gate; a merge that conflicts is aborted, and left to `integrate`'s merger.
 - A path that already exists is reused when it is on the expected branch, and refused otherwise. A branch checked out in a worktree the run did not create belongs to another session: git refuses to check it out twice, and the command stops naming the path.
 - Bootstrap runs per Bootstrap below, whether the worktree is new or reused.
 
