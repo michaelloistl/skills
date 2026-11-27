@@ -26,6 +26,8 @@ Every step ends in a `drive-spec` command that marks the next step begun in the 
 
 A `next:` line that hands work to a subagent names its model (such as on model `sonnet`): pass it as the Agent tool's `model`. `models` in `.claude/drive-spec.json` overrides a role's.
 
+Stay in the repo root: read worktrees and notes by absolute path or `git -C <path>`. `integrate` and `land` remove slice worktrees, so a shell left in one loses its working directory.
+
 Communicate with subagents through context pointers: issue numbers, worktree paths, research notes, the `drive-spec verify` command. Everything else they read themselves.
 
 An interim notification from a background subagent gets a one-line status; act on its final report.
@@ -50,7 +52,7 @@ An interim notification from a background subagent gets a one-line status; act o
    - 0: `stop: done`, every slice closed: go to step 7.
    - 6: agents or gates still run, detached: run the same command again. It adopts them, so no slice builds twice.
    - 5: act on the inbox notes (STATUS.md, Inbox), then run it again.
-   - 4: a slice halted, on its `halted #<m>: <reason>` line: `build` has run `drive-spec halt`, which finished the run. Stop.
+   - 4: a slice halted, on its `halted #<m>: <reason>` line: `build` has run `drive-spec halt`, which finished the run. Stop. When the operator fixes the cause on the base branch, resume with `drive-spec sync-base <spec>`, then `unblock`.
    - 7: `stop: ceiling` or `stop: held`: `build` has finished the run as paused. Stop.
    - 1: a failed tracker or git call, which halts nothing: run the same command again. A second exit 1 in a row with the same message is not transient: stop and ask the operator (STATUS.md, Questions).
    - 2: a refusal, such as the `agent` command missing from the PATH, a slice carrying `agent:blocked` (once the operator says it is fixed, `drive-spec unblock <spec> <m>` clears it: the `agent:*` labels are drive-spec's to set and clear, never the orchestrator's), or another `build` of the spec still running: fix what it names, never route around it.

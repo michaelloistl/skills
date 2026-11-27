@@ -846,8 +846,11 @@ def verify(run, wt, gate=None, wait=None):
     True when green, False when red, None when `wait` minutes passed first: the gate runs on, detached."""
     wt = Path(wt).resolve()
     if dirty(wt, count_untracked=False):
-        raise Failed(f"{wt} has uncommitted changes: commit them first, the verdict is recorded against a commit",
-                     REFUSE)
+        status = sh(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no"])
+        changed = [x[3:] for x in status.splitlines()]
+        raise Failed(f"{wt} has uncommitted changes ({', '.join(changed[:5])}{', …' if len(changed) > 5 else ''}): "
+                     "commit them first, the verdict is recorded against a commit; a file the gate itself rewrites, "
+                     "such as a lockfile, is the gate's to fix", REFUSE)
     warn_untracked(wt)
     head = git(wt, "rev-parse", "HEAD")
     gate = gate or run_gate_of(run)
@@ -2107,6 +2110,34 @@ def cmd_build(spec, sequential, max_slices, wait=None):
 
 # open, confirm, cleanup
 
+def cmd_sync_base(spec):
+    """Merge `origin/<base>` into the spec branch and push it, as when the operator's fix for a halt landed on base:
+    each slice started after picks it up, and the next integration's gate runs on it."""
+    run = Run(spec)
+    plan = checked_plan(run)
+    wt, branch, base = run.root / f"spec-{spec}", plan["spec_branch"], run.base()
+    if not wt.is_dir():
+        raise Failed(f"no spec worktree at {wt}: `drive-spec open {spec}`", REFUSE)
+    if dirty(wt, count_untracked=False):
+        raise Failed(f"{wt} has uncommitted changes: commit or remove them first", REFUSE)
+    git(wt, "fetch", "--quiet", "origin")
+    git(wt, "merge", "--ff-only", "--quiet", f"origin/{branch}")
+    if subprocess.run(["git", "-C", str(wt), "merge-base", "--is-ancestor", f"origin/{base}", "HEAD"],
+                      capture_output=True).returncode == 0:
+        print(f"{branch} already holds origin/{base}")
+        return 0
+    merged = subprocess.run(["git", "-C", str(wt), "merge", "--quiet", "--no-edit", f"origin/{base}"],
+                            capture_output=True, text=True)
+    if merged.returncode:
+        files = sh(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U"]).split()
+        subprocess.run(["git", "-C", str(wt), "merge", "--abort"], capture_output=True)
+        raise Failed(f"origin/{base} conflicts with {branch} in {', '.join(files) or 'the merge'}: a merger subagent "
+                     f"in {wt} runs `git merge origin/{base}`, resolves and commits, then this again", REFUSE)
+    git(wt, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
+    print(f"merged origin/{base} into {branch} and pushed {git(wt, 'rev-parse', 'HEAD')[:12]}")
+    return 0
+
+
 def cmd_open(spec, base, wait=None):
     run = Run(spec)
     plan = make_plan(run)
@@ -2641,6 +2672,30 @@ def cmd_check_round(spec):
     return 0
 
 
+ADR_FILE = re.compile(r"(?:^|/)adr/(\d{3,5})-[^/]+\.md$")
+
+
+def adr_collisions(wt, base):
+    """Each ADR the branch adds under a number `base` has given another ADR meanwhile, with the next free number."""
+    added = sh(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=A", f"{base}...HEAD"]).split()
+    out = []
+    for path in added:
+        m = ADR_FILE.search(path)
+        if not m:
+            continue
+        folder = os.path.dirname(path)
+        names = set(sh(["git", "-C", str(wt), "ls-tree", "--name-only", f"{base}:{folder}"]).split()) \
+            if at_head(wt, base, folder) else set()
+        taken = [x for x in names if x.startswith(f"{m.group(1)}-") and f"{folder}/{x}" != path]
+        if taken:
+            here = {x for x in (os.path.basename(p) for p in os.listdir(Path(wt) / folder))}
+            used = {int(x.split("-", 1)[0]) for x in names | here if re.match(r"\d+-", x)}
+            free = str(max(used) + 1).zfill(len(m.group(1)))
+            out.append(f"{path} takes number {m.group(1)}, which {base} gave {folder}/{taken[0]}; "
+                       f"renumber it to {free}")
+    return out
+
+
 def cmd_review(spec):
     run = Run(spec)
     plan = checked_plan(run)
@@ -2648,6 +2703,9 @@ def cmd_review(spec):
     if open_:
         raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
     wt, head = spec_head(run, plan, push=True, gated=False)
+    clashes = adr_collisions(wt, f"origin/{run.base()}")
+    if clashes:
+        raise Failed("; ".join(clashes) + ": `git mv` each, update what cites it, commit, then this again", REFUSE)
     ks = review_rounds(run)
     k = ks[-1] if ks else 0
     decided = (run.notes / "decisions.md").is_file()
@@ -3254,6 +3312,8 @@ def main():
     op.add_argument("--base", help="base branch; default from the status file, config, or the repo")
     op.add_argument("--wait-minutes", type=float, dest="wait",
                     help="return after this long, exit 6, while the bootstrap runs on; run again to keep waiting")
+    sy = sub.add_parser("sync-base", help="merge origin/<base> into the spec branch and push it")
+    sy.add_argument("spec")
     de = sub.add_parser("defer", help="take slices out of the run, to ship in PRs of their own, as the operator decided")
     de.add_argument("spec")
     de.add_argument("slices", nargs="+")
@@ -3354,6 +3414,8 @@ def main():
             code = cmd_frontier(spec, running, args.sequential, args.max_slices, args.json)
         elif args.cmd == "start":
             code = cmd_start(spec, int(args.slice.lstrip("#")), args.wait)
+        elif args.cmd == "sync-base":
+            code = cmd_sync_base(spec)
         elif args.cmd == "defer":
             code = cmd_defer(spec, [int(x.lstrip("#")) for x in args.slices], args.why.rstrip("."))
         elif args.cmd == "unblock":

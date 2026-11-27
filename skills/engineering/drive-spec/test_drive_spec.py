@@ -622,7 +622,7 @@ class Verify(Cli):
         (self.wt / "a.txt").write_text("changed")
         out = self.run_ds("verify", "10", str(self.wt))
         self.assertEqual(out.returncode, 2)
-        self.assertIn("uncommitted changes", out.stderr)
+        self.assertIn("uncommitted changes (a.txt)", out.stderr)
         self.assertEqual(self.gate_runs(), 0)
 
     def test_untracked_files_are_verified_past_with_a_warning(self):
@@ -1211,6 +1211,33 @@ class Frontier(Cli):
         self.assertEqual(self.run_ds("frontier", "10", "--max", "1").stdout, "stop: ceiling, 1 landed this run\n")
         self.run_ds("gate", "10", GATE)
         self.assertEqual(self.run_ds("frontier", "10", "--max", "1").stdout, "build #12 Wire the route\n")
+
+
+class SyncBase(Cli):
+    def test_merges_base_into_the_spec_branch_and_pushes(self):
+        self.run_ds("gate", "10", GATE)
+        work = self.tmp / "base-fix"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        self.commit(work, "fix.txt", "fixed\n", "Fix the flaky factory")
+        self.git(work, "push", "-q", "origin", "main")
+        out = self.run_ds("sync-base", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("merged origin/main into agent/local-spec-10-export and pushed", out.stdout)
+        self.assertEqual(self.git(self.repo, "show", "origin/agent/local-spec-10-export:fix.txt"), "fixed")
+        self.assertIn("already holds origin/main", self.run_ds("sync-base", "10").stdout)
+
+    def test_a_conflict_is_aborted_and_named(self):
+        self.run_ds("gate", "10", GATE)
+        self.commit(self.spec_wt, "fix.txt", "mine\n", "Add fix.txt")
+        self.git(self.spec_wt, "push", "-q", "origin", "HEAD:agent/local-spec-10-export")
+        work = self.tmp / "base-fix"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        self.commit(work, "fix.txt", "theirs\n", "Add fix.txt on main")
+        self.git(work, "push", "-q", "origin", "main")
+        out = self.run_ds("sync-base", "10")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("conflicts with agent/local-spec-10-export in fix.txt", out.stderr)
+        self.assertEqual(self.git(self.spec_wt, "status", "--porcelain"), "")
 
 
 class Defer(Cli):
@@ -3104,6 +3131,25 @@ class Boundaries(DispatcherCase):
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-1.fix.md").exists())
+
+    def test_an_adr_numbered_as_one_base_took_meanwhile_refuses_review(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        (self.spec_wt / "docs" / "adr").mkdir(parents=True)
+        self.commit(self.spec_wt, "docs/adr/0002-export.md", "# Export\n", "Record the export ADR")
+        self.run_ds("verify", "10", str(self.spec_wt))
+        work = self.tmp / "adr"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        (work / "docs" / "adr").mkdir(parents=True)
+        self.commit(work, "docs/adr/0002-billing.md", "# Billing\n", "Record the billing ADR")
+        self.git(work, "push", "-q", "origin", "main")
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("docs/adr/0002-export.md takes number 0002, which origin/main gave docs/adr/0002-billing.md; "
+                      "renumber it to 0003", out.stderr)
+        self.git(self.spec_wt, "mv", "docs/adr/0002-export.md", "docs/adr/0003-export.md")
+        self.git(self.spec_wt, "commit", "-qm", "Renumber the export ADR")
+        self.assertEqual(self.run_ds("review", "10").returncode, 0)
 
     def test_check_holds_the_last_round_to_its_form_and_changes_nothing(self):
         self.run_ds("gate", "10", GATE)

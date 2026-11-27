@@ -126,7 +126,7 @@ export function boardSlices(plan: Plan | undefined, agents: Map<number, AgentVie
       number: s.number, title: s.title ?? '', state,
       waitingOn: state === 'todo' ? (s.blockers ?? []).filter(b => !closed.has(b)) : [],
       ...(s.pr ? { pr: s.pr } : {}),
-      ...(at !== undefined ? { landedAgo: now - at } : {}),
+      ...(at !== undefined ? { landedAgo: shown(now - at) } : {}),
       ...(agent ? { agent } : {}),
     }
   })
@@ -232,13 +232,13 @@ async function agentViews($: EngineInterface, status: Status, now: number): Prom
       role,
       isQueued: Boolean(raw.report) || role === 'integrate' || Boolean(raw.merged),
       restarts: Number(raw.restarts) || 0,
-      ...(started !== undefined ? { elapsed: now - started } : {}),
+      ...(started !== undefined ? { elapsed: shown(now - started) } : {}),
     }
     if (str(raw.log)) {
       try {
         const { lines, mtime } = await tailLines($, str(raw.log))
         const action = lastAction(lines)
-        view.quiet = now - mtime
+        view.quiet = shown(now - mtime)
         if (action) view.action = action
       } catch {
         // The log is gone once the run cleans up.
@@ -273,6 +273,26 @@ async function planOf($: EngineInterface, spec: number, repoDir: string, nowMs: 
 
 let inflight: Promise<void> | undefined
 
+/** Seconds as `ago` shows them: exact under a minute, whole minutes after, so a tick that changes no figure on screen
+ * leaves the model as it was. */
+export function shown(seconds: number): number {
+  return seconds < 60 ? Math.floor(seconds) : Math.floor(seconds / 60) * 60
+}
+
+/** The model, written only when it differs: each write is an event in the session's stream, every tick. */
+async function setModel($: EngineInterface, next: Model): Promise<void> {
+  if (JSON.stringify(await read($, model)) !== JSON.stringify(next)) await update($, model, () => next)
+}
+
+let lastStatus: string | undefined | null = null
+
+/** The status line, sent only when its text changes, for the same reason. */
+function setStatus($: EngineInterface, text: string | undefined): void {
+  if (text === lastStatus) return
+  lastStatus = text
+  $.ui.status(text)
+}
+
 /** One read at a time: a timer tick joins the read under way; a forced one waits it out and reads again. */
 async function refresh($: EngineInterface, forcePlan = false): Promise<void> {
   if (inflight && !forcePlan) return inflight
@@ -289,8 +309,8 @@ async function load($: EngineInterface, forcePlan: boolean): Promise<void> {
   try {
     const common = await findCommonDir($)
     if (!common) {
-      await update($, model, () => ({ ...EMPTY, error: 'The session folder is not a git repository.' }))
-      $.ui.status(undefined)
+      await setModel($, { ...EMPTY, error: 'The session folder is not a git repository.' })
+      setStatus($, undefined)
       return
     }
     const nowMs = await $.clock.now()
@@ -300,8 +320,8 @@ async function load($: EngineInterface, forcePlan: boolean): Promise<void> {
     const status = spec !== undefined ? runs.get(spec) : undefined
     const repoUrl = githubUrl(str([...runs.values()][0]?.repo))
     if (spec === undefined || !status) {
-      await update($, model, () => ({ repoUrl, runs: runRows(runs) }))
-      $.ui.status(undefined)
+      await setModel($, { repoUrl, runs: runRows(runs) })
+      setStatus($, undefined)
       return
     }
     const repoDir = common.replace(/\/\.git$/, '')
@@ -317,12 +337,12 @@ async function load($: EngineInterface, forcePlan: boolean): Promise<void> {
       summary: str(status.summary), next: str(status.next), question: str(status.question),
       isBlocking: status.question_blocking !== false && status.state === 'waiting',
       base: str(status.base), branch: str(status.branch), prUrl: str(status.pr_url),
-      ...(updated !== undefined ? { age: now - updated } : {}),
+      ...(updated !== undefined ? { age: shown(now - updated) } : {}),
       title: plan?.title ?? '',
       slices: boardSlices(plan, agents, landedOf(landedText ?? ''), now),
     }
-    await update($, model, () => ({ repoUrl: githubUrl(str(status.repo)) || repoUrl, run, runs: runRows(runs) }))
-    $.ui.status(statusLine(run))
+    await setModel($, { repoUrl: githubUrl(str(status.repo)) || repoUrl, run, runs: runRows(runs) })
+    setStatus($, statusLine(run))
     // The web app queues a typed command behind the turn: open the pane unasked once this session's run shows up.
     // Not in Rex, which shows the run in its own pane (alt+cmd+r).
     if (why === 'this session' && (await read($, autoOpened)) !== spec && !(await $.env.get('REX_BLOCK'))) {
@@ -359,6 +379,7 @@ export const register: Register = on => {
       description: 'Toggle the drive-spec run pane; /drive-spec-view <spec> shows that spec, /drive-spec-view follow this session\'s run',
       immediate: true,
     })
+    lastStatus = null
     void refresh($)
     // The status line follows the run whether or not the pane is open: the status file is cheap to read.
     $.clock.every(STATUS_MS, () => void refresh($))

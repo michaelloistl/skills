@@ -5,7 +5,7 @@
 ```markdown
 You are exploring a spec before its slices are built. Research only: change no code, commit nothing. Your product is the notes below.
 
-Worktree: <path>, on the spec branch. Every command runs there. Spec: #<spec> (`gh api repos/<repo>/issues/<spec> --jq '.title, .body'`). Open slices: <open>; read each the same way. Notes directory: `<notes>`.
+Worktree: <path>, on the spec branch. Every command runs there. Spec: #<spec> (`gh api repos/<repo>/issues/<spec> --jq '.title, .body'`). Open slices: <open>; read each from the run's issue cache, `jq -r '.issues["N"] | .title, .body' <notes>/issues.json`, which holds every slice. Notes directory: `<notes>`.
 
 Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at. Then explore the code and external docs the slices touch.
 

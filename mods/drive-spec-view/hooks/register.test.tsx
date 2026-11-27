@@ -1,7 +1,7 @@
 import type { CommandRunInput, UiPane } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { boardSlices, githubUrl, lastAction, pickRun, statusLine } from './register'
+import { boardSlices, githubUrl, lastAction, pickRun, shown, statusLine } from './register'
 
 const CMD = (args: string): CommandRunInput => ({
   command: 'drive-spec-view',
@@ -169,7 +169,11 @@ test('opens the pane on its own once this session drives a run, and not again on
   on('session.id', () => ({ value: 'sess-1' }))
   on('env.get', () => ({ value: undefined }))
   on('fs.exists', (_, e) => ({ value: e.path === STATUS }))
-  on('fs.list', () => ({ value: [{ name: 'spec-10.json', kind: 'file' as const, size: 1, mtimeMs: NOW, isLink: false }] }))
+  let lists = 0
+  on('fs.list', () => {
+    lists++
+    return { value: [{ name: 'spec-10.json', kind: 'file' as const, size: 1, mtimeMs: NOW, isLink: false }] }
+  })
   on('fs.stat', () => ({ value: { kind: 'file' as const, size: 0, mtimeMs: NOW, isLink: false } }))
   on('fs.read', (_, e) => {
     const text = FILES[e.path]
@@ -184,12 +188,17 @@ test('opens the pane on its own once this session drives a run, and not again on
   await until(() => opens > 0)
   expect(opens).toBe(1)
 
+  expect(lines.at(-1)).toContain('drive-spec #10')
   panes = []
   lines.length = 0
+  const before = lists
   await clock.advance(2_000)
-  await until(() => lines.length > 0)
-  expect(lines.at(-1)).toContain('drive-spec #10')
+  await until(() => lists > before)
+  await clock.advance(2_000)
+  await until(() => lists > before + 1)
   expect(opens).toBe(1)
+  // The tick read the run again and found the status line unchanged: it is not sent again.
+  expect(lines).toEqual([])
 })
 
 test('does not open the pane on its own in a Rex pane, but still sets the status line', async ($, on) => {
@@ -271,4 +280,8 @@ describe('slices and agents', () => {
       isBlocking: true, base: '', branch: '', prUrl: '', title: '', slices: [] }
     expect(statusLine(run)).toBe('drive-spec #5 · waiting · explore 5/11 · ▲ waiting on you')
   })
+})
+
+test('ages keep the precision the pane shows, so an idle tick writes no new model', () => {
+  expect([shown(42.7), shown(60), shown(119), shown(3601)]).toEqual([42, 60, 60, 3600])
 })
