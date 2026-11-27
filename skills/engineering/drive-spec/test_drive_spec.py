@@ -1497,7 +1497,7 @@ class Build(BuildCase):
         for m in (11, 12):
             a = self.agent(m)
             self.assertEqual(a["argv"][-1], f"Read {notes / f'brief-{m}.md'} and follow it.")
-            self.assertEqual(a["argv"][:-1], ds.DEFAULT_AGENT[1:])
+            self.assertEqual(a["argv"][:-1], [*ds.DEFAULT_AGENT[1:], "--model", "opus"])
             self.assertEqual((a["stdin"], a["detached"]), ("", True))
             self.assertEqual([k for k in a["env"] if k.startswith(("HERDR_", "REX_"))], [])
             self.assertNotIn("CLAUDE_CODE_SESSION_ID", a["env"])
@@ -1604,8 +1604,8 @@ class Build(BuildCase):
         self.assertRegex(lines[2], r"^reported #11: green [0-9a-f]{12} \(already verified\)$")
         self.assertEqual(lines[3:5], ["integrated #11: merged #100", "landed #11"])
         [argv] = self.resumes(11)
-        self.assertEqual(argv[:-3], ds.DEFAULT_AGENT[1:])
-        self.assertEqual(argv[-3:-1], ["--resume", "sess-11"])
+        self.assertEqual(argv[:-5], ds.DEFAULT_AGENT[1:])
+        self.assertEqual(argv[-5:-1], ["--resume", "sess-11", "--model", "opus"])
         self.assertIn("Reply with that block only", argv[-1])
         self.assertIn(str(self.repo / ".git" / "drive-spec" / "spec-10" / "brief-11.md"), argv[-1])
         self.assertEqual(len(self.spawns(11)), 1)
@@ -2060,6 +2060,19 @@ class Report(unittest.TestCase):
         example = json.loads(SCRIPT.with_name("drive-spec.example.json").read_text())
         self.assertEqual(example["agent"], ds.DEFAULT_AGENT)
         self.assertEqual(example["agentResume"], ds.DEFAULT_AGENT_RESUME)
+        self.assertEqual(example["models"], ds.DEFAULT_MODELS)
+
+    def test_each_role_runs_on_its_model(self):
+        from types import SimpleNamespace
+        run = SimpleNamespace(config={"models": {"merger": "haiku"}})
+        self.assertEqual(ds.with_model(run, "merger", ["claude", "-p"]), ["claude", "-p", "--model", "haiku"])
+        self.assertEqual(ds.with_model(run, "implementer", ["claude", "-p"]), ["claude", "-p", "--model", "opus"])
+        self.assertEqual(ds.with_model(run, "merger", ["claude", "--model", "x"]), ["claude", "--model", "x"])
+        self.assertEqual(ds.with_model(run, "merger", ["codex", "exec"]), ["codex", "exec"])
+        self.assertEqual(ds.subagent(run, "qa", "QA"), "QA subagent on model `sonnet`")
+        for bad in ({"designer": "opus"}, {"qa": ""}, ["opus"]):
+            with self.subTest(models=bad), self.assertRaises(ds.Failed):
+                ds.model_of(SimpleNamespace(config={"models": bad}), "qa")
 
     def test_proof_required_on_a_local_only_slice(self):
         with self.assertRaises(ds.Failed):
@@ -2468,6 +2481,13 @@ class Cleanup(DispatcherCase):
         self.land_11()
         self.edit_state(lambda st: st["issues"]["12"].update(state="closed"))
 
+    def test_pr_review_puts_review_fix_pr_before_qa(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "prReview": True}))
+        self.finish_slices()
+        self.assertEqual(self.run_ds("cleanup", "10").returncode, 0)
+        self.assertEqual(self.row()["step"], "review-pr")
+        self.assertIn("`/review-fix-pr 101`, then `drive-spec qa 10`", self.run_ds("next", "10").stdout)
+
     def test_removes_worktrees_and_notes(self):
         self.finish_slices()
         stray = self.slice(12, "route")
@@ -2480,17 +2500,17 @@ class Cleanup(DispatcherCase):
         self.assertEqual(self.origin_sha("agent/local-spec-10-export"),
                          self.git(self.repo, "rev-parse", "agent/local-spec-10-export"))
         r = self.row()
-        self.assertEqual((r["step"], r["state"], r["pr_url"]), ("review-pr", "running", "https://github.com/acme/app/pull/101"))
-        self.assertTrue(self.status_file()["summary"].endswith("; reviewing and fixing PR #101"))
-        self.assertIn("`/review-fix-pr 101`, then `drive-spec qa 10`", self.run_ds("next", "10").stdout)
+        self.assertEqual((r["step"], r["state"], r["pr_url"]), ("qa-pr", "running", "https://github.com/acme/app/pull/101"))
+        self.assertTrue(self.status_file()["summary"].endswith("; QA of PR #101"))
+        self.assertIn("a QA subagent on model `sonnet`", self.run_ds("next", "10").stdout)
         out = self.run_ds("qa", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         qa_skill = Path(SCRIPT).resolve().parent.parent / "qa-pr" / "SKILL.md"
         prompt = f"Read {qa_skill} and follow it for `/qa-pr 101`. Report back the comment URL, its first line, and each failed scenario's title."
-        self.assertEqual(out.stdout, f"next: a QA subagent with the prompt `{prompt}`; then `drive-spec finish 10 done`\n")
+        self.assertEqual(out.stdout, f"next: a QA subagent on model `sonnet` with the prompt `{prompt}`; then `drive-spec finish 10 done`\n")
         r = self.row()
         self.assertEqual((r["step"], r["state"]), ("qa-pr", "running"))
-        self.assertIn(f"a QA subagent with the prompt `{prompt}`, then `drive-spec finish 10 done`",
+        self.assertIn(f"a QA subagent on model `sonnet` with the prompt `{prompt}`, then `drive-spec finish 10 done`",
                       self.run_ds("next", "10").stdout)
 
     def test_qa_off_points_at_finish(self):
@@ -2800,20 +2820,33 @@ class Boundaries(DispatcherCase):
         self.assertNotIn("Rename ExportJob", fix)
         self.assertIn("not a clean review", self.run_ds("reviewed", "10").stderr)
         self.commit(self.spec_wt, "export.csv", "x\n", "Export to CSV")
-        self.assertIn("not verified green", self.run_ds("review", "10").stderr)
-        self.run_ds("verify", "10", str(self.spec_wt))
+        before = self.origin_sha("agent/local-spec-10-export")
+        counted = len(Path(self.counter).read_text().splitlines()) if Path(self.counter).exists() else 0
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("pushed ", out.stdout)
-        self.assertEqual(self.origin_sha("agent/local-spec-10-export"), self.git(self.spec_wt, "rev-parse", "HEAD"))
+        self.assertNotIn("pushed ", out.stdout)
+        self.assertEqual(self.origin_sha("agent/local-spec-10-export"), before)
         self.assertIn(str(self.notes() / "review" / "round-1.json"),
                       (self.notes() / "review" / "round-2.brief.md").read_text())
         round_1 = json.loads((self.notes() / "review" / "round-1.meta.json").read_text())["head"]
-        self.assertIn(f"diff {round_1}..{self.git(self.spec_wt, 'rev-parse', 'HEAD')}` is what changed since",
+        self.assertIn(f"diff {round_1}..{self.git(self.spec_wt, 'rev-parse', 'HEAD')}`: the earlier rounds reviewed",
                       (self.notes() / "review" / "round-2.brief.md").read_text())
-        self.assertNotIn("is what changed since", (self.notes() / "review" / "round-1.brief.md").read_text())
-        self.round_(2, self.CALL)
-        self.assertIn("review clean at round 2", self.run_ds("review", "10").stdout)
+        self.assertNotIn("review only what changed since", (self.notes() / "review" / "round-1.brief.md").read_text())
+        head = self.git(self.spec_wt, "rev-parse", "HEAD")
+        self.assertIn(f"--diff-filter=d {round_1}..{head}`", (self.notes() / "review" / "round-2.brief.md").read_text())
+        self.round_(2, self.CALL, checked={"AGENTS.md": []})
+        self.assertIn("checked: export.csv is in the change", self.run_ds("review", "10").stderr)
+        self.round_(2, self.CALL, checked={"AGENTS.md": ["export.csv"]})
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("review clean at round 2, but", out.stderr)
+        self.assertIn("has no green gate verdict", out.stderr)
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.assertEqual(len(Path(self.counter).read_text().splitlines()) - counted, 1)
+        out = self.run_ds("review", "10")
+        self.assertIn("pushed ", out.stdout)
+        self.assertIn("review clean at round 2", out.stdout)
+        self.assertEqual(self.origin_sha("agent/local-spec-10-export"), self.git(self.spec_wt, "rev-parse", "HEAD"))
         out = self.run_ds("reviewed", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         r = self.row()

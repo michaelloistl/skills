@@ -15,7 +15,7 @@ Round <k> raised these, each citing the written rule it breaks (`Rule:`) or how 
 
 Fix every one. Test-first where a test can exist: write it, watch it fail, make it pass; a `Fails:` finding's test reproduces its steps. Change only what the findings ask for.
 
-Before the gate, run the repo's lint command, as `CLAUDE.md` or `AGENTS.md` names it, and the tests of every class you changed, until both pass. Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer. The orchestrator runs the full verify gate on your HEAD once you report; a red comes back to you with its failing tail, to fix, commit and report again. Never skip, sleep or rerun a failing test until it passes: a red you cannot trace to a cause is red, so report it, naming the test. Weaken no test and no file of the gate to clear a finding.
+Before the gate, run the repo's lint command, as `CLAUDE.md` or `AGENTS.md` names it, and the tests of every class you changed, until both pass. Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer. Those are your gate: the full verify gate runs once, when a review round comes back clean. Never skip, sleep or rerun a failing test until it passes: a red you cannot trace to a cause is red, so report it, naming the test. Weaken no test and no file of the gate to clear a finding.
 
-Report back in one paragraph: what you changed for each finding, the commit SHAs, and the lint and test commands you ran with their results.
+Write `<notes>/review/round-<k>.fixed.md`: what you changed for each finding, by its number, the commit SHAs, and the lint and test commands you ran with their results. Report back one line and nothing else: `round <k> fixed: N of N findings, HEAD SHA12`, or `round <k> red: THE FAILING TEST`.
 ```

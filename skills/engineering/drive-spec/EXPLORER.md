@@ -26,5 +26,5 @@ Write, in the notes directory:
 
 Then run `<skill dir>/drive-spec explored <spec> --check`, which records and posts nothing: it names each note missing or out of form. Done when it exits 0.
 
-Report back in a few lines: the files written, the ADRs listed, the unmapped requirements, the questions, the conflicts.
+Report back one line and nothing else: `explored: N slice notes, N ADRs, N unmapped, N questions, N conflicts`. The notes hold the rest; the orchestrator reads them only when a command names one.
 ```

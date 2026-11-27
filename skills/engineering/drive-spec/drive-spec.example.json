@@ -13,6 +13,8 @@
             "--permission-prompts", "none"],
   "agentResume": ["claude", "-p", "--verbose", "--output-format", "stream-json", "--permission-mode", "auto",
                   "--permission-prompts", "none", "--resume", "{session}"],
+  "models": {"implementer": "opus", "reviewer": "opus", "explorer": "sonnet", "merger": "sonnet",
+             "fixer": "sonnet", "qa": "sonnet"},
   "runProof": "docs/agents/run-proof.md",
   "localOnly": {
     "label": "needs:desktop",

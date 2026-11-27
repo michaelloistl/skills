@@ -23,8 +23,8 @@ At every step boundary, and within step 6 at each agent launch, landing and halt
 | `review` | `land` of the last slice, or `frontier` as it stops on `done` while the status still reads `build`; then `drive-spec review` at each round, fix and clean |
 | `confirm` | `drive-spec reviewed` |
 | `cleanup` | `drive-spec confirm` |
-| `review-pr` | `drive-spec cleanup`; `finish halted --step review-pr` |
-| `qa-pr` | `drive-spec qa`; `finish done`, or `finish halted --step qa-pr` |
+| `review-pr` | `drive-spec cleanup` with `prReview`; `finish halted --step review-pr` |
+| `qa-pr` | `drive-spec cleanup` without `prReview`; `drive-spec qa`; `finish done`, or `finish halted --step qa-pr` |
 | any, `waiting` | `drive-spec ask`; `drive-spec answered` sets it `running` again |
 
 `step` is the step's name: `resolve`, `guard`, `worktree`, `preview`, `explore`, `build`, `review`, `confirm`, `cleanup`, `review-pr`, `qa-pr`.

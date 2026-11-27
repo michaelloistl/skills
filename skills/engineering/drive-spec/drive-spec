@@ -1537,6 +1537,7 @@ def brief(run, m, wt, base, continuing, local_only, key="", proof_doc=None):
     proof_doc = local.get("proof", "") if local_only else proof_doc
     return fill("IMPLEMENTER.md", {
         "path": wt, "m": m, "repo": run.repo, "spec": run.spec, "base": f"origin/{base}", "notes": run.notes,
+        "skill dir": Path(__file__).resolve().parent,
         "skill dir": Path(__file__).resolve().parent, "label": local.get("label", ""),
         "proof": proof_doc or "", "report": "<report>", "key": key}, {
         "continuing": continuing, "localOnly": local_only, "runProved": bool(proof_doc) and not local_only,
@@ -1624,7 +1625,7 @@ def cmd_start(spec, m, wait=None):
     path = write_brief(run, f"brief-{m}.md",
                        brief(run, m, wt, base, continuing, bool(local_label) and local_label in s["labels"],
                              tracker_key(run), proved and proved[1]))
-    print(f"next: an implementer subagent with the prompt `Read {path} and follow it.`")
+    print(f"next: an {subagent(run, 'implementer', 'implementer')} with the prompt `Read {path} and follow it.`")
     return 0
 
 
@@ -1659,6 +1660,34 @@ RESUME_PROMPT = ("Your last response did not end with a valid report block: {why
                  "\"deviations\": [...], \"unverified\": [...], \"proof\": ...}}</report>, as {brief} describes.")
 REPORT = re.compile(r"<report>(.*?)</report>\s*\Z", re.S)
 REPORT_TYPES = {"sha": str, "verdict": str, "verdictLine": str, "deviations": list, "unverified": list}
+
+
+# The model each role runs on, unless `models` in the config names another. Judging and building the change stay on
+# the strongest model; reading, merging, fixing named findings and driving a browser do not need it.
+DEFAULT_MODELS = {"implementer": "opus", "reviewer": "opus", "explorer": "sonnet", "merger": "sonnet",
+                  "fixer": "sonnet", "qa": "sonnet"}
+
+
+def model_of(run, role):
+    """The model a role runs on: `models` in the config, else DEFAULT_MODELS."""
+    models = run.config.get("models") or {}
+    if not isinstance(models, dict) or set(models) - set(DEFAULT_MODELS) \
+            or not all(isinstance(v, str) and v for v in models.values()):
+        raise Failed(".claude/drive-spec.json: `models` maps roles (" + ", ".join(DEFAULT_MODELS)
+                     + ") to model names", REFUSE)
+    return models.get(role, DEFAULT_MODELS[role])
+
+
+def subagent(run, role, kind):
+    """How a `next:` line names a subagent: its kind, and the model to pass as the Agent tool's `model`."""
+    return f"{kind} subagent on model `{model_of(run, role)}`"
+
+
+def with_model(run, role, argv):
+    """`argv` with `--model` for the role, when the agent is Claude Code and the argv names no model itself."""
+    if os.path.basename(argv[0]) != "claude" or any(x == "--model" or x.startswith("--model=") for x in argv):
+        return list(argv)
+    return [*argv, "--model", model_of(run, role)]
 
 
 def agent_argv(run):
@@ -1720,7 +1749,8 @@ def launch(run, m, role, wt, brief_path, argv=None, prompt=None):
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"agent-{m}-{role}.log"
     with open(log, "a") as out:
-        proc = subprocess.Popen([*(argv or agent_argv(run)), prompt or f"Read {brief_path} and follow it."], cwd=wt,
+        proc = subprocess.Popen([*with_model(run, role, argv or agent_argv(run)),
+                                 prompt or f"Read {brief_path} and follow it."], cwd=wt,
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
                                 env=agent_env())
     return proc, log
@@ -2260,7 +2290,7 @@ def cmd_explore(spec):
         "open": ", ".join(f"#{m}" for m in open_) or "none",
         "todo": ", ".join(f"issue-{m}.md" for m in todo) or "every slice already has one; refresh none",
         "skill dir": Path(__file__).resolve().parent}))
-    print(f"next: a general-purpose subagent with the prompt `Read {path} and follow it.`; then "
+    print(f"next: a {subagent(run, 'explorer', 'general-purpose')} with the prompt `Read {path} and follow it.`; then "
           f"`drive-spec explored {spec}`")
     return 0
 
@@ -2467,8 +2497,11 @@ def read_round(run, k, wt):
         faults += [f"checked: no entry for {doc}: read it in full" for doc in rule_docs(run, wt, base)
                    if doc not in checked]
         covered = {f for v in checked.values() for f in v}
+        since = json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if k > 1 else None
+        scope = git(wt, "diff", "--name-only", "--diff-filter=d", f"{since}..{head}").split() if since \
+            else changed_files(run, wt, head, base)
         faults += [f"checked: {f} is in the change, under no rule doc: read it in full"
-                   for f in changed_files(run, wt, head, base) if f not in covered]
+                   for f in scope if f not in covered]
     items = checklist(run, wt, base)
     if items is not None:
         triggered = data.get("triggered")
@@ -2533,8 +2566,9 @@ def judgement_calls(round_, base):
             for x in round_["findings"] if x["kind"] in ("judgement", "pre-existing")]
 
 
-def spec_head(run, plan, push):
-    """The spec worktree's HEAD, clean, level with origin and green; with `push`, a green HEAD ahead is pushed."""
+def spec_head(run, plan, push, gated=True):
+    """The spec worktree's HEAD, clean, level with origin and green; with `push`, a green HEAD ahead is pushed.
+    Without `gated`, as between review rounds, a HEAD ahead of origin need not be green yet: it stays unpushed."""
     spec = run.spec
     wt = run.root / f"spec-{spec}"
     if not wt.is_dir():
@@ -2572,14 +2606,15 @@ def spec_head(run, plan, push):
         elif not push:
             raise Failed(f"{wt} is not at origin/{branch}: push the fixes", REFUSE)
         elif not green(run, head, gate):
-            raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
+            if gated:
+                raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
         else:
             git(wt, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
             git(wt, "fetch", "--quiet", "origin")
             if git(wt, "rev-parse", f"origin/{branch}") != head:
                 raise Failed(f"pushed {head[:12]} to {branch}, but origin/{branch} is not there: push by hand")
             print(f"pushed {head[:12]} to {branch}")
-    if not green(run, head, gate):
+    if gated and not green(run, head, gate):
         raise Failed(f"{head[:12]} is not verified green: {verify_cmd}, then this again", REFUSE)
     return wt, head
 
@@ -2612,7 +2647,7 @@ def cmd_review(spec):
     open_ = [f"#{x['number']}" for x in plan["slices"] if x["state"] != "closed"]
     if open_:
         raise Failed(f"not every slice is closed: {', '.join(open_)}", REFUSE)
-    wt, head = spec_head(run, plan, push=True)
+    wt, head = spec_head(run, plan, push=True, gated=False)
     ks = review_rounds(run)
     k = ks[-1] if ks else 0
     decided = (run.notes / "decisions.md").is_file()
@@ -2620,7 +2655,7 @@ def cmd_review(spec):
     if k:
         result = round_file(run, k, "json")
         if not result.is_file():
-            print(f"round {k} waits for its reviewer: a subagent with the prompt "
+            print(f"round {k} waits for its reviewer: a {subagent(run, 'reviewer', 'general-purpose')} with the prompt "
                   f"`Read {round_file(run, k, 'brief.md')} and follow it.`; then `drive-spec review {spec}` again")
             return 0
         data = read_round(run, k, wt)
@@ -2629,6 +2664,14 @@ def cmd_review(spec):
         calls = len(data["findings"]) - len(rules) - older
         calls_text = f"{calls} judgement call(s)" + (f" and {older} pre-existing bug(s)" if older else "")
         if data["head"] == head and not rules:
+            if not green(run, head, run_gate_of(run)):
+                run.status(step="review", state="running", summary=f"review clean at round {k}; the gate runs once "
+                           "now", next=f"drive-spec verify {spec} {wt}", branch=plan["spec_branch"])
+                raise Failed(f"review clean at round {k}, but {head[:12]} has no green gate verdict: "
+                             f"`drive-spec verify {spec} {wt}` in the background, then this again. A red goes to "
+                             "an implementer subagent in the spec worktree with its failing tail, and its fix to a "
+                             "new round", REFUSE)
+            spec_head(run, plan, push=True)
             run.status(step="review", state="running", summary=f"review clean at round {k}, {calls_text} "
                        "this round", next=f"drive-spec reviewed {spec}", branch=plan["spec_branch"])
             print(f"review clean at round {k}: next `drive-spec reviewed {spec}`")
@@ -2649,7 +2692,7 @@ def cmd_review(spec):
             run.status(step="review", state="running", summary=f"review round {k}: {len(rules)} finding(s) to fix, "
                        "fixing", next=f"drive-spec review {spec} once the fixes are green", branch=plan["spec_branch"])
             print(f"round {k} raised {len(rules)} finding(s) to fix and {calls_text}")
-            print(f"next: an implementer subagent with the prompt `Read {fix} and follow it.`; then "
+            print(f"next: an {subagent(run, 'fixer', 'implementer')} with the prompt `Read {fix} and follow it.`; then "
                   f"`drive-spec review {spec}` again")
             return 0
     k += 1
@@ -2660,12 +2703,14 @@ def cmd_review(spec):
     slices = ", ".join(f"#{x['number']}" for x in plan["slices"])
     brief_path = round_file(run, k, "brief.md")
     guarded = guarded_changes(run, wt, f"origin/{run.base()}")
+    prior = json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else ""
     brief_path.write_text(fill("REVIEWER.md", {
         "path": wt, "head": head, "base": run.base(), "spec": spec, "repo": run.repo, "slices": slices,
         "notes": run.notes, "k": k, "earlier": ", ".join(f"`{e}`" for e in earlier),
-        "since": json.loads(round_file(run, k - 1, "meta.json").read_text())["head"] if earlier else "",
+        "since": prior,
         "out": round_file(run, k, "json"), "key": key, "guarded": "; ".join(guarded),
         "skill dir": Path(__file__).resolve().parent,
+        "scope": f"{prior}..{head}" if earlier else f"origin/{run.base()}...{head}",
         "rules": ", ".join(f"`{x}`" for x in rule_docs(run, wt))
         or "none found on base: read `CLAUDE.md` or `AGENTS.md` and every document they point at"}, {
         "decided": decided, "covered": (run.notes / "coverage.md").is_file(), "earlier": bool(earlier),
@@ -2674,7 +2719,7 @@ def cmd_review(spec):
     run.status(step="review", state="running", summary=f"review round {k} at {head[:12]}",
                next=f"drive-spec review {spec} once the reviewer writes its findings", branch=plan["spec_branch"])
     print(f"brief: {brief_path}")
-    print(f"next: a reviewer subagent with the prompt `Read {brief_path} and follow it.`; then "
+    print(f"next: a {subagent(run, 'reviewer', 'reviewer')} with the prompt `Read {brief_path} and follow it.`; then "
           f"`drive-spec review {spec}` again")
     return 0
 
@@ -2802,11 +2847,13 @@ def cmd_cleanup(spec):
         removed.append("notes")
     spec_pr = spec_pr_of(run, run.base(), plan["spec_branch"])
     url = spec_pr["url"] if spec_pr else None
-    run.status(step="review-pr", state="running",
+    # `prReview` adds /review-fix-pr's pass over the spec PR; step 7's rounds already reviewed it, so it is opt-in.
+    pr_review = run.config.get("prReview") is True
+    run.status(step="review-pr" if pr_review else "qa-pr", state="running",
                summary="cleaned up: " + (", ".join(removed) or "nothing left")
-               + (f"; reviewing and fixing PR #{spec_pr['number']}" if spec_pr else ""),
-               next=f"/review-fix-pr, then drive-spec qa {spec}", branch=plan["spec_branch"],
-               **({"pr_url": url} if url else {}))
+               + (f"; {'reviewing and fixing' if pr_review else 'QA of'} PR #{spec_pr['number']}" if spec_pr else ""),
+               next=f"/review-fix-pr, then drive-spec qa {spec}" if pr_review else f"drive-spec qa {spec}",
+               branch=plan["spec_branch"], **({"pr_url": url} if url else {}))
     print("removed " + (", ".join(removed) or "nothing"))
     print(url or "no open spec PR")
     return 0
@@ -2830,7 +2877,8 @@ def cmd_qa(spec):
     run.status(step="qa-pr", state="running", summary=f"running QA on PR #{spec_pr['number']}",
                next=f"a QA subagent runs /qa-pr {spec_pr['number']}, then drive-spec finish done",
                branch=plan["spec_branch"], pr_url=spec_pr["url"])
-    print(f"next: a QA subagent with the prompt `{qa_prompt(spec_pr['number'])}`; then `drive-spec finish {spec} done`")
+    print(f"next: a {subagent(run, 'qa', 'QA')} with the prompt `{qa_prompt(spec_pr['number'])}`; "
+          f"then `drive-spec finish {spec} done`")
     return 0
 
 
@@ -2934,7 +2982,8 @@ def next_step(run, status):
         if run.config.get("qa") is False:
             return step, f"`drive-spec finish {spec} done`"
         pr = (status.get("pr_url") or "").rsplit("/", 1)[-1]
-        return step, f"a QA subagent with the prompt `{qa_prompt(pr)}`, then `drive-spec finish {spec} done`"
+        return step, (f"a {subagent(run, 'qa', 'QA')} with the prompt `{qa_prompt(pr)}`, "
+                      f"then `drive-spec finish {spec} done`")
     if step == "build":
         flags = (" --sequential" if status.get("sequential") is True else "") + \
             (f" --max {status['max']}" if status.get("max") is not None else "")
