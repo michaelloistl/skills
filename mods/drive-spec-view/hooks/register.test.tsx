@@ -192,6 +192,42 @@ test('opens the pane on its own once this session drives a run, and not again on
   expect(opens).toBe(1)
 })
 
+test('does not open the pane on its own in a Rex pane, but still sets the status line', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'drive-spec-view' } }))
+  let opens = 0
+  on('ui.open', () => {
+    opens++
+    return { value: { isPlaced: true } }
+  })
+  on('ui.panes', () => ({ value: [] }))
+  const lines: (string | undefined)[] = []
+  on('ui.status', (_, e) => {
+    lines.push(e.text)
+    return { value: undefined }
+  })
+  mock.clock(on, { now: NOW })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('env.get', (_, e) => ({ value: e.name === 'REX_BLOCK' ? 'block:1' : undefined }))
+  on('fs.exists', (_, e) => ({ value: e.path === STATUS }))
+  on('fs.list', () => ({ value: [{ name: 'spec-10.json', kind: 'file' as const, size: 1, mtimeMs: NOW, isLink: false }] }))
+  on('fs.stat', () => ({ value: { kind: 'file' as const, size: 0, mtimeMs: NOW, isLink: false } }))
+  on('fs.read', (_, e) => {
+    const text = FILES[e.path]
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('process.run', () => ({
+    value: { exitCode: 0, stdout: `${COMMON}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await until(() => Boolean(lines.at(-1)?.includes('drive-spec #10')))
+  expect(lines.at(-1)).toContain('drive-spec #10')
+  expect(opens).toBe(0)
+})
+
 describe('which run', () => {
   const runs = new Map<number, Record<string, unknown>>([
     [10, { state: 'running', session_id: 'a' }],

@@ -324,7 +324,8 @@ async function load($: EngineInterface, forcePlan: boolean): Promise<void> {
     await update($, model, () => ({ repoUrl: githubUrl(str(status.repo)) || repoUrl, run, runs: runRows(runs) }))
     $.ui.status(statusLine(run))
     // The web app queues a typed command behind the turn: open the pane unasked once this session's run shows up.
-    if (why === 'this session' && (await read($, autoOpened)) !== spec) {
+    // Not in Rex, which shows the run in its own pane (alt+cmd+r).
+    if (why === 'this session' && (await read($, autoOpened)) !== spec && !(await $.env.get('REX_BLOCK'))) {
       await update($, autoOpened, () => spec)
       if (!(await isOpen($))) void $.ui.open({ id: PANE, title: TITLE })
     }
