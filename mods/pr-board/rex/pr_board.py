@@ -760,9 +760,9 @@ class App:
         if self.block:
             try:
                 args = {'block_id': self.block, 'method': 'process'}
-                process = rex_call('block.method', args, self.session)
+                process = rex_call('block.method', args, self.session or self.block)
                 pwd = None if (process.get('foreground') or {}).get('cwd') else \
-                    rex_call('block.method', {**args, 'method': 'pwd'}, self.session)
+                    rex_call('block.method', {**args, 'method': 'pwd'}, self.session or self.block)
                 found, pid = block_place(process, pwd)
                 cwd = found or cwd
             except (RuntimeError, ValueError) as err:
