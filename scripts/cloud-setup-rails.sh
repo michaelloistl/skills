@@ -140,7 +140,8 @@ node-up
 # 9>&-: the daemons must not inherit the lock, or it outlives this script and
 # every later run, such as the next session start's, waits on it forever.
 service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null 9>&-
-redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes >/dev/null 9>&-
+# --dir /tmp --save "": Redis would snapshot dump.rdb into the caller's directory, the repo.
+redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes --dir /tmp --save "" >/dev/null 9>&-
 EOF
 chmod +x /usr/local/bin/rails-services-up
 

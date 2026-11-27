@@ -2381,6 +2381,7 @@ class Open(DispatcherCase):
         self.assertEqual(out.returncode, 6, out.stderr)
         self.assertIn("bootstrap of spec-10 still running", out.stdout)
         self.assertIn("installing gems", out.stdout)
+        self.assertRegex(out.stdout, r"; deepest command: \(?(sleep|sh|bash|seq)")
         out = self.run_ds("open", "10", "--wait-minutes", "0.01")
         self.assertEqual(out.returncode, 6, out.stderr)
         (self.tmp / "go").write_text("")
@@ -2729,6 +2730,32 @@ class Boundaries(DispatcherCase):
         r = self.row()
         self.assertEqual((r["attention"], r["step"]), ("HALT", "explore"))
 
+    def test_a_conflicts_halt_posts_the_open_questions_too(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export → #11\n", questions="- Q1: Public or sign-in? Recommend public.\n",
+                           conflicts="- #11 says CSV; #12 says JSON\n  Recommend: CSV, as the spec names it.\n")
+        self.assertEqual(self.run_ds("explored", "10").returncode, 3)
+        body = self.comments(10)[0]
+        self.assertIn("Recommend: CSV, as the spec names it.", body)
+        self.assertIn("- Q1: Public or sign-in? Recommend public.", body)
+
+    def test_explored_check_holds_the_notes_to_their_form_and_posts_nothing(self):
+        self.run_ds("gate", "10", GATE)
+        self.write_explore("- Export → #11 and #12, both\n- Route → unmapped\n",
+                           questions="- Q1: Public or sign-in?\n")
+        out = self.run_ds("explored", "10", "--check")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("coverage.md lines fit no form", out.stderr)
+        self.write_explore("- Export → #11\n- Route → unmapped\n", questions="- Q1: Public or sign-in?\n",
+                           conflicts="- #11 says CSV; #12 says JSON\n")
+        self.assertIn("no `Recommend:` line", self.run_ds("explored", "10", "--check").stderr)
+        self.write_explore("- Export → #11\n- Route → unmapped\n", questions="- Q1: Public or sign-in?\n",
+                           conflicts="- #11 says CSV; #12 says JSON\n  Recommend: CSV.\n")
+        out = self.run_ds("explored", "10", "--check")
+        self.assertEqual((out.returncode, out.stdout), (0, "the notes fit EXPLORER.md\n"), out.stderr)
+        self.assertEqual(self.comments(10), [])
+        self.assertFalse((self.notes() / "explored.json").exists())
+
     def test_explored_reads_a_conflicts_file_naming_no_issue_as_none(self):
         self.run_ds("gate", "10", GATE)
         for name in ("issue-11.md", "issue-12.md"):
@@ -3015,6 +3042,52 @@ class Boundaries(DispatcherCase):
         out = self.run_ds("review", "10")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue((self.notes() / "review" / "round-2.brief.md").exists())
+
+    def test_a_round_is_held_to_base_as_its_brief_found_it(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        work = self.tmp / "late-checklist"
+        self.git(self.tmp, "clone", "-q", str(self.origin), str(work))
+        self.commit(work, "REVIEW.md", "# Review\n\n## Late item\nTrigger: any.\nCheck: x.\nWhy: y\n", "Add a checklist")
+        self.git(work, "push", "-q", "origin", "main")
+        self.round_(1, self.RULE)
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round 1 raised 1 finding(s) to fix", out.stdout)
+
+    def test_an_answer_holds_for_a_round_amended_after_it(self):
+        (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 1}))
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.run_ds("review", "10")
+        self.round_(1, self.RULE)
+        self.assertEqual(self.run_ds("review", "10").returncode, 2)
+        self.run_ds("ask", "10", "Round 1 still raised a rule finding; go on?")
+        self.run_ds("answered", "10", "go on")
+        self.round_(1, self.RULE, self.CALL)
+        out = self.run_ds("review", "10")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue((self.notes() / "review" / "round-1.fix.md").exists())
+
+    def test_check_holds_the_last_round_to_its_form_and_changes_nothing(self):
+        self.run_ds("gate", "10", GATE)
+        self.close_all()
+        self.run_ds("verify", "10", str(self.spec_wt))
+        self.assertEqual(self.run_ds("review", "10", "--check").returncode, 2)
+        self.run_ds("review", "10")
+        self.assertIn("review 10 --check`", (self.notes() / "review" / "round-1.brief.md").read_text())
+        self.round_(1, {"kind": "bug", "finding": "Breaks."})
+        out = self.run_ds("review", "10", "--check")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("finding 1: a bug finding says not how it fails", out.stderr)
+        self.round_(1, self.RULE, self.CALL)
+        out = self.run_ds("review", "10", "--check")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "round 1 fits REVIEWER.md: rule 1, bug 0, pre-existing 0, judgement 1\n")
+        self.assertFalse((self.notes() / "review" / "round-1.fix.md").exists())
 
     def test_rounds_past_the_cap_go_on_while_each_raises_new_findings(self):
         (self.repo / ".claude" / "drive-spec.json").write_text(json.dumps({"verify": GATE, "reviewRounds": 2}))

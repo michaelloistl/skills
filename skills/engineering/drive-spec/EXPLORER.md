@@ -22,7 +22,9 @@ Write, in the notes directory:
       - PDF export → out of scope: "PDF stays out of this spec"
 
 - `questions.md`, fresh: one line per decision the spec leaves to the operator, `- Q1: QUESTION`, numbered on from Q1, each question with its options and the recommendation, the spec's where it gives one, with its reason. A spec or slice line that contradicts an ADR, an amendment included, is one too: quote both, and give amending the ADR and changing the spec as options. Empty when the spec leaves none.
-- `conflicts.md`, fresh: two open issues that cannot both be built as written, in any order, naming both by number (`#12`) and quoting both lines; empty, or the one word `none`, when there are none. A later slice extending an earlier one is build order, not a conflict; a choice the spec leaves open goes in `questions.md`; a clash with the existing code goes in that slice's notes.
+- `conflicts.md`, fresh: two open issues that cannot both be built as written, in any order, naming both by number (`#12`) and quoting both lines, then a `Recommend:` line saying which line you would change and why; empty, or the one word `none`, when there are none. A later slice extending an earlier one is build order, not a conflict; a choice the spec leaves open goes in `questions.md`; a clash with the existing code goes in that slice's notes.
+
+Then run `<skill dir>/drive-spec explored <spec> --check`, which records and posts nothing: it names each note missing or out of form. Done when it exits 0.
 
 Report back in a few lines: the files written, the ADRs listed, the unmapped requirements, the questions, the conflicts.
 ```

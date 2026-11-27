@@ -13,12 +13,12 @@ Read first: `CLAUDE.md` or `AGENTS.md`, and anything they point at. Match the re
 
 Account for every comment in scope: fix it, or decline it with a reason when it is already resolved, purely informational, wrong, or would undo an operator decision. Change only what the feedback asks for. Test-first where a test can exist: write it, watch it fail, make it pass, one behaviour at a time. Refactor only when green.
 
-Verify gate, run once everything is committed, must print `green` before you finish: `<verify command>`. Run it in the foreground with a 3-minute Bash timeout: a subagent's command still running at 3 minutes moves to the background. It runs the gate on your HEAD and records the verdict against that commit; the orchestrator checks that record before it pushes. Exit 6 prints `running …`: the gate goes on, so run the same command again, which re-attaches to it, until it prints a verdict. Its exit code is the verdict, so run it bare: no pipe and no command after it.
+Before you finish, run the repo's lint command, as `CLAUDE.md` or `AGENTS.md` names it, and the tests of every class you changed, until both pass, and commit everything. The orchestrator runs the full verify gate on your HEAD once you report; a red comes back to you with its failing tail, to fix, commit and report again.
 
 Commit in imperative present tense, one commit or a few focused ones, subject line only. No Co-Authored-By, no generated-with trailer.
 
 Report back:
-- the commit SHAs, and the verdict line the verify command printed, quoted verbatim (`green <sha>`, or `red <sha>: …`). Red means the verify gate is failing and why; report it as red rather than committing around it.
+- the commit SHAs, and the lint and test commands you ran with their results. A failure you could not fix is red: report it as red, naming the test, rather than committing around it.
 - **SUMMARY** — short Markdown of what changed, for a top-level PR comment.
 - **REPLIES** — one entry per inline comment in scope: its numeric id and a short reply (what changed, or why declined).
 ```
