@@ -15,11 +15,11 @@ def session(id, status, age=60, **extra):
 
 
 class RowsTest(unittest.TestCase):
-    def test_groups_needs_you_first_then_working(self):
+    def test_groups_needs_you_then_working_then_done(self):
         got = c.rows([session('a', 'running'), session('b', 'idle'), session('c', 'requires_action'),
                       session('d', 'failed'), session('e', 'pending'), session('f', 'archived')], NOW)
-        self.assertEqual([r['id'] for r in got], ['c', 'd', 'b', 'a', 'e'])
-        self.assertEqual([r['group'] for r in got], ['needs'] * 3 + ['working'] * 2)
+        self.assertEqual([r['id'] for r in got], ['c', 'd', 'a', 'e', 'b'])
+        self.assertEqual([r['group'] for r in got], ['needs'] * 2 + ['working'] * 2 + ['done'])
 
     def test_most_recent_first_within_a_state(self):
         got = c.rows([session('old', 'running', age=600), session('new', 'running', age=5)], NOW)
@@ -89,6 +89,69 @@ class RenderTest(unittest.TestCase):
         self.assertIn('Session a', out)
 
 
+def idle(id, bucket=None, category=None, needs='', **extra):
+    return session(id, 'idle', status_bucket=bucket,
+                   post_turn_summary={'status_category': category, 'needs_action': needs}, **extra)
+
+
+class StateTest(unittest.TestCase):
+    def test_idle_sessions_sort_by_their_bucket_first(self):
+        self.assertEqual(c.state(idle('a', 'working', 'review_ready')), 'waiting')
+        self.assertEqual(c.state(idle('a', 'review_ready', 'completed')), 'review')
+        self.assertEqual(c.state(idle('a', 'need_input')), 'input')
+        self.assertEqual(c.state(idle('a', 'completed', 'completed')), 'done')
+
+    def test_without_a_bucket_the_turn_category_decides(self):
+        self.assertEqual(c.state(idle('a', None, 'need_input')), 'input')
+        self.assertEqual(c.state(idle('a', None, 'failed')), 'failed')
+        self.assertEqual(c.state(idle('a')), 'done')
+
+    def test_a_completed_turn_naming_an_action_needs_you(self):
+        self.assertEqual(c.state(idle('a', 'completed', 'completed', needs='Merge PR #5')), 'input')
+
+    def test_running_and_approval_come_from_session_status(self):
+        self.assertEqual(c.state(session('a', 'running', status_bucket='completed')), 'running')
+        self.assertEqual(c.state(session('a', 'requires_action')), 'approval')
+        self.assertIsNone(c.state(session('a', 'archived')))
+
+
+class CardTest(unittest.TestCase):
+    SESSION = idle('s', 'review_ready', 'review_ready', needs='Approve the PR',
+                   unread=True, connection_status='disconnected',
+                   session_context={'outcomes': [{'git_info': {'repo': 'org/app', 'branches': ['b1']}}]},
+                   external_metadata={'current_branches': {'': 'b2'}, 'unpushed_work': True,
+                                      'context_usage': {'used_tokens': 250, 'max_tokens': 1000},
+                                      'usage': {'cost_usd': 3.456}, 'last_served_model': 'claude-opus-5-5',
+                                      'post_turn_summary': {}},
+                   )
+
+    def card(self, width=80, hover=False):
+        import re
+        s = dict(self.SESSION)
+        s['post_turn_summary'] = {**s['post_turn_summary'], 'status_detail': 'PR #9 ready',
+                                  'recent_action': 'Pushed three commits and opened PR #9. ' * 6}
+        [r] = c.rows([s], NOW)
+        return [re.sub(r'\033\[[0-9;?]*[A-Za-z]', '', l) for l in c.card(0, r, width, hover, False)]
+
+    def test_card_shows_the_session_at_a_glance(self):
+        text = '\n'.join(self.card())
+        self.assertIn('◆ Session s', text)
+        self.assertIn('ready for review · 1m ●', text)
+        self.assertIn('PR #9 ready', text)
+        self.assertIn('→ Approve the PR', text)
+        self.assertIn('app · b2 ⚑ unpushed', text)
+        self.assertIn('ctx 25% · $3.46 · opus-5-5 · offline', text)
+
+    def test_every_card_line_is_the_card_width(self):
+        for width in (40, 80):
+            for l in self.card(width):
+                self.assertEqual(len(l), width, l)
+
+    def test_hover_shows_more_of_the_recent_action(self):
+        self.assertGreater(len(self.card(hover=True)), len(self.card()))
+        self.assertLessEqual(len(self.card(hover=True)) - len(self.card()), c.HOVER_LINES - 2)
+
+
 class AccountTest(unittest.TestCase):
     def test_default_folder_also_tries_the_plain_keychain_item(self):
         a = c.account('/h/.claude', home='/h')
@@ -150,21 +213,25 @@ class AccountTest(unittest.TestCase):
         one = [{**r, 'account': 'claude'} for r in c.rows([session('a', 'running')], NOW)]
         two = one + [{**r, 'account': 'claude-on'} for r in c.rows([session('b', 'running')], NOW)]
         strip = lambda ls: re.sub(r'\033\[[0-9;?]*[A-Za-z]', '', '\n'.join(ls))
-        self.assertNotIn('claude ·', strip(c.render(one, 80)))
-        self.assertIn('claude-on · running', strip(c.render(two, 80)))
+        self.assertNotIn('│ claude ', strip(c.render(one, 80)))
+        self.assertIn('│ claude-on ', strip(c.render(two, 80)))
 
 
 class ClickTest(unittest.TestCase):
-    def test_hits_map_each_row_and_its_detail_line_to_its_item(self):
+    def test_hits_map_every_line_of_a_card_to_its_session(self):
         items = c.rows([session('a', 'running'),
                         session('b', 'requires_action', external_metadata={'pending_action': {'tool_name': 'Bash'}})], NOW)
         hits = []
         lines = c.render(items, 80, hits=hits)
         self.assertEqual(len(hits), len(lines))
-        shown = [(c.KEYS[i], l) for i, l in zip(hits, lines) if i is not None]
-        self.assertEqual([k for k, _ in shown], ['1', '1', '2'])
-        self.assertIn('Bash wants approval', shown[1][1])
-        self.assertIsNone(hits[0])
+        by_item = {}
+        for i, l in zip(hits, lines):
+            by_item.setdefault(i, []).append(l)
+        self.assertEqual(set(by_item) - {None}, {0, 1})
+        self.assertIn('╭', by_item[0][0])
+        self.assertIn('╰', by_item[0][-1])
+        self.assertTrue(any('Bash wants approval' in l for l in by_item[0]))
+        self.assertTrue(all('Session' not in l for l in by_item[None]))
 
     def test_parse_input_reads_left_presses_and_keys(self):
         data = '\033[<0;12;5M\033[<0;12;5m' + 'r' + '\033[<2;3;4M' + '\033[<64;1;1M'
@@ -205,15 +272,15 @@ class ClickTest(unittest.TestCase):
 
     def test_approval_uses_the_display_name(self):
         items = self.approval_rows(display_tool_name='Edit file')
-        self.assertEqual(items[0]['detail'], 'Edit file wants approval')
+        self.assertEqual(items[0]['headline'], 'Edit file wants approval')
 
     def test_hovered_approval_is_wrapped_and_capped(self):
         items = self.approval_rows(input={'command': 'x' * 1000})
         plain = lambda ls: [__import__('re').sub(r'\033\[[0-9;?]*[A-Za-z]', '', l) for l in ls]
         lines = plain(c.render(items, 60, hover=0))
-        body = [l for l in lines if '│' in l]
+        body = [l for l in lines if '│ │ ' in l]
         self.assertEqual(len(body), c.HOVER_LINES)
-        self.assertTrue(body[-1].endswith('…'))
+        self.assertIn('…', body[-1])
         for l in lines:
             self.assertLessEqual(len(l), 60, l)
 

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import termios
+import textwrap
 import time
 import tty
 import urllib.error
@@ -28,9 +29,19 @@ WEB = 'https://claude.ai/code/'
 BASE_SERVICE = 'Claude Code-credentials'
 KEYS = '123456789abcdefghijklmnopstuvwxyz'  # q and r are commands
 
-NEEDS = {'requires_action': 'needs approval', 'failed': 'failed', 'idle': 'awaiting reply'}
-WORKING = {'running': 'running', 'pending': 'starting'}
-ORDER = {'requires_action': 0, 'failed': 1, 'idle': 2, 'running': 3, 'pending': 4}
+# Each state: its group, label, glyph and colour. Order here is the order on screen.
+STATES = {
+    'approval': ('needs', 'needs approval', '⚠', 'needs'),
+    'failed': ('needs', 'failed', '✗', 'failed'),
+    'input': ('needs', 'needs input', '?', 'needs'),
+    'review': ('needs', 'ready for review', '◆', 'needs'),
+    'running': ('working', 'running', '↻', 'working'),
+    'starting': ('working', 'starting', '◌', 'working'),
+    'waiting': ('working', 'working · idle', '◷', 'working'),
+    'done': ('done', 'done', '✓', 'done'),
+}
+ORDER = {k: i for i, k in enumerate(STATES)}
+GROUPS = (('needs', 'NEEDS YOU'), ('working', 'WORKING'), ('done', 'DONE'))
 
 
 def parse_time(s):
@@ -88,43 +99,127 @@ def approval(session):
 
 
 def wrap(lines, width, max_lines):
-    """Lines cut into width-wide pieces, at most max_lines, the last ending in … when cut short."""
+    """Lines wrapped at word breaks to width, at most max_lines, the last ending in … when cut short."""
     out = []
     for line in lines:
-        while line and len(out) <= max_lines:
-            out.append(line[:width])
-            line = line[width:]
+        out += textwrap.wrap(line, width, break_on_hyphens=False) or ['']
+        if len(out) > max_lines:
+            break
     if len(out) > max_lines:
         out = out[:max_lines]
         out[-1] = out[-1][:max(0, width - 1)] + '…'
     return out
 
 
+def state(session):
+    """The session's state: from session_status while it runs or waits on approval, else from
+    status_bucket, the server's own sorting, then from how its last turn ended."""
+    status = session.get('session_status')
+    if status == 'requires_action':
+        return 'approval'
+    if status == 'failed':
+        return 'failed'
+    if status == 'running':
+        return 'running'
+    if status == 'pending':
+        return 'starting'
+    if status != 'idle':
+        return None
+    summary = turn_summary(session)
+    category = summary.get('status_category') or ''
+    bucket = session.get('status_bucket') or ''
+    for value in (bucket, category):
+        if value == 'failed':
+            return 'failed'
+        if value in ('need_input', 'blocked'):
+            return 'input'
+        if value == 'review_ready':
+            return 'review'
+        if value == 'working':
+            return 'waiting'
+        if value == 'completed':
+            return 'input' if text(summary.get('needs_action')) else 'done'
+    return 'input' if text(summary.get('needs_action')) else 'done'
+
+
+def turn_summary(session):
+    meta = session.get('external_metadata') or {}
+    summary = session.get('post_turn_summary') or meta.get('post_turn_summary')
+    return summary if isinstance(summary, dict) else {}
+
+
+def text(value):
+    return value.strip() if isinstance(value, str) else ''
+
+
+def repo_and_branch(session):
+    meta = session.get('external_metadata') or {}
+    repo, branch = '', ''
+    for outcome in (session.get('session_context') or {}).get('outcomes') or []:
+        info = (outcome or {}).get('git_info') or {}
+        if info.get('repo'):
+            repo = info['repo']
+            branch = (info.get('branches') or [''])[0]
+            break
+    branches = meta.get('current_branches')
+    if isinstance(branches, dict) and branches:
+        branch = next(iter(branches.values())) or branch
+    return repo, branch
+
+
+def context_share(session):
+    usage = (session.get('external_metadata') or {}).get('context_usage') or {}
+    used, top = usage.get('used_tokens'), usage.get('max_tokens')
+    return used / top if isinstance(used, (int, float)) and isinstance(top, (int, float)) and top else None
+
+
 def rows(sessions, now, max_age_days=2.0):
-    """The sessions worth showing, needs-you first, then by most recent update."""
+    """The sessions worth showing, needs-you first, then by most recent update.
+
+    Done and failed sessions not updated for max_age_days are left out; so are archived ones.
+    """
     out = []
     for s in sessions:
-        status = s.get('session_status')
-        if status not in ORDER:
+        st = state(s)
+        if st is None:
             continue
         updated = parse_time(s.get('updated_at') or s.get('created_at'))
         age = None if updated is None else now - updated
-        if status in NEEDS and status != 'requires_action' and age is not None and age > max_age_days * 86400:
+        if st in ('done', 'failed') and age is not None and age > max_age_days * 86400:
             continue
+        group, label, _, _ = STATES[st]
+        meta = s.get('external_metadata') or {}
+        summary = turn_summary(s)
+        repo, branch = repo_and_branch(s)
+        cost = (meta.get('usage') or {}).get('cost_usd')
         out.append({
             'id': s.get('id'),
             'title': s.get('title') or s.get('id') or '?',
-            'status': status,
-            'group': 'needs' if status in NEEDS else 'working',
-            'label': NEEDS.get(status) or WORKING.get(status),
-            'detail': detail(s),
+            'status': st,
+            'group': group,
+            'label': label,
+            'headline': detail(s) or text(summary.get('status_detail')),
+            'needs': text(summary.get('needs_action')),
+            'recent': text(summary.get('recent_action')),
+            'task': text(s.get('task_summary')) or text(meta.get('task_summary')),
             'approval': approval(s),
+            'repo': repo,
+            'branch': branch,
+            'unpushed': meta.get('unpushed_work') is True,
+            'context': context_share(s),
+            'cost': cost if isinstance(cost, (int, float)) else None,
+            'model': text(meta.get('last_served_model')) or text(s.get('configured_model')),
+            'unread': s.get('unread') is True,
             'age': age,
             'url': WEB + str(s.get('id')),
             'offline': s.get('connection_status') == 'disconnected',
         })
-    out.sort(key=lambda r: (ORDER[r['status']], r['age'] if r['age'] is not None else float('inf')))
+    out.sort(key=sort_key)
     return out
+
+
+def sort_key(r):
+    return (ORDER[r['status']], r['age'] if r['age'] is not None else float('inf'))
 
 
 def newly_needing(before, after):
@@ -224,73 +319,125 @@ def fetch_all(accounts, now, max_age_days, fetch=fetch):
             if r['id'] not in seen:
                 seen.add(r['id'])
                 items.append({**r, 'account': acct['label']})
-    items.sort(key=lambda r: (ORDER[r['status']], r['age'] if r['age'] is not None else float('inf')))
+    items.sort(key=sort_key)
     return items, errors
 
 
 # --- render ------------------------------------------------------------------
 
-C = {'needs': '\033[33m', 'failed': '\033[31m', 'working': '\033[36m', 'dim': '\033[2m',
-     'bold': '\033[1m', 'off': '\033[0m'}
-GLYPH = {'requires_action': '⚠', 'failed': '✗', 'idle': '●', 'running': '↻', 'pending': '◌'}
-
-
-HOVER_LINES = 6  # most lines a hovered approval's detail takes
+C = {'needs': '\033[33m', 'failed': '\033[31m', 'working': '\033[36m', 'done': '\033[32m',
+     'dim': '\033[2m', 'bold': '\033[1m', 'off': '\033[0m'}
+HOVER_LINES = 6  # most lines a hovered card's recent action or approval takes
+CARD_MAX = 100   # widest a card grows
 
 
 def link(text, hovered):
-    return f'{C["bold"]}\033[4m{text}{C["off"]}' if hovered else text
+    return f'{C["bold"]}\033[4m{text}{C["off"]}' if hovered else f'{C["bold"]}{text}{C["off"]}'
 
 
 def cut(text, n):
     return text if len(text) <= n else text[:max(0, n - 1)] + '…'
 
 
+def short_model(model):
+    return model[len('claude-'):] if model.startswith('claude-') else model
+
+
+def facts(r, tagged):
+    """The card's last lines: repo and branch, then context, cost, model, account, offline."""
+    where = ' · '.join(x for x in (r['repo'].split('/')[-1], r['branch']) if x)
+    if r['unpushed']:
+        where += (' ' if where else '') + '⚑ unpushed'
+    stats = []
+    if r['context'] is not None:
+        stats.append(f'ctx {round(r["context"] * 100)}%')
+    if r['cost'] is not None:
+        stats.append(f'${r["cost"]:.2f}')
+    if r['model']:
+        stats.append(short_model(r['model']))
+    if tagged and r.get('account'):
+        stats.append(r['account'])
+    if r['offline']:
+        stats.append('offline')
+    return [x for x in (where, ' · '.join(stats)) if x]
+
+
+def card(i, r, width, hovered, tagged):
+    """One session as a bordered card, `width` cells wide including its border."""
+    _, _, glyph, tone = STATES[r['status']]
+    colour = C[tone]
+    inner = width - 4
+    key = KEYS[i] if i < len(KEYS) else ' '
+    right = f' {r["label"]} · {ago(r["age"])}{" ●" if r["unread"] else ""} '
+    left = f'╭ {key} {glyph} '
+    title_w = max(4, width - len(left) - len(right) - 3)
+    title = cut(r['title'], title_w)
+    fill = max(1, width - len(left) - len(title) - 1 - len(right) - 1)
+    lines = [f'{colour}╭{C["off"]} {C["dim"]}{key}{C["off"]} {colour}{glyph}{C["off"]} {link(title, hovered)} '
+             f'{colour}{"─" * fill}{right}╮{C["off"]}']
+
+    def row(content, style=''):
+        pad = ' ' * max(0, inner - len(content))
+        lines.append(f'{colour}│{C["off"]} {style}{content}{C["off"] if style else ""}{pad} {colour}│{C["off"]}')
+
+    def para(body, max_lines, style='', prefix=''):
+        for piece in wrap([body], inner - len(prefix), max_lines):
+            row(prefix + piece, style)
+            prefix = ' ' * len(prefix)
+
+    if r['headline']:
+        para(r['headline'], 2)
+    if r['needs']:
+        para(r['needs'], 3, C['needs'], '→ ')
+    if hovered and r['approval']:
+        for piece in wrap(r['approval'], inner - 2, HOVER_LINES):
+            row(f'│ {piece}', C['needs'])
+    if r['task']:
+        para(r['task'], 1, C['working'], '↻ ')
+    if r['recent'] and r['recent'] != r['headline']:
+        para(r['recent'], HOVER_LINES if hovered else 2, C['dim'])
+    for line in facts(r, tagged):
+        row(cut(line, inner), C['dim'])
+    lines.append(f'{colour}╰{"─" * (width - 2)}╯{C["off"]}')
+    return lines
+
+
 def render(items, width, errors=(), fetched=None, now=None, hits=None, hover=None):
     """The screen's lines. Pass `hits` to get, per line, the index of the item it shows, or None.
 
-    The item at index `hover` shows its title underlined, like a link under the pointer.
+    Each session is a card. The one at index `hover` underlines its title, like a link under
+    the pointer, and shows its recent action and pending approval in full.
     """
     lines = []
+    card_w = max(30, min(CARD_MAX, width - 1))
     tagged = len({r.get('account') for r in items}) > 1
+
+    def mark(index):
+        if hits is not None:
+            hits.extend([index] * (len(lines) - len(hits)))
+
     head = f'{C["bold"]}Cloud sessions{C["off"]}'
     if fetched is not None and now is not None:
         head += f'  {C["dim"]}updated {ago(now - fetched)} ago{C["off"]}'
     lines.append(head)
     for error in errors:
         lines.append(f'{C["failed"]}{cut(error, width)}{C["off"]}')
-    for group, title in (('needs', 'NEEDS YOU'), ('working', 'WORKING')):
+    for group, title in GROUPS:
         group_items = [(i, r) for i, r in enumerate(items) if r['group'] == group]
+        if group == 'done' and not group_items:
+            continue
         lines.append('')
-        colour = C['needs'] if group == 'needs' else C['working']
+        colour = C['done'] if group == 'done' else C['needs'] if group == 'needs' else C['working']
         lines.append(f'{colour}{C["bold"]}{title}{C["off"]} {C["dim"]}{len(group_items)}{C["off"]}')
         if not group_items:
             lines.append(f'  {C["dim"]}none{C["off"]}')
+        mark(None)
         for i, r in group_items:
-            key = KEYS[i] if i < len(KEYS) else ' '
-            colour = C['failed'] if r['status'] == 'failed' else (C['needs'] if group == 'needs' else C['working'])
-            right = ago(r['age'])
-            label = r['label'] + (' · offline' if r['offline'] else '')
-            if tagged:
-                label = f"{r.get('account')} · {label}"
-            fixed = 2 + 2 + 2 + len(label) + 2 + len(right) + 1
-            title_w = max(8, min(40, width - fixed))
-            if hits is not None:
-                hits.extend([None] * (len(lines) - len(hits)))
-            lines.append(f' {C["dim"]}{key}{C["off"]} {colour}{GLYPH[r["status"]]}{C["off"]} '
-                         f'{link(cut(r["title"], title_w), i == hover)}{" " * (title_w - len(cut(r["title"], title_w)))}'
-                         f'  {colour}{label}{C["off"]}  {C["dim"]}{right}{C["off"]}')
-            if r['detail']:
-                lines.append(f'      {C["dim"]}{cut(r["detail"], max(10, width - 7))}{C["off"]}')
-            if i == hover and r.get('approval'):
-                for piece in wrap(r['approval'], max(10, width - 8), HOVER_LINES):
-                    lines.append(f'      {C["needs"]}│{C["off"]} {piece}')
-            if hits is not None:
-                hits.extend([i] * (len(lines) - len(hits)))
+            lines.extend(card(i, r, card_w, i == hover, tagged))
+            mark(i)
     lines.append('')
     lines.append(f'{C["dim"]}click or key opens in browser · r refresh · q quit{C["off"]}')
-    if hits is not None:
-        hits.extend([None] * (len(lines) - len(hits)))
+    mark(None)
     return lines
 
 
@@ -345,7 +492,7 @@ def loop(args):
                 new, errors = fetch_all(accounts, time.time(), args.max_age)
                 failed = {e.split(':', 1)[0] for e in errors}
                 new += [r for r in items if r.get('account') in failed]  # keep a failed account's last rows
-                new.sort(key=lambda r: (ORDER[r['status']], r['age'] if r['age'] is not None else float('inf')))
+                new.sort(key=sort_key)
                 if not first and args.notify:
                     for r in newly_needing(items, new):
                         notify(r)
@@ -386,11 +533,22 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--once', action='store_true', help='print the list and exit')
     p.add_argument('--json', action='store_true', help='print the rows as JSON and exit')
+    p.add_argument('--raw', action='store_true', help="print each account's sessions as the API returns them, and exit")
     p.add_argument('--interval', type=float, default=30, help='seconds between fetches (default 30)')
     p.add_argument('--max-age', type=float, default=2, help='hide idle and failed sessions older than this many days (default 2)')
     p.add_argument('--no-notify', dest='notify', action='store_false', help='no macOS notification when a session starts needing you')
     p.add_argument('--config-dir', action='append', help='a Claude Code config folder to read (repeatable; default ~/.claude and every signed-in ~/.claude-*)')
     args = p.parse_args()
+    if args.raw:
+        accounts = [account(d) for d in args.config_dir] if args.config_dir else default_accounts()
+        out = {}
+        for acct in accounts:
+            try:
+                out[acct['label']] = fetch(acct)
+            except Exception as e:
+                out[acct['label']] = {'error': str(e)}
+        print(json.dumps(out, indent=2))
+        return 0
     if args.once or args.json:
         accounts = [account(d) for d in args.config_dir] if args.config_dir else default_accounts()
         items, errors = fetch_all(accounts, time.time(), args.max_age)
