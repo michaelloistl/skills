@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Commit files to the evidence branch with git and push it: a cloud session's
+# GitHub proxy refuses REST writes to git data and contents (403), but lets
+# git push a new branch. Run inside the repo's checkout; the work tree, index
+# and HEAD stay untouched.
 set -euo pipefail
 
 repo="${1:?usage: upload-evidence.sh <owner/repo> <branch> <dir in branch> <file>...}"
@@ -6,20 +10,31 @@ branch="${2:?}"
 dest="${3:?}"
 shift 3
 
-if ! gh api "repos/$repo/branches/$branch" --silent 2>/dev/null; then
-  blob=$(printf '# QA evidence\n\nScreenshots that qa-pr comments embed. Nothing merges from here.\n' |
-    jq -Rs '{content: ., encoding: "utf-8"}' | gh api "repos/$repo/git/blobs" --input - --jq .sha)
-  tree=$(gh api "repos/$repo/git/trees" -f "tree[][path]=README.md" -f "tree[][mode]=100644" -f "tree[][type]=blob" -f "tree[][sha]=$blob" --jq .sha)
-  commit=$(gh api "repos/$repo/git/commits" -f message="Start QA evidence" -f tree="$tree" --jq .sha)
-  gh api "repos/$repo/git/refs" -f ref="refs/heads/$branch" -f sha="$commit" --silent
-fi
+tip=refs/qa-pr/evidence-tip
+index=$(mktemp -u)
+trap 'rm -f "$index"' EXIT
+
+# Retry: another QA run may push the branch between our fetch and push.
+for attempt in 1 2 3; do
+  rm -f "$index"
+  if git fetch -q origin "+refs/heads/$branch:$tip" 2>/dev/null; then
+    parent=$(git rev-parse "$tip")
+    GIT_INDEX_FILE=$index git read-tree "$parent"
+  else
+    parent=
+    readme=$(printf '# QA evidence\n\nScreenshots that qa-pr comments embed. Nothing merges from here.\n' | git hash-object -w --stdin)
+    GIT_INDEX_FILE=$index git update-index --add --cacheinfo "100644,$readme,README.md"
+  fi
+  for file in "$@"; do
+    blob=$(git hash-object -w "$file")
+    GIT_INDEX_FILE=$index git update-index --add --cacheinfo "100644,$blob,$dest/$(basename "$file")"
+  done
+  tree=$(GIT_INDEX_FILE=$index git write-tree)
+  commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "Add QA evidence $dest")
+  if git push -q origin "$commit:refs/heads/$branch"; then break; fi
+  if [ "$attempt" = 3 ]; then echo "upload-evidence: push to $branch failed" >&2; exit 1; fi
+done
 
 for file in "$@"; do
-  path="$dest/$(basename "$file")"
-  sha=$(gh api "repos/$repo/contents/$path?ref=$branch" --jq .sha 2>/dev/null || true)
-  base64 < "$file" | tr -d '\n' |
-    jq -Rs --arg message "Add $path" --arg branch "$branch" --arg sha "$sha" \
-      '{message: $message, branch: $branch, content: .} + (if $sha == "" then {} else {sha: $sha} end)' |
-    gh api -X PUT "repos/$repo/contents/$path" --input - --silent
-  printf '%s\thttps://github.com/%s/blob/%s/%s?raw=true\n' "$file" "$repo" "$branch" "$path"
+  printf '%s\thttps://github.com/%s/blob/%s/%s/%s?raw=true\n' "$file" "$repo" "$branch" "$dest" "$(basename "$file")"
 done

@@ -137,8 +137,10 @@ exec 9>/tmp/rails-services-up.lock
 flock 9
 ruby-up
 node-up
-service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null
-redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes >/dev/null
+# 9>&-: the daemons must not inherit the lock, or it outlives this script and
+# every later run, such as the next session start's, waits on it forever.
+service postgresql status >/dev/null 2>&1 || service postgresql start >/dev/null 9>&-
+redis-cli ping >/dev/null 2>&1 || redis-server --daemonize yes >/dev/null 9>&-
 EOF
 chmod +x /usr/local/bin/rails-services-up
 
