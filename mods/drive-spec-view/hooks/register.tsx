@@ -530,7 +530,7 @@ export const register: Register = on => {
 
         <Box marginTop={1}><Text color="subtle" bold>{`SLICES  ${run.slices.length}`}</Text></Box>
         {run.slices.length === 0 && <Text dimColor>No slices read yet.</Text>}
-        <Box flexDirection="column" gap={1}>{run.slices.map(slice)}</Box>
+        <Box flexDirection="column">{run.slices.map(slice)}</Box>
       </Box>
     )
   })
